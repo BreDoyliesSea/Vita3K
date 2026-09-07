@@ -34,4 +34,8 @@ struct State {
 
 bool init(State &ngs, MemState &mem);
 void deinit(State &ngs, MemState &mem);
+
+// Tell every live voice module that guest memory has been rewound under it, so host-side decoder
+// positions can resynchronise. See ModuleRuntimeState::on_savestate_loaded.
+void on_savestate_loaded(State &ngs, const MemState &mem);
 } // namespace ngs

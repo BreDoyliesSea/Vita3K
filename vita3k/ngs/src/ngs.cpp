@@ -367,6 +367,26 @@ void deinit(State &ngs, MemState &mem) {
     ngs.definitions = Ptr<VoiceDefinition>(0);
 }
 
+void on_savestate_loaded(State &ngs, const MemState &mem) {
+    for (System *system : ngs.systems) {
+        if (!system)
+            continue;
+        for (Rack *rack : system->racks) {
+            if (!rack)
+                continue;
+            for (const Ptr<Voice> &voice_ptr : rack->voices) {
+                Voice *voice = voice_ptr.get(mem);
+                if (!voice)
+                    continue;
+                for (ModuleData &data : voice->datas) {
+                    if (data.runtime_state)
+                        data.runtime_state->on_savestate_loaded();
+                }
+            }
+        }
+    }
+}
+
 bool init_system(State &ngs, const MemState &mem, SceNgsSystemInitParams *parameters, Ptr<void> memspace, const uint32_t memspace_size) {
     // Reserve first memory allocation for our System struct
     System *sys = memspace.cast<System>().get(mem);

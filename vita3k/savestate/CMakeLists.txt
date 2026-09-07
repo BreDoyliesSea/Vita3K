@@ -7,4 +7,4 @@ add_library(
 
 target_include_directories(savestate PUBLIC include)
 target_link_libraries(savestate PUBLIC emuenv mem)
-target_link_libraries(savestate PRIVATE config cpu io kernel miniz nids util)
+target_link_libraries(savestate PRIVATE config cpu io kernel miniz ngs nids util)

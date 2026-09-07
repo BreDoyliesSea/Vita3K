@@ -68,6 +68,11 @@ struct ModuleLogicalState {
 
 struct ModuleRuntimeState {
     virtual ~ModuleRuntimeState() = default;
+
+    // Called after a savestate has been loaded. Guest memory has just been rewound underneath
+    // this object, so any host decoder position it holds now refers to a different point in a
+    // different buffer. Resynchronise rather than carry the stale position forward.
+    virtual void on_savestate_loaded() {}
 };
 
 struct PCMFrameQueue {
