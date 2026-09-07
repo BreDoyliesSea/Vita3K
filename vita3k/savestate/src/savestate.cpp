@@ -25,6 +25,7 @@
 #include <kernel/thread/thread_state.h>
 #include <mem/functions.h>
 #include <mem/state.h>
+#include <nids/functions.h>
 #include <util/log.h>
 
 #include <miniz.h>
@@ -211,6 +212,25 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
             "Savestate: {} thread(s) are blocked inside an HLE call; their wait state cannot be captured "
             "and they will resume as if the wait had returned",
             waiting);
+
+        // Which calls, specifically. Restoring a blocked thread means re-entering the import it
+        // is parked in, so the shape of this histogram decides how big that job actually is: a
+        // long tail means every wait helper needs its own restore path, while a handful of
+        // repeated NIDs means a few do. Logged at save time because it is the only moment the
+        // guest is quiesced with the waits still in place.
+        if (waiting > 0) {
+            std::map<uint32_t, int> parked_in;
+            for (const auto &pair : emuenv.kernel.threads) {
+                if (!pair.second || pair.second->status != ThreadStatus::wait)
+                    continue;
+                parked_in[pair.second->current_import_nid.load(std::memory_order_relaxed)]++;
+            }
+            for (const auto &[nid, count] : parked_in) {
+                const char *const name = nid ? import_name(nid) : nullptr;
+                LOG_INFO("Savestate:   {} thread(s) parked in {} ({})", count,
+                    name ? name : "no import in flight", log_hex(nid));
+            }
+        }
     }
 
     // --- assemble ---------------------------------------------------------------------------
