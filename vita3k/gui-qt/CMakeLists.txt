@@ -109,6 +109,7 @@ target_link_libraries(gui-qt PUBLIC
     motion
     packages
     renderer
+    savestate
     touch
     gxm
     audio

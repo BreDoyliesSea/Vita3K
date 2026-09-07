@@ -18,6 +18,7 @@
 #pragma once
 
 #include <app/session_controller.h>
+#include <savestate/savestate.h>
 #include <app/state.h>
 #include <emuenv/state.h>
 
@@ -26,6 +27,7 @@
 #include <QPointer>
 #include <QTimer>
 
+#include <functional>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -111,6 +113,9 @@ private slots:
 
     void on_pause_triggered();
     void on_stop_triggered();
+    void on_quicksave_triggered();
+    void on_quickload_triggered();
+    void run_with_guest_quiesced(const char *what, const std::function<savestate::Result()> &action);
     void on_ps_button();
     void on_toolbar_refresh();
     void on_toolbar_fullscreen();

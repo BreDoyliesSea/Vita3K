@@ -36,6 +36,8 @@ signals:
     void toggle_touch_pressed();
     void texture_replacement_toggled();
     void screenshot_requested();
+    void quicksave_requested();
+    void quickload_requested();
 
 protected:
     bool eventFilter(QObject *watched, QEvent *event) override;

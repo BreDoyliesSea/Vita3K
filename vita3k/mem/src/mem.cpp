@@ -482,6 +482,23 @@ Block alloc_block(MemState &mem, uint32_t size, const char *name, Address start_
     });
 }
 
+void for_each_allocation(const MemState &state, const std::function<void(Address, uint32_t)> &visit) {
+    const size_t table_length = TOTAL_MEM_SIZE / STANDARD_PAGE_SIZE;
+    for (size_t page_num = 0; page_num < table_length;) {
+        const AllocMemPage &page = state.alloc_table[page_num];
+        if (!page.allocated || page.size == 0) {
+            page_num++;
+            continue;
+        }
+        // Skip the guard allocation at address 0. init() deliberately marks it PAGE_NOACCESS
+        // so that null dereferences fault, which means simply reading it crashes the host.
+        // It holds no guest state worth reporting.
+        if (page_num != 0)
+            visit(static_cast<Address>(page_num * STANDARD_PAGE_SIZE), page.size * STANDARD_PAGE_SIZE);
+        page_num += page.size;
+    }
+}
+
 void free(MemState &state, Address address) {
     const std::lock_guard<std::mutex> lock(state.generation_mutex);
     const uint32_t page_num = address / STANDARD_PAGE_SIZE;

@@ -66,5 +66,11 @@ Block alloc_block(MemState &mem, uint32_t size, const char *name, Address start_
 Address alloc_at(MemState &state, Address address, uint32_t size, const char *name);
 Address try_alloc_at(MemState &state, Address address, uint32_t size, const char *name);
 void free(MemState &state, Address address);
+
+// Visit every live allocation as (start address, size in bytes), in ascending address order.
+// The allocation table only marks the first page of each block, so callers cannot walk it
+// correctly without knowing the page layout - that knowledge stays here.
+// The caller must hold whatever quiescence it needs; this does not lock.
+void for_each_allocation(const MemState &state, const std::function<void(Address, uint32_t)> &visit);
 uint32_t mem_available(MemState &state);
 const char *mem_name(Address address, MemState &state);
