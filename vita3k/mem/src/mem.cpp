@@ -229,10 +229,51 @@ static void align_to_page(MemState &state, Address &addr, Address &size) {
     size = end - addr;
 }
 
+// DIAG: which protect call last covered each host page, and whether it was ever unprotected.
+// If an unhandled fault lands on a page this table still owns, protection outlived the
+// protect_tree entry that described it -- which is the asymmetry under investigation.
+namespace {
+struct PageOwner {
+    Address seg_addr;
+    uint32_t seg_size;
+    uint64_t seq;
+};
+std::mutex g_page_owner_mutex;
+std::map<Address, PageOwner> g_page_owner;
+std::atomic<uint64_t> g_protect_seq{ 0 };
+
+void diag_note_protect(const MemState &state, Address addr, uint32_t size) {
+    const uint64_t seq = g_protect_seq.fetch_add(1);
+    const Address first = align_down(addr, state.host_page_size);
+    const Address last = align_down(addr + size - 1, state.host_page_size);
+    const std::lock_guard<std::mutex> lock(g_page_owner_mutex);
+    for (Address page = first; page <= last; page += state.host_page_size)
+        g_page_owner[page] = PageOwner{ addr, size, seq };
+}
+
+void diag_note_unprotect(const MemState &state, Address addr, uint32_t size) {
+    const Address first = align_down(addr, state.host_page_size);
+    const Address last = align_down(addr + size - 1, state.host_page_size);
+    const std::lock_guard<std::mutex> lock(g_page_owner_mutex);
+    for (Address page = first; page <= last; page += state.host_page_size)
+        g_page_owner.erase(page);
+}
+
+bool diag_page_still_owned(const MemState &state, Address vaddr, PageOwner &out) {
+    const std::lock_guard<std::mutex> lock(g_page_owner_mutex);
+    auto it = g_page_owner.find(align_down(vaddr, state.host_page_size));
+    if (it == g_page_owner.end())
+        return false;
+    out = it->second;
+    return true;
+}
+} // namespace
+
 void unprotect_inner(MemState &state, Address addr, uint32_t size) {
     if (LOG_PROTECT) {
         fmt::print("Unprotect: {} {}\n", log_hex(addr), size);
     }
+    diag_note_unprotect(state, addr, size);
     uint8_t *addr_ptr = state.use_page_table ? state.page_table[addr / KiB(4)] : state.memory.get();
 
     uint8_t *target = &addr_ptr[addr];
@@ -252,6 +293,7 @@ void unprotect_inner(MemState &state, Address addr, uint32_t size) {
 }
 
 void protect_inner(MemState &state, Address addr, uint32_t size, const MemPerm perm) {
+    diag_note_protect(state, addr, size);
     uint8_t *addr_ptr = state.use_page_table ? state.page_table[addr / KiB(4)] : state.memory.get();
 
     uint8_t *target = &addr_ptr[addr];
@@ -319,11 +361,16 @@ bool handle_access_violation(MemState &state, uint8_t *addr, bool write) noexcep
     // costs real time; logging only the first hides how often it happens. Count them all and
     // report the first few plus a periodic total.
     static std::atomic<uint64_t> unhandled_protect_count{ 0 };
+    // Sample page ownership BEFORE unprotecting: unprotect_inner() clears the tracker entry,
+    // so querying afterwards always reports "not owned" and tells you nothing. (It did exactly
+    // that on the first attempt.)
+    PageOwner owner_before{};
+    const bool owned_before = diag_page_still_owned(state, vaddr, owner_before);
     const auto report_unhandled = [&](const char *what, Address nearest, uint32_t nearest_size) {
         const uint64_t n = unhandled_protect_count.fetch_add(1) + 1;
         if (n <= 4 || (n % 1000) == 0) {
-            LOG_CRITICAL("Unhandled write protected region was valid. Address=0x{:X} ({}, nearest segment 0x{:X}+{}, page shares a tracked segment: {}) [occurrence {}]",
-                vaddr, what, nearest, nearest_size, shares_page_with_segment(vaddr), n);
+            LOG_CRITICAL("Unhandled write protected region was valid. Address=0x{:X} ({}, nearest segment 0x{:X}+{}) page was protected by: {} (owner 0x{:X}+{} seq {}) [occurrence {}]",
+                vaddr, what, nearest, nearest_size, owned_before, owner_before.seg_addr, owner_before.seg_size, owner_before.seq, n);
         }
     };
 
