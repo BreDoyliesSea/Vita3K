@@ -1368,9 +1368,17 @@ void MainWindow::on_quicksave_triggered() {
 }
 
 void MainWindow::on_quickload_triggered() {
+    // Loading restores guest memory and CPU registers, but not the kernel objects that
+    // threads are blocked on -- and around 87% of a game's threads are blocked inside an HLE
+    // call at any moment. They resume as if their wait had returned, and the guest typically
+    // destabilises within seconds. Say so plainly rather than letting it look like a bug in
+    // the game.
     run_with_guest_quiesced("Quickload", [this] {
         return savestate::load(emuenv, savestate::slot_path(emuenv, 0));
     });
+    statusBar()->showMessage(
+        tr("Quickload is experimental: thread wait state is not restored and the game may become unstable."),
+        10000);
 }
 
 void MainWindow::on_stop_triggered() {
