@@ -144,6 +144,7 @@ using PhysicalKeyCode = input::PhysicalKeyCode;
     code(std::string, "backend-renderer", "Vulkan", backend_renderer)                                   \
     code(std::string, "custom-driver-name", "", custom_driver_name)                                     \
     code(bool, "turbo-mode", false, turbo_mode)                                                         \
+    code(int, "fast-forward-speed", 1, fast_forward_speed)                                            \
     code(int, "gpu-idx", 0, gpu_idx)                                                                    \
     code(bool, "high-accuracy", false, high_accuracy)                                                   \
     code(float, "resolution-multiplier", 1.0f, resolution_multiplier)                                   \
