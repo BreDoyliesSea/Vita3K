@@ -22,14 +22,17 @@
 #include <emuenv/state.h>
 #include <io/state.h>
 #include <kernel/state.h>
+#include <kernel/sync_primitives.h>
 #include <kernel/thread/thread_state.h>
 #include <mem/functions.h>
 #include <mem/state.h>
+#include <ngs/state.h>
 #include <nids/functions.h>
 #include <util/log.h>
 
 #include <miniz.h>
 
+#include <algorithm>
 #include <cstring>
 #include <ctime>
 #include <fstream>
@@ -48,6 +51,23 @@ constexpr uint8_t MAGIC[8] = { 0x56, 0x49, 0x54, 0x41, 0x33, 0x4B, 0x53, 0x53 };
 // skips anything it does not recognise so a newer state stays partially readable.
 constexpr uint32_t TAG_MEM = 0x204D454DU; // "MEM "
 constexpr uint32_t TAG_CPU = 0x20555043U; // "CPU "
+constexpr uint32_t TAG_WAIT = 0x54494157U; // "WAIT" - which HLE wait each parked thread is in
+constexpr uint32_t TAG_SYNC = 0x434E5953U; // "SYNC" - scalar state of the kernel sync primitives
+
+// NIDs the restore path understands. A parked thread can only be carried across a load if its
+// wait is one of these.
+constexpr uint32_t NID_sceKernelWaitSema = 0x0C7B834BU;
+constexpr uint32_t NID_sceKernelDelayThread = 0x4B675D05U;
+constexpr uint32_t NID_sceAudioOutOutput = 0x02DB3F5FU;
+
+// Waits that finish on their own in bounded real time whatever the guest does: a fixed delay, and
+// an audio buffer the device drains. They need no matching across a load -- whichever one such a
+// thread happens to be in, it will fall out of it shortly and rejoin the guest's own loop.
+// A semaphore wait is different: it ends only when another thread signals, so a thread sitting in
+// one is part of the state and has to still be sitting in the same one.
+bool is_self_completing_wait(uint32_t nid) {
+    return nid == NID_sceKernelDelayThread || nid == NID_sceAudioOutOutput;
+}
 
 // A state records the emulator build that produced it. Guest memory is full of pointers into
 // host-side structures whose layout this binary fixes, so a state from a different build is
@@ -261,6 +281,72 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
         }
     }
 
+    // --- WAIT: what each parked thread is blocked in ------------------------------------------
+    // A thread in ThreadStatus::wait is inside a host C++ frame that no snapshot can describe.
+    // Rather than try to rebuild that frame on load, record what the wait *is*, so the load can
+    // check the guest is still parked the same way and refuse if it is not.
+    std::vector<uint8_t> wait_raw;
+    {
+        const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
+        std::vector<std::pair<SceUID, const ThreadState *>> parked;
+        for (const auto &pair : emuenv.kernel.threads) {
+            if (pair.second && pair.second->status == ThreadStatus::wait)
+                parked.emplace_back(pair.first, pair.second.get());
+        }
+        put<uint32_t>(wait_raw, static_cast<uint32_t>(parked.size()));
+        for (const auto &[uid, thread] : parked) {
+            put(wait_raw, uid);
+            put<uint32_t>(wait_raw, thread->current_import_nid.load(std::memory_order_relaxed));
+            for (int i = 0; i < 4; i++)
+                put<uint32_t>(wait_raw, thread->current_import_args[i]);
+        }
+    }
+
+    // --- SYNC: scalar state of the kernel sync primitives --------------------------------------
+    // These objects live on the host, not in guest memory, so nothing above captures them. A
+    // semaphore's count is exactly the kind of thing the guest's own bookkeeping (which *is* in
+    // the snapshot) expects to agree with.
+    //
+    // Only the scalars are recorded, not the objects themselves: this restores into the same
+    // running session, where every object still exists under the same uid. Loading a state into a
+    // fresh session would need the objects constructed, which is a different and much larger job.
+    std::vector<uint8_t> sync_raw;
+    {
+        const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
+
+        put<uint32_t>(sync_raw, static_cast<uint32_t>(emuenv.kernel.semaphores.size()));
+        for (const auto &[uid, sema] : emuenv.kernel.semaphores) {
+            put(sync_raw, uid);
+            put<int32_t>(sync_raw, sema ? sema->val : 0);
+        }
+
+        put<uint32_t>(sync_raw, static_cast<uint32_t>(emuenv.kernel.eventflags.size()));
+        for (const auto &[uid, ef] : emuenv.kernel.eventflags) {
+            put(sync_raw, uid);
+            put<int32_t>(sync_raw, ef ? ef->flags : 0);
+        }
+
+        put<uint32_t>(sync_raw, static_cast<uint32_t>(emuenv.kernel.simple_events.size()));
+        for (const auto &[uid, ev] : emuenv.kernel.simple_events) {
+            put(sync_raw, uid);
+            put<uint32_t>(sync_raw, ev ? ev->pattern : 0);
+            put<uint64_t>(sync_raw, ev ? ev->last_user_data : 0);
+        }
+
+        // Mutexes and lwmutexes share a type. The owner is a ThreadStatePtr; record its uid,
+        // which is what a restore can look back up.
+        const auto put_mutexes = [&sync_raw](const MutexPtrs &mutexes) {
+            put<uint32_t>(sync_raw, static_cast<uint32_t>(mutexes.size()));
+            for (const auto &[uid, mutex] : mutexes) {
+                put(sync_raw, uid);
+                put<int32_t>(sync_raw, mutex ? mutex->lock_count : 0);
+                put<SceUID>(sync_raw, (mutex && mutex->owner) ? mutex->owner->id : 0);
+            }
+        };
+        put_mutexes(emuenv.kernel.mutexes);
+        put_mutexes(emuenv.kernel.lwmutexes);
+    }
+
     // --- assemble ---------------------------------------------------------------------------
     std::vector<uint8_t> file;
     file.insert(file.end(), std::begin(MAGIC), std::end(MAGIC));
@@ -278,6 +364,16 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
     put<uint64_t>(file, static_cast<uint64_t>(cpu_raw.size()));
     put<uint64_t>(file, static_cast<uint64_t>(cpu_raw.size()));
     file.insert(file.end(), cpu_raw.begin(), cpu_raw.end());
+
+    put(file, TAG_WAIT);
+    put<uint64_t>(file, wait_raw.size());
+    put<uint64_t>(file, wait_raw.size());
+    file.insert(file.end(), wait_raw.begin(), wait_raw.end());
+
+    put(file, TAG_SYNC);
+    put<uint64_t>(file, sync_raw.size());
+    put<uint64_t>(file, sync_raw.size());
+    file.insert(file.end(), sync_raw.begin(), sync_raw.end());
 
     // Write to a temporary and rename into place, so an interrupted save cannot destroy the
     // previous good state.
@@ -356,6 +452,10 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
     size_t mem_raw_size = 0;
     const uint8_t *cpu_data = nullptr;
     size_t cpu_size = 0;
+    const uint8_t *wait_data = nullptr;
+    size_t wait_size = 0;
+    const uint8_t *sync_data = nullptr;
+    size_t sync_size = 0;
 
     while (r.need(sizeof(uint32_t) + sizeof(uint64_t) * 2)) {
         uint32_t tag = 0;
@@ -378,14 +478,97 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
             cpu_data = payload;
             cpu_size = static_cast<size_t>(stored);
             break;
+        case TAG_WAIT:
+            wait_data = payload;
+            wait_size = static_cast<size_t>(stored);
+            break;
+        case TAG_SYNC:
+            sync_data = payload;
+            sync_size = static_cast<size_t>(stored);
+            break;
         default:
             LOG_WARN("Savestate: ignoring unknown chunk 0x{:08X}", tag);
             break;
         }
     }
 
-    if (!mem_packed || !cpu_data)
+    if (!mem_packed || !cpu_data || !wait_data || !sync_data)
         return Result::fail("state is missing a required chunk");
+
+    // --- gate: is the guest still parked the way the state expects? --------------------------
+    // Run before anything is written. Restoring guest memory to a snapshot while the threads sit
+    // in different waits than they did is what makes a load look successful and then fall over
+    // half a minute later; refusing is better than that, and leaves the session untouched.
+    struct ParkedWait {
+        SceUID thread;
+        uint32_t nid;
+        uint32_t args[4];
+    };
+    std::vector<ParkedWait> parked;
+    {
+        Reader wr{ wait_data, wait_size, 0 };
+        uint32_t count = 0;
+        if (!wr.get(count))
+            return Result::fail("corrupt wait chunk");
+        parked.reserve(count);
+        for (uint32_t i = 0; i < count; i++) {
+            ParkedWait w{};
+            if (!wr.get(w.thread) || !wr.get(w.nid))
+                return Result::fail("corrupt wait chunk");
+            for (uint32_t &arg : w.args) {
+                if (!wr.get(arg))
+                    return Result::fail("corrupt wait chunk");
+            }
+            parked.push_back(w);
+        }
+    }
+
+    {
+        const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
+
+        // Every semaphore wait recorded in the state must still be held by the same thread on the
+        // same semaphore. needCount and the timeout pointer are compared too, cheaply, since they
+        // are already to hand.
+        for (const ParkedWait &w : parked) {
+            if (is_self_completing_wait(w.nid))
+                continue;
+            if (w.nid != NID_sceKernelWaitSema) {
+                const char *const name = w.nid ? import_name(w.nid) : nullptr;
+                return Result::fail(fmt::format("thread {} was parked in {}, which this build cannot restore",
+                    w.thread, name ? name : fmt::format("{}", log_hex(w.nid))));
+            }
+            const auto it = emuenv.kernel.threads.find(w.thread);
+            if (it == emuenv.kernel.threads.end() || !it->second)
+                return Result::fail(fmt::format("thread {} from the state no longer exists", w.thread));
+            const auto &thread = it->second;
+            if (thread->status != ThreadStatus::wait
+                || thread->current_import_nid.load(std::memory_order_relaxed) != w.nid
+                || thread->current_import_args[0] != w.args[0]
+                || thread->current_import_args[1] != w.args[1]
+                || thread->current_import_args[2] != w.args[2]) {
+                return Result::fail(fmt::format(
+                    "thread {} \"{}\" has moved on since the state was taken (was waiting on semaphore {})",
+                    w.thread, thread->name, log_hex(w.args[0])));
+            }
+        }
+
+        // And the converse: a thread parked now that was not parked then is equally a mismatch,
+        // because its host frame is one the snapshot knows nothing about.
+        for (const auto &pair : emuenv.kernel.threads) {
+            const auto &thread = pair.second;
+            if (!thread || thread->status != ThreadStatus::wait)
+                continue;
+            const uint32_t nid = thread->current_import_nid.load(std::memory_order_relaxed);
+            if (is_self_completing_wait(nid))
+                continue;
+            const bool recorded = std::any_of(parked.begin(), parked.end(),
+                [&](const ParkedWait &w) { return w.thread == pair.first; });
+            if (!recorded) {
+                return Result::fail(fmt::format("thread {} \"{}\" is waiting now but was not when the state was taken",
+                    pair.first, thread->name));
+            }
+        }
+    }
 
     std::vector<uint8_t> mem_raw;
     if (!inflate_to(mem_packed, mem_packed_size, mem_raw, mem_raw_size))
@@ -510,8 +693,97 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
     if (missing > 0)
         LOG_WARN("Savestate: {} thread(s) in the state no longer exist; their register state was dropped", missing);
 
-    LOG_INFO("Savestate loaded: {} ({} regions, {}/{} threads restored)",
-        path.string(), region_count, restored, thread_count);
+    // --- restore sync primitive scalars --------------------------------------------------------
+    // The guest's own bookkeeping is in the snapshot; these host-side counters are what it expects
+    // to agree with. Objects that no longer exist are skipped rather than created: the gate above
+    // has already established that the threads which matter are parked exactly as they were, and
+    // creating kernel objects here would be reconstructing state this design deliberately does not
+    // own.
+    uint32_t sync_restored = 0, sync_skipped = 0;
+    {
+        Reader sr{ sync_data, sync_size, 0 };
+        const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
+
+        const auto read_table = [&](const auto &table, auto &&apply) -> bool {
+            uint32_t count = 0;
+            if (!sr.get(count))
+                return false;
+            for (uint32_t i = 0; i < count; i++) {
+                SceUID uid = 0;
+                if (!sr.get(uid))
+                    return false;
+                const auto it = table.find(uid);
+                if (!apply(it != table.end() ? it->second : nullptr))
+                    return false;
+            }
+            return true;
+        };
+
+        const auto count_it = [&](bool present) { present ? sync_restored++ : sync_skipped++; };
+
+        bool ok = read_table(emuenv.kernel.semaphores, [&](const SemaphorePtr &sema) {
+            int32_t val = 0;
+            if (!sr.get(val))
+                return false;
+            if (sema)
+                sema->val = val;
+            count_it(sema != nullptr);
+            return true;
+        });
+
+        ok = ok && read_table(emuenv.kernel.eventflags, [&](const EventFlagPtr &ef) {
+            int32_t flags = 0;
+            if (!sr.get(flags))
+                return false;
+            if (ef)
+                ef->flags = flags;
+            count_it(ef != nullptr);
+            return true;
+        });
+
+        ok = ok && read_table(emuenv.kernel.simple_events, [&](const SimpleEventPtr &ev) {
+            uint32_t pattern = 0;
+            uint64_t user_data = 0;
+            if (!sr.get(pattern) || !sr.get(user_data))
+                return false;
+            if (ev) {
+                ev->pattern = pattern;
+                ev->last_user_data = user_data;
+            }
+            count_it(ev != nullptr);
+            return true;
+        });
+
+        const auto restore_mutexes = [&](const MutexPtrs &table) {
+            return read_table(table, [&](const MutexPtr &mutex) {
+                int32_t lock_count = 0;
+                SceUID owner_id = 0;
+                if (!sr.get(lock_count) || !sr.get(owner_id))
+                    return false;
+                if (mutex) {
+                    mutex->lock_count = lock_count;
+                    const auto owner = emuenv.kernel.threads.find(owner_id);
+                    mutex->owner = (owner != emuenv.kernel.threads.end()) ? owner->second : nullptr;
+                }
+                count_it(mutex != nullptr);
+                return true;
+            });
+        };
+        ok = ok && restore_mutexes(emuenv.kernel.mutexes);
+        ok = ok && restore_mutexes(emuenv.kernel.lwmutexes);
+
+        if (!ok)
+            return Result::fail("corrupt sync chunk");
+    }
+
+    // Host-side audio decoders hold a position inside the stream they were decoding. Guest memory
+    // has just been rewound underneath them, so that position is now wrong and the next frame
+    // unpacks nonsense -- observed as a storm of Atrac9 decode failures ending in a fault. Tell
+    // them to resynchronise.
+    ngs::on_savestate_loaded(emuenv.ngs, emuenv.mem);
+
+    LOG_INFO("Savestate loaded: {} ({} regions, {}/{} threads restored, {} sync object(s) restored, {} gone)",
+        path.string(), region_count, restored, thread_count, sync_restored, sync_skipped);
     return Result::ok();
 }
 

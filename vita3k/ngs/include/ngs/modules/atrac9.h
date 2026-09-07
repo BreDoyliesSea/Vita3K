@@ -85,6 +85,15 @@ struct Atrac9RuntimeState : public ModuleRuntimeState {
     StereoRateResamplerRuntimeState rate_resampler;
     std::vector<uint8_t> decoded_superframe_samples;
     std::vector<uint8_t> temporary_bytes;
+
+    // The decoder carries a position within the current superframe. After a load that position
+    // belongs to the pre-load stream, so the next frame is read at the wrong offset and unpacks
+    // nonsense -- the same failure the decode-error path already flushes for. Flush, rather than
+    // destroy and rebuild, because audio processing does not stop for a savestate.
+    void on_savestate_loaded() override {
+        if (decoder)
+            decoder->flush();
+    }
 };
 
 class Atrac9Module : public Module {

@@ -29,7 +29,7 @@ namespace savestate {
 // kernel object graph, GPU state, open file handles and the audio graph are not. A state is
 // therefore only meaningful to the same running process that produced it -- reloading one
 // after restarting the emulator will not work, and the header records enough to refuse it.
-inline constexpr uint32_t FORMAT_VERSION = 1;
+inline constexpr uint32_t FORMAT_VERSION = 2;
 
 struct Result {
     bool success = false;
