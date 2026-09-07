@@ -91,6 +91,8 @@ using PhysicalKeyCode = input::PhysicalKeyCode;
     code(PhysicalKeyCode, "keyboard-gui-toggle-touch", PhysicalKeyCode::KeyT, keyboard_gui_toggle_touch)                               \
     code(PhysicalKeyCode, "keyboard-toggle-texture-replacement", PhysicalKeyCode::Unbound, keyboard_toggle_texture_replacement)        \
     code(PhysicalKeyCode, "keyboard-take-screenshot", PhysicalKeyCode::Unbound, keyboard_take_screenshot)                              \
+    code(PhysicalKeyCode, "keyboard-quicksave", PhysicalKeyCode::F5, keyboard_quicksave)                                                  \
+    code(PhysicalKeyCode, "keyboard-quickload", PhysicalKeyCode::F8, keyboard_quickload)                                                  \
     code(PhysicalKeyCode, "keyboard-pinch-modifier", PhysicalKeyCode::Unbound, keyboard_pinch_modifier)                                \
     code(PhysicalKeyCode, "keyboard-alternate-pinch-in", PhysicalKeyCode::Unbound, keyboard_alternate_pinch_in)                        \
     code(PhysicalKeyCode, "keyboard-alternate-pinch-out", PhysicalKeyCode::Unbound, keyboard_alternate_pinch_out)                      \
@@ -123,6 +125,8 @@ using PhysicalKeyCode = input::PhysicalKeyCode;
     code(PhysicalKeyCode, "keyboard-gui-toggle-touch-alt", PhysicalKeyCode::Unbound, keyboard_gui_toggle_touch_alt)                    \
     code(PhysicalKeyCode, "keyboard-toggle-texture-replacement-alt", PhysicalKeyCode::Unbound, keyboard_toggle_texture_replacement_alt)\
     code(PhysicalKeyCode, "keyboard-take-screenshot-alt", PhysicalKeyCode::Unbound, keyboard_take_screenshot_alt)                      \
+    code(PhysicalKeyCode, "keyboard-quicksave-alt", PhysicalKeyCode::Unbound, keyboard_quicksave_alt)                                     \
+    code(PhysicalKeyCode, "keyboard-quickload-alt", PhysicalKeyCode::Unbound, keyboard_quickload_alt)                                     \
     code(PhysicalKeyCode, "keyboard-pinch-modifier-alt", PhysicalKeyCode::Unbound, keyboard_pinch_modifier_alt)                        \
     code(PhysicalKeyCode, "keyboard-alternate-pinch-in-alt", PhysicalKeyCode::Unbound, keyboard_alternate_pinch_in_alt)                \
     code(PhysicalKeyCode, "keyboard-alternate-pinch-out-alt", PhysicalKeyCode::Unbound, keyboard_alternate_pinch_out_alt)

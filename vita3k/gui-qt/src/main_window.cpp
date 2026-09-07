@@ -1030,6 +1030,12 @@ std::optional<AppLaunchRequest> MainWindow::boot_game_once(const AppLaunchReques
     connect(m_kb_filter, &CtrlKeyboardFilter::screenshot_requested,
         this, [this]() { take_screenshot(emuenv); });
 
+    connect(m_kb_filter, &CtrlKeyboardFilter::quicksave_requested,
+        this, [this]() { on_quicksave_triggered(); });
+
+    connect(m_kb_filter, &CtrlKeyboardFilter::quickload_requested,
+        this, [this]() { on_quickload_triggered(); });
+
     if (auto next_request = take_pending_app_launch_request()) {
         on_game_closed();
         return next_request;
@@ -1324,6 +1330,47 @@ void MainWindow::on_pause_triggered() {
     const bool is_paused = m_app_session.is_paused();
     m_app_session.set_pause_reason(app::AppSessionPauseReason::User, !is_paused);
     refresh_emulation_actions();
+}
+
+// Quicksave and quickload both need the guest fully stopped. pause_threads() parks every
+// guest thread outside the JIT, which is exactly the quiescence a consistent snapshot needs.
+// A dedicated pause reason keeps this independent of the user's own pause, so taking a state
+// while already paused does not resume the game underneath them.
+void MainWindow::run_with_guest_quiesced(const char *what, const std::function<savestate::Result()> &action) {
+    if (!m_game_window) {
+        statusBar()->showMessage(tr("%1: no game is running").arg(QString::fromUtf8(what)), 4000);
+        return;
+    }
+
+    m_app_session.set_pause_reason(app::AppSessionPauseReason::Savestate, true);
+    savestate::Result result = savestate::Result::fail("did not run");
+    try {
+        result = action();
+    } catch (const std::exception &e) {
+        result = savestate::Result::fail(e.what());
+    }
+    m_app_session.set_pause_reason(app::AppSessionPauseReason::Savestate, false);
+
+    if (result) {
+        statusBar()->showMessage(tr("%1 complete").arg(QString::fromUtf8(what)), 4000);
+    } else {
+        LOG_ERROR("{} failed: {}", what, result.reason);
+        statusBar()->showMessage(tr("%1 failed: %2").arg(QString::fromUtf8(what),
+                                     QString::fromStdString(result.reason)),
+            8000);
+    }
+}
+
+void MainWindow::on_quicksave_triggered() {
+    run_with_guest_quiesced("Quicksave", [this] {
+        return savestate::save(emuenv, savestate::slot_path(emuenv, 0));
+    });
+}
+
+void MainWindow::on_quickload_triggered() {
+    run_with_guest_quiesced("Quickload", [this] {
+        return savestate::load(emuenv, savestate::slot_path(emuenv, 0));
+    });
 }
 
 void MainWindow::on_stop_triggered() {
