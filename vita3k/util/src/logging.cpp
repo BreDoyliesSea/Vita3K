@@ -20,6 +20,8 @@
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
+
+#include <DbgHelp.h>
 #endif
 
 #include <spdlog/async.h>
@@ -35,6 +37,7 @@
 #include <functional>
 #include <iostream>
 #include <mutex>
+#include <string>
 #include <vector>
 
 namespace logging {
@@ -178,11 +181,73 @@ void rebuild_default_logger() {
 
 // log exceptions and flush log file on exceptions
 #ifdef _WIN32
+// Base and extent of our own executable image, resolved once at startup by walking the PE
+// headers. Doing it here rather than in the handler keeps the handler free of loader calls, which
+// are not safe to make while a fault is being dispatched.
+static uintptr_t s_exe_base = 0;
+static size_t s_exe_size = 0;
+
+// Symbol lookup for crash addresses. Initialised once at startup, because SymInitialize walks the
+// module list and must not be called while a fault is being dispatched. SymFromAddr itself is not
+// documented as safe inside a handler either, but by the time this runs the process is already
+// going down and a function name is worth more than the small risk of not getting one.
+static bool s_symbols_ready = false;
+
+static void init_symbols() {
+    SymSetOptions(SYMOPT_DEFERRED_LOADS | SYMOPT_UNDNAME);
+    s_symbols_ready = SymInitialize(GetCurrentProcess(), nullptr, TRUE) != FALSE;
+}
+
+static std::string symbol_for(uintptr_t address) {
+    if (!s_symbols_ready)
+        return {};
+    alignas(SYMBOL_INFO) char buffer[sizeof(SYMBOL_INFO) + MAX_SYM_NAME] = {};
+    auto *symbol = reinterpret_cast<SYMBOL_INFO *>(buffer);
+    symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+    symbol->MaxNameLen = MAX_SYM_NAME;
+    DWORD64 displacement = 0;
+    if (!SymFromAddr(GetCurrentProcess(), address, &displacement, symbol))
+        return {};
+    return fmt::format(" [{}+{}]", symbol->Name, displacement);
+}
+
+static void resolve_own_image() {
+    const auto base = reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr));
+    if (!base)
+        return;
+    const auto *dos = reinterpret_cast<const IMAGE_DOS_HEADER *>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+        return;
+    const auto *nt = reinterpret_cast<const IMAGE_NT_HEADERS *>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE)
+        return;
+    s_exe_base = base;
+    s_exe_size = nt->OptionalHeader.SizeOfImage;
+}
+
+// Where the faulting instruction was, not just what it touched. An address inside our own image
+// means host code followed a bad pointer; an address outside every image is almost always
+// dynarmic's generated code, which means the guest is executing something it should not be. The
+// two have completely different causes and the fault address alone does not distinguish them.
+static void log_fault_origin(PEXCEPTION_POINTERS pExp) {
+    const auto pc = reinterpret_cast<uintptr_t>(pExp->ExceptionRecord->ExceptionAddress);
+    const std::string symbol = symbol_for(pc);
+    if (s_exe_base && pc >= s_exe_base && pc < s_exe_base + s_exe_size) {
+        LOG_CRITICAL("  faulting instruction at Vita3K.exe+{}{} (thread {})",
+            log_hex(static_cast<uint64_t>(pc - s_exe_base)), symbol, GetCurrentThreadId());
+    } else {
+        LOG_CRITICAL("  faulting instruction at {}{}, outside our image - JIT-generated or another "
+                     "module (thread {})",
+            log_hex(static_cast<uint64_t>(pc)), symbol, GetCurrentThreadId());
+    }
+}
+
 static LONG WINAPI exception_handler(PEXCEPTION_POINTERS pExp) noexcept {
     const unsigned ec = pExp->ExceptionRecord->ExceptionCode;
     switch (ec) {
     case EXCEPTION_ACCESS_VIOLATION:
         LOG_CRITICAL("Exception EXCEPTION_ACCESS_VIOLATION ({}). ", log_hex(ec));
+        log_fault_origin(pExp);
         switch (pExp->ExceptionRecord->ExceptionInformation[0]) {
         case 0:
             LOG_CRITICAL("Read violation at address {}.", log_hex(pExp->ExceptionRecord->ExceptionInformation[1]));
@@ -229,6 +294,8 @@ static LONG WINAPI exception_handler(PEXCEPTION_POINTERS pExp) noexcept {
 }
 
 void register_log_exception_handler() {
+    resolve_own_image();
+    init_symbols();
     if (!AddVectoredExceptionHandler(0, exception_handler)) {
         LOG_CRITICAL("Failed to register an exception handler");
     }
