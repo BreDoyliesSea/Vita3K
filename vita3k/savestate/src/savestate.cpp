@@ -33,6 +33,7 @@
 #include <ctime>
 #include <fstream>
 #include <limits>
+#include <map>
 #include <type_traits>
 #include <vector>
 
@@ -318,31 +319,87 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
     if (!inflate_to(mem_packed, mem_packed_size, mem_raw, mem_raw_size))
         return Result::fail("guest memory chunk is corrupt");
 
-    // --- restore memory ---------------------------------------------------------------------
+    // --- reconcile the address space --------------------------------------------------------
+    // Restoring page contents is only meaningful if the same pages are allocated. Allocations
+    // made since the save must go, and allocations freed since must come back, or the guest
+    // resumes against an address space that does not match its own pointers. Doing this
+    // through the allocator rather than by restoring the allocation table directly keeps the
+    // host commit state correct: alloc/free commit and decommit pages as they go.
     Reader mr{ mem_raw.data(), mem_raw.size(), 0 };
     uint32_t region_count = 0;
     if (!mr.get(region_count))
         return Result::fail("corrupt memory chunk");
 
-    uint32_t skipped = 0;
+    struct SavedRegion {
+        Address addr;
+        uint32_t size;
+        size_t offset; // into mem_raw, where this region's bytes start
+    };
+    std::vector<SavedRegion> saved;
+    saved.reserve(region_count);
     for (uint32_t i = 0; i < region_count; i++) {
         Address addr = 0;
         uint32_t size = 0;
         if (!mr.get(addr) || !mr.get(size) || !mr.need(size))
             return Result::fail("corrupt memory chunk");
-        // Only write where this process still has the same allocation mapped. A state is
-        // session-local, so this should always hold; if it does not, skipping is far safer
-        // than writing into unmapped address space.
-        if (!Ptr<uint8_t>(addr).valid(emuenv.mem)) {
-            skipped++;
-            mr.pos += size;
-            continue;
-        }
-        std::memcpy(emuenv.mem.memory.get() + addr, mem_raw.data() + mr.pos, size);
+        saved.push_back({ addr, size, mr.pos });
         mr.pos += size;
     }
+
+    std::map<Address, uint32_t> live;
+    {
+        const std::lock_guard<std::mutex> alloc_lock(emuenv.mem.generation_mutex);
+        for_each_allocation(emuenv.mem, [&](Address addr, uint32_t size) {
+            live.emplace(addr, size);
+        });
+    }
+
+    std::map<Address, uint32_t> wanted;
+    for (const auto &region : saved)
+        wanted.emplace(region.addr, region.size);
+
+    // free() and try_alloc_at() take the allocator lock themselves, so these run unlocked.
+    uint32_t freed = 0;
+    for (const auto &entry : live) {
+        const auto it = wanted.find(entry.first);
+        if (it == wanted.end() || it->second != entry.second) {
+            free(emuenv.mem, entry.first);
+            freed++;
+        }
+    }
+
+    uint32_t reallocated = 0;
+    uint32_t unrecoverable = 0;
+    for (const auto &entry : wanted) {
+        const auto it = live.find(entry.first);
+        if (it != live.end() && it->second == entry.second)
+            continue;
+        if (try_alloc_at(emuenv.mem, entry.first, entry.second, "savestate") == 0) {
+            unrecoverable++;
+            continue;
+        }
+        reallocated++;
+    }
+
+    if (freed > 0 || reallocated > 0)
+        LOG_INFO("Savestate: address space reconciled ({} freed, {} restored)", freed, reallocated);
+    if (unrecoverable > 0)
+        LOG_ERROR("Savestate: {} region(s) could not be re-allocated; the guest address space does not match the state", unrecoverable);
+
+    // --- restore memory ---------------------------------------------------------------------
+    uint32_t skipped = 0;
+    {
+        const std::lock_guard<std::mutex> alloc_lock(emuenv.mem.generation_mutex);
+        for (const auto &region : saved) {
+            if (!Ptr<uint8_t>(region.addr).valid(emuenv.mem)) {
+                skipped++;
+                continue;
+            }
+            std::memcpy(emuenv.mem.memory.get() + region.addr, mem_raw.data() + region.offset, region.size);
+        }
+    }
     if (skipped > 0)
-        LOG_WARN("Savestate: {} region(s) are not mapped in this session and were skipped", skipped);
+        LOG_WARN("Savestate: {} region(s) are still not mapped and were skipped", skipped);
 
     // --- restore CPU contexts -----------------------------------------------------------------
     Reader cr{ cpu_data, cpu_size, 0 };
