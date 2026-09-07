@@ -20,6 +20,7 @@
 #include <config/version.h>
 #include <cpu/functions.h>
 #include <emuenv/state.h>
+#include <gxm/state.h>
 #include <io/state.h>
 #include <kernel/state.h>
 #include <kernel/sync_primitives.h>
@@ -279,6 +280,24 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
                     log_hex(thread->current_import_args[3]));
             }
         }
+    }
+
+    // --- refuse if a frame is in flight --------------------------------------------------------
+    // The display queue thread peeks the front entry, runs the guest's display callback, and only
+    // then pops it -- so an empty queue means no callback is part-way through. That matters
+    // because the callback's progress is tracked by renderer-side sync timestamps while the
+    // SceGxmSyncObject they are compared against lives in guest memory. A load rewinds the guest
+    // side and not the host side, and the queue thread is then waiting on a timestamp that will
+    // never arrive: the main thread blocks in sceGxmDisplayQueueAddEntry and the guest stops.
+    //
+    // Snapshotting only when the queue is empty removes the inconsistency rather than trying to
+    // restore around it. The caller drains it before quiescing the guest; this is the check that
+    // it actually worked, and it has to be here because by now nothing else can be running.
+    {
+        const std::lock_guard<std::mutex> queue_lock(emuenv.gxm.display_queue.get_mutex());
+        const size_t pending = emuenv.gxm.display_queue.size();
+        if (pending > 0)
+            return Result::fail(fmt::format("a frame is still in flight ({} display queue entries)", pending));
     }
 
     // --- WAIT: what each parked thread is blocked in ------------------------------------------
