@@ -24,6 +24,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 
 struct AllocMemPage {
     uint32_t allocated : 4;
@@ -71,6 +72,17 @@ struct MemState {
     AllocPageTable alloc_table;
     BitmapAllocator allocator;
     ProtectSegmentTrees protect_tree;
+    // Host pages currently carrying a protection set by protect_inner(). Lets the fault handler
+    // tell "this page is protected and I must act" from "another thread already handled this and
+    // unprotected it", which is otherwise indistinguishable once the segment has been erased
+    // from protect_tree.
+    //
+    // Has its own mutex rather than reusing protect_mutex: protect_inner/unprotect_inner are
+    // reached both from paths that already hold protect_mutex (add_protect,
+    // handle_access_violation) and from paths that do not (kubridge). It is always the innermost
+    // lock, so there is no ordering hazard.
+    std::mutex protected_pages_mutex;
+    std::set<Address> protected_pages;
 
     PageNameMap page_name_map;
 

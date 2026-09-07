@@ -269,7 +269,25 @@ bool diag_page_still_owned(const MemState &state, Address vaddr, PageOwner &out)
 }
 } // namespace
 
+// Record or clear the host pages a protection covers. protect_inner() and unprotect_inner() are
+// the only places page protection changes, so this set is the authoritative answer to "is this
+// page protected right now".
+static void note_pages(MemState &state, Address addr, uint32_t size, bool protect) {
+    if (size == 0)
+        return;
+    const Address first = align_down(addr, state.host_page_size);
+    const Address last = align_down(addr + size - 1, state.host_page_size);
+    const std::lock_guard<std::mutex> lock(state.protected_pages_mutex);
+    for (Address page = first; page <= last; page += state.host_page_size) {
+        if (protect)
+            state.protected_pages.insert(page);
+        else
+            state.protected_pages.erase(page);
+    }
+}
+
 void unprotect_inner(MemState &state, Address addr, uint32_t size) {
+    note_pages(state, addr, size, false);
     if (LOG_PROTECT) {
         fmt::print("Unprotect: {} {}\n", log_hex(addr), size);
     }
@@ -293,6 +311,7 @@ void unprotect_inner(MemState &state, Address addr, uint32_t size) {
 }
 
 void protect_inner(MemState &state, Address addr, uint32_t size, const MemPerm perm) {
+    note_pages(state, addr, size, true);
     diag_note_protect(state, addr, size);
     uint8_t *addr_ptr = state.use_page_table ? state.page_table[addr / KiB(4)] : state.memory.get();
 
@@ -360,6 +379,19 @@ bool handle_access_violation(MemState &state, uint8_t *addr, bool write) noexcep
     // Disgaea 3 hits this thousands of times per session. Logging every one drowns the log and
     // costs real time; logging only the first hides how often it happens. Count them all and
     // report the first few plus a periodic total.
+    // Two threads can fault on the same protected page before either handler runs. The first
+    // takes protect_mutex, invokes the callbacks, unprotects and erases the segment; the second
+    // then finds no segment and an already-writable page. That is the race resolving correctly,
+    // not an error -- the work was done by the other thread.
+    //
+    // Measured at the fault with VirtualQuery, every one of these reported the page already
+    // MEM_COMMIT + PAGE_READWRITE. Disgaea 3 produced thousands per session.
+    {
+        const std::lock_guard<std::mutex> pages_lock(state.protected_pages_mutex);
+        if (!state.protected_pages.contains(align_down(vaddr, state.host_page_size)))
+            return true;
+    }
+
     static std::atomic<uint64_t> unhandled_protect_count{ 0 };
     // Sample page ownership BEFORE unprotecting: unprotect_inner() clears the tracker entry,
     // so querying afterwards always reports "not owned" and tells you nothing. (It did exactly
