@@ -552,8 +552,13 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
             }
         }
 
-        // And the converse: a thread parked now that was not parked then is equally a mismatch,
+        // And the converse: a thread in a wait now that it was not in then is equally a mismatch,
         // because its host frame is one the snapshot knows nothing about.
+        //
+        // Matching on identity alone is not enough. A thread recorded in a self-completing wait --
+        // say a 1 ms delay -- can be sitting in a semaphore wait by the time the load runs, and an
+        // "is it in the list?" test passes that happily while the frame it is actually parked in
+        // is one the state never saw. Require the recorded entry to describe the same wait.
         for (const auto &pair : emuenv.kernel.threads) {
             const auto &thread = pair.second;
             if (!thread || thread->status != ThreadStatus::wait)
@@ -561,11 +566,19 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
             const uint32_t nid = thread->current_import_nid.load(std::memory_order_relaxed);
             if (is_self_completing_wait(nid))
                 continue;
-            const bool recorded = std::any_of(parked.begin(), parked.end(),
+            const auto recorded = std::find_if(parked.begin(), parked.end(),
                 [&](const ParkedWait &w) { return w.thread == pair.first; });
-            if (!recorded) {
+            if (recorded == parked.end()) {
                 return Result::fail(fmt::format("thread {} \"{}\" is waiting now but was not when the state was taken",
                     pair.first, thread->name));
+            }
+            if (recorded->nid != nid || recorded->args[0] != thread->current_import_args[0]
+                || recorded->args[1] != thread->current_import_args[1]
+                || recorded->args[2] != thread->current_import_args[2]) {
+                const char *const now = import_name(nid);
+                const char *const then = recorded->nid ? import_name(recorded->nid) : nullptr;
+                return Result::fail(fmt::format("thread {} \"{}\" is in {} now but was in {} when the state was taken",
+                    pair.first, thread->name, now ? now : "an unknown call", then ? then : "another call"));
             }
         }
     }
