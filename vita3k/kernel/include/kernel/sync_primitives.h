@@ -259,3 +259,10 @@ private:
 };
 
 typedef std::shared_ptr<MsgPipe> MsgPipePtr;
+
+// Savestate support. Restoring a semaphore's count writes a number that the queue of threads
+// already waiting on it knows nothing about, which can leave a waiter satisfiable with nobody left
+// to wake it -- Semaphore::signal is the only thing that ever wakes one. Re-establish the invariant
+// that signal maintains: on exit, every semaphore's queue is either empty or its front waiter
+// still needs more than the count can give.
+void reconcile_waiters_after_load(KernelState &kernel);
