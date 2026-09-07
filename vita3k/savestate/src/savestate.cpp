@@ -187,6 +187,30 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
             put(cpu_raw, entry.first);
             put(cpu_raw, entry.second);
         }
+
+        // A thread in ThreadStatus::wait is blocked inside a host C++ frame in one of the
+        // sync primitive helpers, and WaitingThreadData holds raw pointers into that frame's
+        // locals (was_canceled, outBits, result_pattern...). None of that lives in guest
+        // memory or registers, so those threads cannot be restored by any snapshot of the
+        // guest. Report how many there are: it decides whether restricting save points to
+        // "nothing is blocked" is even achievable.
+        int running = 0, dormant = 0, waiting = 0, suspended = 0;
+        for (const auto &pair : emuenv.kernel.threads) {
+            if (!pair.second)
+                continue;
+            switch (pair.second->status) {
+            case ThreadStatus::run: running++; break;
+            case ThreadStatus::dormant: dormant++; break;
+            case ThreadStatus::wait: waiting++; break;
+            case ThreadStatus::suspend: suspended++; break;
+            }
+        }
+        LOG_INFO("Savestate: thread status at snapshot - run {}, dormant {}, wait {}, suspend {}",
+            running, dormant, waiting, suspended);
+        LOG_WARN_IF(waiting > 0,
+            "Savestate: {} thread(s) are blocked inside an HLE call; their wait state cannot be captured "
+            "and they will resume as if the wait had returned",
+            waiting);
     }
 
     // --- assemble ---------------------------------------------------------------------------
