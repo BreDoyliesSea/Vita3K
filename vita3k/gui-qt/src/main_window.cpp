@@ -107,7 +107,9 @@
 #include <QWidgetAction>
 #include <QtResource>
 
+#include <algorithm>
 #include <chrono>
+#include <limits>
 #include <map>
 #include <optional>
 #include <string>
@@ -1483,7 +1485,43 @@ void MainWindow::on_fast_forward_cycled() {
         statusBar()->showMessage(tr("Fast-forward %1x").arg(speed), 3000);
 }
 
+// Wait for the GXM display queue to empty. Must happen *before* the guest is quiesced, not after:
+// the queue is drained by a host thread that runs a guest callback, so a paused guest can never
+// drain it and waiting under the pause would hang instead of settling.
+//
+// An empty queue means no display callback is part-way through, which is what makes a snapshot
+// restorable -- see the matching check in savestate::save for why.
+bool MainWindow::wait_for_display_queue_idle(int timeout_ms) {
+    const auto started = std::chrono::steady_clock::now();
+    const auto deadline = started + std::chrono::milliseconds(timeout_ms);
+    size_t smallest_seen = std::numeric_limits<size_t>::max();
+    while (std::chrono::steady_clock::now() < deadline) {
+        {
+            const std::lock_guard<std::mutex> lock(emuenv.gxm.display_queue.get_mutex());
+            const size_t pending = emuenv.gxm.display_queue.size();
+            smallest_seen = std::min(smallest_seen, pending);
+            if (pending == 0) {
+                const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - started);
+                LOG_INFO("Savestate: display queue idle after {} ms", waited.count());
+                return true;
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    LOG_WARN("Savestate: display queue never emptied in {} ms (smallest depth seen: {})",
+        timeout_ms, smallest_seen);
+    return false;
+}
+
 void MainWindow::on_quicksave_triggered() {
+    // The queue turns over about sixty times a second, so this normally returns immediately. If it
+    // does not, saying so beats writing a state that is known not to restore.
+    if (!wait_for_display_queue_idle(2000)) {
+        statusBar()->showMessage(tr("Quicksave: a frame is still in flight, try again"), 6000);
+        return;
+    }
+
     run_with_guest_quiesced("Quicksave", [this] {
         return savestate::save(emuenv, savestate::slot_path(emuenv, 0));
     });
