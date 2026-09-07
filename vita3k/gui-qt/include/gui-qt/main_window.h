@@ -114,6 +114,7 @@ private slots:
     void on_pause_triggered();
     void on_stop_triggered();
     void on_quicksave_triggered();
+    void on_fast_forward_cycled();
     void on_quickload_triggered();
     void run_with_guest_quiesced(const char *what, const std::function<savestate::Result()> &action);
     void on_ps_button();

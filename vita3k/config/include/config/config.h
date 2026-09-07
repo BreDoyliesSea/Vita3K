@@ -93,6 +93,7 @@ using PhysicalKeyCode = input::PhysicalKeyCode;
     code(PhysicalKeyCode, "keyboard-take-screenshot", PhysicalKeyCode::Unbound, keyboard_take_screenshot)                              \
     code(PhysicalKeyCode, "keyboard-quicksave", PhysicalKeyCode::F5, keyboard_quicksave)                                                  \
     code(PhysicalKeyCode, "keyboard-quickload", PhysicalKeyCode::F8, keyboard_quickload)                                                  \
+    code(PhysicalKeyCode, "keyboard-fast-forward", PhysicalKeyCode::F6, keyboard_fast_forward)                                          \
     code(PhysicalKeyCode, "keyboard-pinch-modifier", PhysicalKeyCode::Unbound, keyboard_pinch_modifier)                                \
     code(PhysicalKeyCode, "keyboard-alternate-pinch-in", PhysicalKeyCode::Unbound, keyboard_alternate_pinch_in)                        \
     code(PhysicalKeyCode, "keyboard-alternate-pinch-out", PhysicalKeyCode::Unbound, keyboard_alternate_pinch_out)                      \
@@ -127,6 +128,7 @@ using PhysicalKeyCode = input::PhysicalKeyCode;
     code(PhysicalKeyCode, "keyboard-take-screenshot-alt", PhysicalKeyCode::Unbound, keyboard_take_screenshot_alt)                      \
     code(PhysicalKeyCode, "keyboard-quicksave-alt", PhysicalKeyCode::Unbound, keyboard_quicksave_alt)                                     \
     code(PhysicalKeyCode, "keyboard-quickload-alt", PhysicalKeyCode::Unbound, keyboard_quickload_alt)                                     \
+    code(PhysicalKeyCode, "keyboard-fast-forward-alt", PhysicalKeyCode::Unbound, keyboard_fast_forward_alt)                             \
     code(PhysicalKeyCode, "keyboard-pinch-modifier-alt", PhysicalKeyCode::Unbound, keyboard_pinch_modifier_alt)                        \
     code(PhysicalKeyCode, "keyboard-alternate-pinch-in-alt", PhysicalKeyCode::Unbound, keyboard_alternate_pinch_in_alt)                \
     code(PhysicalKeyCode, "keyboard-alternate-pinch-out-alt", PhysicalKeyCode::Unbound, keyboard_alternate_pinch_out_alt)

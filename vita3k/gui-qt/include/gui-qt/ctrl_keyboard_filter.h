@@ -38,6 +38,7 @@ signals:
     void screenshot_requested();
     void quicksave_requested();
     void quickload_requested();
+    void fast_forward_cycled();
 
 protected:
     bool eventFilter(QObject *watched, QEvent *event) override;

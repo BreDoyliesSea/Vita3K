@@ -55,6 +55,7 @@
 #include <config/state.h>
 #include <config/version.h>
 #include <ctrl/functions.h>
+#include <display/functions.h>
 #include <display/state.h>
 #include <gxm/state.h>
 #include <interface.h>
@@ -1036,6 +1037,9 @@ std::optional<AppLaunchRequest> MainWindow::boot_game_once(const AppLaunchReques
     connect(m_kb_filter, &CtrlKeyboardFilter::quickload_requested,
         this, [this]() { on_quickload_triggered(); });
 
+    connect(m_kb_filter, &CtrlKeyboardFilter::fast_forward_cycled,
+        this, [this]() { on_fast_forward_cycled(); });
+
     if (auto next_request = take_pending_app_launch_request()) {
         on_game_closed();
         return next_request;
@@ -1359,6 +1363,23 @@ void MainWindow::run_with_guest_quiesced(const char *what, const std::function<s
                                      QString::fromStdString(result.reason)),
             8000);
     }
+}
+
+void MainWindow::on_fast_forward_cycled() {
+    // Unlike quicksave this does not quiesce the guest. Changing the speed only changes how long
+    // the vblank generator sleeps between frames, which it re-reads every frame, so there is
+    // nothing to pause and no state to keep consistent.
+    if (!m_game_window) {
+        statusBar()->showMessage(tr("Fast-forward: no game is running"), 4000);
+        return;
+    }
+
+    const uint32_t speed = cycle_speed_multiplier(emuenv.display);
+    LOG_INFO("Fast-forward: {}x", speed);
+    if (speed == 1)
+        statusBar()->showMessage(tr("Fast-forward off (normal speed)"), 3000);
+    else
+        statusBar()->showMessage(tr("Fast-forward %1x").arg(speed), 3000);
 }
 
 void MainWindow::on_quicksave_triggered() {
