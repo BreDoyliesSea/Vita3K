@@ -789,6 +789,12 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
             return Result::fail("corrupt sync chunk");
     }
 
+    // Restoring the counts above wrote numbers the waiting-thread queues know nothing about. A
+    // waiter can now be satisfiable with nobody left to wake it, because semaphore_signal is the
+    // only thing that ever wakes one -- which presents as the guest hanging with a correct-looking
+    // frame on screen. Put the invariant back.
+    reconcile_waiters_after_load(emuenv.kernel);
+
     // Host-side audio decoders hold a position inside the stream they were decoding. Guest memory
     // has just been rewound underneath them, so that position is now wrong and the next frame
     // unpacks nonsense -- observed as a storm of Atrac9 decode failures ending in a fault. Tell
