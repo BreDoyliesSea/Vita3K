@@ -162,14 +162,30 @@ void call_import(EmuEnvState &emuenv, CPUState &cpu, uint32_t nid, SceUID thread
     }
     const ImportFn *fn = resolve_import(nid);
     if (fn) {
-        // Track which import this thread is inside, restoring the previous value rather than
-        // clearing it: an HLE function can run a guest callback that calls back into another
-        // import, so these nest.
+        // Track which import this thread is inside and the arguments it was handed, restoring
+        // the previous values rather than clearing them: an HLE function can run a guest callback
+        // that calls back into another import, so these nest.
+        //
+        // Load-then-store rather than exchange, and plain stores for the arguments: this runs on
+        // every HLE call, and a lock-prefixed exchange here would be paying for atomicity that
+        // nothing needs (see the note in ThreadState).
         const ThreadStatePtr caller = emuenv.kernel.get_thread(thread_id);
-        const uint32_t outer_nid = caller ? caller->current_import_nid.exchange(nid, std::memory_order_relaxed) : 0;
+        uint32_t outer_nid = 0;
+        uint32_t outer_args[4]{};
+        if (caller) {
+            outer_nid = caller->current_import_nid.load(std::memory_order_relaxed);
+            caller->current_import_nid.store(nid, std::memory_order_relaxed);
+            for (int i = 0; i < 4; i++) {
+                outer_args[i] = caller->current_import_args[i];
+                caller->current_import_args[i] = read_reg(cpu, i);
+            }
+        }
         (*fn)(emuenv, cpu, thread_id);
-        if (caller)
+        if (caller) {
             caller->current_import_nid.store(outer_nid, std::memory_order_relaxed);
+            for (int i = 0; i < 4; i++)
+                caller->current_import_args[i] = outer_args[i];
+        }
     } else {
         const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
         // make the function return 0
