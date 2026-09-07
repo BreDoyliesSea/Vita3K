@@ -94,6 +94,9 @@ bool CtrlKeyboardFilter::eventFilter(QObject *watched, QEvent *event) {
         if (pressed && matches(cfg.keyboard_fast_forward, cfg.keyboard_fast_forward_alt))
             emit fast_forward_cycled();
 
+        if (pressed && matches(cfg.keyboard_dump_threads, cfg.keyboard_dump_threads_alt))
+            emit thread_dump_requested();
+
         return false;
     }
     case QEvent::MouseButtonPress:

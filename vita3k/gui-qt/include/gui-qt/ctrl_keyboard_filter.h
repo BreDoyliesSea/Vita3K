@@ -39,6 +39,7 @@ signals:
     void quicksave_requested();
     void quickload_requested();
     void fast_forward_cycled();
+    void thread_dump_requested();
 
 protected:
     bool eventFilter(QObject *watched, QEvent *event) override;

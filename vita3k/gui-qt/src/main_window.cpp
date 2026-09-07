@@ -54,6 +54,8 @@
 #include <config/settings.h>
 #include <config/state.h>
 #include <config/version.h>
+#include <cpu/functions.h>
+#include <nids/functions.h>
 #include <ctrl/functions.h>
 #include <display/functions.h>
 #include <display/state.h>
@@ -105,7 +107,12 @@
 #include <QWidgetAction>
 #include <QtResource>
 
+#include <chrono>
+#include <map>
 #include <optional>
+#include <string>
+#include <thread>
+#include <vector>
 
 #if defined(HAVE_X11) || defined(HAVE_WAYLAND)
 #include <qpa/qplatformnativeinterface.h>
@@ -1040,6 +1047,9 @@ std::optional<AppLaunchRequest> MainWindow::boot_game_once(const AppLaunchReques
     connect(m_kb_filter, &CtrlKeyboardFilter::fast_forward_cycled,
         this, [this]() { on_fast_forward_cycled(); });
 
+    connect(m_kb_filter, &CtrlKeyboardFilter::thread_dump_requested,
+        this, [this]() { on_thread_dump_requested(); });
+
     if (auto next_request = take_pending_app_launch_request()) {
         on_game_closed();
         return next_request;
@@ -1363,6 +1373,97 @@ void MainWindow::run_with_guest_quiesced(const char *what, const std::function<s
                                      QString::fromStdString(result.reason)),
             8000);
     }
+}
+
+void MainWindow::on_thread_dump_requested() {
+    // A snapshot of what every guest thread is doing right now. Built for diagnosing a guest that
+    // has stopped making progress, where the useful question is not "which threads are waiting"
+    // -- that distribution looks normal even when nothing is advancing -- but "what is the one
+    // that is still running actually doing".
+    //
+    // Running threads get their PC sampled twice, because a thread spinning on a flag that will
+    // never be set and a thread making slow progress are indistinguishable from one sample.
+    if (!m_game_window) {
+        statusBar()->showMessage(tr("Thread dump: no game is running"), 4000);
+        return;
+    }
+
+    struct Sample {
+        SceUID id;
+        ThreadStatePtr thread;
+        std::string name;
+        ThreadStatus status;
+        uint32_t nid;
+        uint32_t args[3];
+        uint32_t pc, lr, sp;
+        std::string traceback;
+    };
+    std::vector<Sample> samples;
+    std::map<SceUID, uint32_t> first_pc;
+
+    // Everything that reads kernel state happens under the kernel lock and nothing else does.
+    // log_stack_traceback() in particular must NOT be called from here: it resolves addresses via
+    // KernelState::find_module_by_addr, which takes the same non-recursive mutex, and locking it
+    // twice on one thread terminates the process outright.
+    const auto collect = [&](std::map<SceUID, uint32_t> *pc_only) {
+        const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
+        for (const auto &pair : emuenv.kernel.threads) {
+            const auto &thread = pair.second;
+            if (!thread || !thread->cpu)
+                continue;
+            if (pc_only) {
+                (*pc_only)[pair.first] = read_pc(*thread->cpu);
+                continue;
+            }
+            Sample s{};
+            s.id = pair.first;
+            s.thread = thread; // keeps it alive once the lock is gone
+            s.name = thread->name;
+            s.status = thread->status;
+            s.nid = thread->current_import_nid.load(std::memory_order_relaxed);
+            for (int i = 0; i < 3; i++)
+                s.args[i] = thread->current_import_args[i];
+            s.pc = read_pc(*thread->cpu);
+            s.lr = read_lr(*thread->cpu);
+            s.sp = read_sp(*thread->cpu);
+            samples.push_back(std::move(s));
+        }
+    };
+
+    collect(&first_pc);
+    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    collect(nullptr);
+
+    for (Sample &s : samples) {
+        if (s.status == ThreadStatus::run && s.thread)
+            s.traceback = s.thread->log_stack_traceback();
+    }
+
+    const auto status_name = [](ThreadStatus s) {
+        switch (s) {
+        case ThreadStatus::run: return "run ";
+        case ThreadStatus::dormant: return "dorm";
+        case ThreadStatus::wait: return "wait";
+        case ThreadStatus::suspend: return "susp";
+        }
+        return "????";
+    };
+
+    LOG_INFO("=== thread dump: {} thread(s) ===", samples.size());
+    for (const Sample &s : samples) {
+        const char *const import = s.nid ? import_name(s.nid) : nullptr;
+        const auto before = first_pc.find(s.id);
+        const bool moved = before != first_pc.end() && before->second != s.pc;
+        LOG_INFO("  [{}] id={} \"{}\" pc={}{} lr={} sp={} in {}({}, {}, {})",
+            status_name(s.status), s.id, s.name, log_hex(s.pc),
+            (s.status == ThreadStatus::run) ? (moved ? " (advancing)" : " (PC UNCHANGED over 250ms)") : "",
+            log_hex(s.lr), log_hex(s.sp), import ? import : "-",
+            log_hex(s.args[0]), log_hex(s.args[1]), log_hex(s.args[2]));
+        if (!s.traceback.empty())
+            LOG_INFO("{}", s.traceback);
+    }
+    LOG_INFO("=== end thread dump ===");
+    statusBar()->showMessage(tr("Thread dump written to the log (%1 threads)").arg(samples.size()), 4000);
 }
 
 void MainWindow::on_fast_forward_cycled() {
