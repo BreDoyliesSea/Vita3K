@@ -52,8 +52,14 @@ constexpr uint32_t TAG_CPU = 0x20555043U; // "CPU "
 // A state records the emulator build that produced it. Guest memory is full of pointers into
 // host-side structures whose layout this binary fixes, so a state from a different build is
 // not merely stale, it is actively dangerous. Refuse it rather than crash confusingly later.
+//
+// app_hash is part of the identity, not just the version and build number. Those two do not
+// change when the working tree is rebuilt, so without the hash the check passed for exactly the
+// case it exists to catch: edit the emulator, rebuild, load a state whose host layout assumptions
+// the new binary no longer shares. Anyone developing against this hits that; a released build
+// never would.
 std::string build_identity() {
-    return std::string(app_version) + "-" + std::to_string(app_number);
+    return std::string(app_version) + "-" + std::to_string(app_number) + "-" + app_hash;
 }
 
 template <typename T>
@@ -229,6 +235,28 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
                 const char *const name = nid ? import_name(nid) : nullptr;
                 LOG_INFO("Savestate:   {} thread(s) parked in {} ({})", count,
                     name ? name : "no import in flight", log_hex(nid));
+            }
+
+            // And the arguments each one was called with. A restore re-enters the call rather
+            // than rebuilding its host frame, so these values are the whole input to that -- for
+            // sceKernelWaitSema they are semaId, needCount and a guest pointer to the timeout.
+            // Logged so the design can be checked against real values before anything relies on
+            // them.
+            //
+            // LOG_INFO, not LOG_DEBUG: spdlog's compile-time SPDLOG_ACTIVE_LEVEL defaults to INFO,
+            // so LOG_DEBUG is not merely filtered at runtime, it is compiled out. No log-level
+            // setting brings it back, which makes a debug line here look like "no threads found"
+            // rather than "this code cannot emit". This runs once per savestate, on user request.
+            for (const auto &pair : emuenv.kernel.threads) {
+                const auto &thread = pair.second;
+                if (!thread || thread->status != ThreadStatus::wait)
+                    continue;
+                const uint32_t nid = thread->current_import_nid.load(std::memory_order_relaxed);
+                const char *const name = nid ? import_name(nid) : nullptr;
+                LOG_INFO("Savestate:     thread {} \"{}\" in {} args {} {} {} {}", pair.first,
+                    thread->name, name ? name : "-", log_hex(thread->current_import_args[0]),
+                    log_hex(thread->current_import_args[1]), log_hex(thread->current_import_args[2]),
+                    log_hex(thread->current_import_args[3]));
             }
         }
     }
