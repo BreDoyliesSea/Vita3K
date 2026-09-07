@@ -16,6 +16,8 @@
 // 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
 #include <mem/functions.h>
+
+#include <atomic>
 #include <mem/state.h>
 
 #include <util/align.h>
@@ -298,11 +300,38 @@ bool handle_access_violation(MemState &state, uint8_t *addr, bool write) noexcep
         fmt::print("Access: {}\n", log_hex(vaddr));
     }
 
+    // DIAG: protect_inner() protects whole host pages, but protect_tree records only the exact
+    // segment. A write to the remainder of a protected page therefore resolves to nothing and
+    // takes the unprotect-and-continue path below -- which also drops protection on the tracked
+    // segment sharing that page, so the renderer stops being told the buffer changed. Report
+    // whether the faulting address really is on a page that holds a tracked segment.
+    const auto page_of = [&](Address a) { return align_down(a, state.host_page_size); };
+    const auto shares_page_with_segment = [&](Address a) {
+        const Address page = page_of(a);
+        for (const auto &[seg_addr, seg_info] : state.protect_tree) {
+            if (page_of(seg_addr) <= page && page < page_of(seg_addr + seg_info.size - 1) + state.host_page_size)
+                return true;
+        }
+        return false;
+    };
+
+    // Disgaea 3 hits this thousands of times per session. Logging every one drowns the log and
+    // costs real time; logging only the first hides how often it happens. Count them all and
+    // report the first few plus a periodic total.
+    static std::atomic<uint64_t> unhandled_protect_count{ 0 };
+    const auto report_unhandled = [&](const char *what, Address nearest, uint32_t nearest_size) {
+        const uint64_t n = unhandled_protect_count.fetch_add(1) + 1;
+        if (n <= 4 || (n % 1000) == 0) {
+            LOG_CRITICAL("Unhandled write protected region was valid. Address=0x{:X} ({}, nearest segment 0x{:X}+{}, page shares a tracked segment: {}) [occurrence {}]",
+                vaddr, what, nearest, nearest_size, shares_page_with_segment(vaddr), n);
+        }
+    };
+
     auto it = state.protect_tree.lower_bound(vaddr);
     if (it == state.protect_tree.end()) {
         // HACK: keep going
         unprotect_inner(state, align_down(vaddr, state.host_page_size), state.host_page_size);
-        LOG_CRITICAL("Unhandled write protected region was valid. Address=0x{:X}", vaddr);
+        report_unhandled("no segment at or below", 0, 0);
         return true;
     }
 
@@ -310,7 +339,7 @@ bool handle_access_violation(MemState &state, uint8_t *addr, bool write) noexcep
     if (vaddr < it->first || vaddr >= it->first + info.size) {
         // HACK: keep going
         unprotect_inner(state, align_down(vaddr, state.host_page_size), state.host_page_size);
-        LOG_CRITICAL("Unhandled write protected region was valid. Address=0x{:X}", vaddr);
+        report_unhandled("outside nearest segment", it->first, info.size);
         return true;
     }
 
