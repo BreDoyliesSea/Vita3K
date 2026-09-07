@@ -542,6 +542,35 @@ SceInt32 Semaphore::signal(SceInt32 count) {
     return SCE_KERNEL_OK;
 }
 
+void reconcile_waiters_after_load(KernelState &kernel) {
+    // Snapshot the semaphores out of the UID table, then work without its lock, as Semaphore::signal
+    // does: waking a waiter takes the semaphore's lock and then the thread's.
+    std::vector<SceUID> semaphore_uids;
+    kernel.objects.for_each<Semaphore>([&](Semaphore &semaphore) { semaphore_uids.push_back(semaphore.uid); });
+
+    int woken = 0;
+    for (const SceUID uid : semaphore_uids) {
+        const SemaphorePtr semaphore = kernel.objects.find<Semaphore>(uid);
+        if (!semaphore)
+            continue;
+        const auto guard = semaphore->lock();
+        if (!guard)
+            continue;
+
+        // Same drain as Semaphore::signal
+        while (auto *waiter = semaphore->waiters.front()) {
+            if (semaphore->val < waiter->entry.need_count)
+                break;
+
+            semaphore->val -= waiter->entry.need_count;
+            semaphore->waiters.wake(*waiter);
+            woken++;
+        }
+    }
+
+    LOG_INFO_IF(woken > 0, "Savestate: released {} thread(s) whose semaphore was restored above their wait", woken);
+}
+
 SceInt32 Semaphore::cancel(SceInt32 set_count, SceUInt32 *num_wait_threads) {
     const auto guard = lock();
     if (!guard)
