@@ -24,6 +24,7 @@
 #include <mem/block.h>
 #include <mem/ptr.h>
 
+#include <atomic>
 #include <condition_variable>
 #include <list>
 #include <mutex>
@@ -67,6 +68,13 @@ struct ThreadState {
     ThreadStatus status = ThreadStatus::dormant;
     // What the thread waits on while waiting, empty otherwise
     WaitTarget wait_target;
+
+    // NID of the HLE import this thread is currently executing, 0 when it is running guest code.
+    // Maintained by call_import(). A thread in ThreadStatus::wait is parked inside one of these,
+    // in a host C++ frame that no snapshot of guest memory can describe, so this is the only
+    // thing that says *which* call would have to be re-entered to restore it. Atomic because a
+    // savestate reads it from another thread while this one is still running.
+    std::atomic<uint32_t> current_import_nid{ 0 };
 
     std::condition_variable status_cond;
     uint32_t returned_value = 0;
