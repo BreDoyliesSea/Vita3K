@@ -69,12 +69,17 @@ struct ThreadState {
     // What the thread waits on while waiting, empty otherwise
     WaitTarget wait_target;
 
-    // NID of the HLE import this thread is currently executing, 0 when it is running guest code.
-    // Maintained by call_import(). A thread in ThreadStatus::wait is parked inside one of these,
-    // in a host C++ frame that no snapshot of guest memory can describe, so this is the only
-    // thing that says *which* call would have to be re-entered to restore it. Atomic because a
-    // savestate reads it from another thread while this one is still running.
+    // NID of the HLE import this thread is currently executing, 0 when it is running guest code,
+    // and the ABI argument registers it was called with. Maintained by call_import(). A thread in
+    // ThreadStatus::wait is parked inside one of these, in a host C++ frame that no snapshot of
+    // guest memory can describe, so together these are what a restore would need in order to
+    // re-enter the call rather than reconstruct the frame.
+    //
+    // The NID is atomic because a savestate reads it from another thread that may still be
+    // running. The arguments are plain: they are only ever read for a thread already parked in
+    // ThreadStatus::wait, which by definition is not writing them.
     std::atomic<uint32_t> current_import_nid{ 0 };
+    uint32_t current_import_args[4]{};
 
     std::condition_variable status_cond;
     uint32_t returned_value = 0;
