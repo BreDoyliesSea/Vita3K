@@ -79,6 +79,10 @@ struct DisplayState {
     // or run twice as fast (if they only rely on these function calls for their timings)
     bool fps_hack = false;
 
+    // Fast-forward. The vblank generator paces the whole guest, so dividing its period speeds
+    // everything up together. 1 is normal speed. Read every frame so it can be changed live.
+    std::atomic<uint32_t> speed_multiplier{ 1 };
+
     // should contain the list of sync objects / swapchain images (in the order they appear in the cycle)
     std::vector<PredictedDisplayFrame> predicted_frames;
     // position in the predicted_frame cycle (the -1 is needed)
