@@ -162,7 +162,14 @@ void call_import(EmuEnvState &emuenv, CPUState &cpu, uint32_t nid, SceUID thread
     }
     const ImportFn *fn = resolve_import(nid);
     if (fn) {
+        // Track which import this thread is inside, restoring the previous value rather than
+        // clearing it: an HLE function can run a guest callback that calls back into another
+        // import, so these nest.
+        const ThreadStatePtr caller = emuenv.kernel.get_thread(thread_id);
+        const uint32_t outer_nid = caller ? caller->current_import_nid.exchange(nid, std::memory_order_relaxed) : 0;
         (*fn)(emuenv, cpu, thread_id);
+        if (caller)
+            caller->current_import_nid.store(outer_nid, std::memory_order_relaxed);
     } else {
         const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
         // make the function return 0
