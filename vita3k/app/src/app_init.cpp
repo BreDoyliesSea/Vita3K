@@ -597,6 +597,11 @@ void apply_renderer_config(EmuEnvState &emuenv) {
         r.set_turbo_mode(emuenv.cfg.turbo_mode);
 #endif
     emuenv.display.fps_hack = cc.fps_hack;
+    {
+        const uint32_t ff = static_cast<uint32_t>(std::max(1, emuenv.cfg.fast_forward_speed));
+        emuenv.display.speed_multiplier.store(ff, std::memory_order_relaxed);
+        LOG_INFO_IF(ff > 1, "Fast-forward: running the vblank clock at {}x", ff);
+    }
 
     if (!emuenv.overlay_manager)
         emuenv.overlay_manager = std::make_unique<overlay::display_manager>();
@@ -690,6 +695,11 @@ void apply_runtime_settings(EmuEnvState &emuenv) {
         r.set_turbo_mode(emuenv.cfg.turbo_mode);
 #endif
     emuenv.display.fps_hack = cc.fps_hack;
+    {
+        const uint32_t ff = static_cast<uint32_t>(std::max(1, emuenv.cfg.fast_forward_speed));
+        emuenv.display.speed_multiplier.store(ff, std::memory_order_relaxed);
+        LOG_INFO_IF(ff > 1, "Fast-forward: running the vblank clock at {}x", ff);
+    }
     r.sys_date_format = cc.sys_date_format;
     r.sys_lang = cc.sys_lang;
     r.sys_button = cc.sys_button;

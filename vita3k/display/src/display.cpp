@@ -67,8 +67,12 @@ static void vblank_sync_thread(EmuEnvState &emuenv) {
                 return waiter.entry.target_vcount <= display.vblank_count;
             });
         }
+        // Fast-forward divides the vblank period. Everything the guest paces off vblank -- its
+        // frame loop, sceDisplayWait, sceTouchRead -- speeds up together.
+        const int64_t speed = std::max<uint32_t>(1, display.speed_multiplier.load(std::memory_order_relaxed));
+        const int64_t period = std::max<int64_t>(1, TARGET_MICRO_PER_FRAME / speed);
         const auto time_ms = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-        const auto time_left = TARGET_MICRO_PER_FRAME - (time_ms % TARGET_MICRO_PER_FRAME);
+        const auto time_left = period - (time_ms % period);
         std::this_thread::sleep_for(std::chrono::microseconds(time_left));
     }
 }
@@ -219,6 +223,7 @@ void DisplayState::deinit() {
     last_setframe_vblank_count = 0;
 
     fps_hack = false;
+    speed_multiplier.store(1);
     // pretty sure we set this on game boot
     fullscreen = false;
 }
