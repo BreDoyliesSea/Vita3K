@@ -367,6 +367,21 @@ void deinit(State &ngs, MemState &mem) {
     ngs.definitions = Ptr<VoiceDefinition>(0);
 }
 
+void collect_host_owned_memspaces(State &ngs, const MemState &mem, std::vector<Address> &out) {
+    // Must be called *before* guest memory is overwritten -- this walk is only safe while the
+    // host pointers embedded in these objects are still this process's own.
+    for (System *system : ngs.systems) {
+        if (!system)
+            continue;
+        out.push_back(system->memspace.address());
+        for (Rack *rack : system->racks) {
+            if (!rack)
+                continue;
+            out.push_back(rack->memspace.address());
+        }
+    }
+}
+
 void on_savestate_loaded(State &ngs, const MemState &mem) {
     for (System *system : ngs.systems) {
         if (!system)

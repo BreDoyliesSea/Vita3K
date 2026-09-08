@@ -893,6 +893,7 @@ std::string to_debug_str<SceGxmTransferFlags>(const MemState &mem, SceGxmTransfe
 }
 
 static void display_entry_thread(EmuEnvState &emuenv) {
+    logging::name_this_thread("gxm display queue");
     auto &display_queue = emuenv.gxm.display_queue;
     const Address callback_address = emuenv.gxm.params.displayQueueCallback.address();
     const ThreadStatePtr display_thread = emuenv.kernel.get_thread(emuenv.gxm.display_queue_thread);
@@ -1360,6 +1361,29 @@ struct SceGxmRenderTarget {
     std::uint16_t scenesPerFrame;
     SceUID driverMemBlock;
 };
+
+// See the declaration in gxm/functions.h. Defined here because SceGxmContext and
+// SceGxmRenderTarget are only complete in this translation unit.
+void gxm::collect_host_owned_ranges(GxmState &gxm, const MemState &mem,
+    std::vector<std::pair<Address, uint32_t>> &out) {
+    {
+        const std::lock_guard<std::mutex> lock(gxm.sync_objects_mutex);
+        for (SceGxmSyncObject *sync_object : gxm.sync_objects) {
+            if (!sync_object)
+                continue;
+            out.emplace_back(Ptr<SceGxmSyncObject>(sync_object, mem).address(),
+                static_cast<uint32_t>(sizeof(SceGxmSyncObject)));
+        }
+    }
+
+    if (gxm.immediate_context)
+        out.emplace_back(gxm.immediate_context, static_cast<uint32_t>(sizeof(SceGxmContext)));
+    for (const auto &[_, address] : gxm.deferred_contexts)
+        out.emplace_back(address, static_cast<uint32_t>(sizeof(SceGxmContext)));
+    for (const auto &[_, address] : gxm.render_targets)
+        out.emplace_back(address, static_cast<uint32_t>(sizeof(SceGxmRenderTarget)));
+}
+
 
 static int destroy_gxm_render_target(EmuEnvState &emuenv, SceGxmRenderTarget *render_target, const Address render_target_addr, const bool force_backend_destroy) {
     if (!render_target) {

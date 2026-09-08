@@ -269,10 +269,14 @@ static void log_fault_origin(PEXCEPTION_POINTERS pExp) {
 
 static LONG WINAPI exception_handler(PEXCEPTION_POINTERS pExp) noexcept {
     const unsigned ec = pExp->ExceptionRecord->ExceptionCode;
+    // Deliberately NOT called for every exception code. On EXCEPTION_STACK_OVERFLOW there is no
+    // stack budget left to run it in -- it allocates a std::string and calls into dbghelp -- and
+    // doing so killed the process outright before anything reached the log.
+    if (ec == EXCEPTION_ACCESS_VIOLATION)
+        log_fault_origin(pExp);
     switch (ec) {
     case EXCEPTION_ACCESS_VIOLATION:
         LOG_CRITICAL("Exception EXCEPTION_ACCESS_VIOLATION ({}). ", log_hex(ec));
-        log_fault_origin(pExp);
         switch (pExp->ExceptionRecord->ExceptionInformation[0]) {
         case 0:
             LOG_CRITICAL("Read violation at address {}.", log_hex(pExp->ExceptionRecord->ExceptionInformation[1]));

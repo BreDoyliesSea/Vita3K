@@ -27,6 +27,7 @@
 #include <kernel/thread/thread_state.h>
 #include <mem/functions.h>
 #include <mem/state.h>
+#include <gxm/functions.h>
 #include <ngs/state.h>
 #include <nids/functions.h>
 #include <util/log.h>
@@ -610,14 +611,26 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
             if (it == emuenv.kernel.threads.end() || !it->second)
                 return Result::fail(fmt::format("thread {} from the state no longer exists", w.thread));
             const auto &thread = it->second;
+            const uint32_t now_nid = thread->current_import_nid.load(std::memory_order_relaxed);
             if (thread->status != ThreadStatus::wait
-                || thread->current_import_nid.load(std::memory_order_relaxed) != w.nid
+                || now_nid != w.nid
                 || thread->current_import_args[0] != w.args[0]
                 || thread->current_import_args[1] != w.args[1]
                 || thread->current_import_args[2] != w.args[2]) {
+                // Say which of the four things differs. "Has moved on" on its own does not
+                // distinguish a thread that is off doing work from one that is parked in the
+                // right call on the wrong object, and the two have different odds of coming back.
+                const char *what = "is running";
+                if (thread->status != ThreadStatus::wait)
+                    what = "is not waiting";
+                else if (now_nid != w.nid)
+                    what = "is in a different call";
+                else
+                    what = "is waiting on a different object";
                 return Result::fail(fmt::format(
-                    "thread {} \"{}\" has moved on since the state was taken (was waiting on semaphore {})",
-                    w.thread, thread->name, log_hex(w.args[0])));
+                    "thread {} \"{}\" {} (state has it in semaphore {}, now {} on {})",
+                    w.thread, thread->name, what, log_hex(w.args[0]),
+                    now_nid ? import_name(now_nid) : "nothing", log_hex(thread->current_import_args[0])));
             }
         }
 
@@ -699,7 +712,20 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
     // realloc was the problem. It is not -- the faults are host code following pointers that were
     // already stale -- but the single hold is kept, because the walk and the copy do want to be
     // atomic with respect to the guest.
-    uint32_t freed = 0, reallocated = 0, unrecoverable = 0, skipped = 0;
+    // Regions that hold host objects placement-new'd into guest memory. Their bytes are captured
+    // like any other guest memory, but they contain this-process host pointers, so restoring a
+    // state taken by a different process installs pointers into a heap that no longer exists.
+    // Collected before anything is overwritten, while the walk is still safe.
+    std::vector<Address> host_owned;
+    ngs::collect_host_owned_memspaces(emuenv.ngs, emuenv.mem, host_owned);
+
+    // GXM keeps its host objects in smaller pieces of guest memory that sit alongside real guest
+    // data, so those are skipped by byte range rather than by whole region.
+    std::vector<std::pair<Address, uint32_t>> host_owned_ranges;
+    gxm::collect_host_owned_ranges(emuenv.gxm, emuenv.mem, host_owned_ranges);
+
+    uint32_t freed = 0, reallocated = 0, unrecoverable = 0, skipped = 0, host_owned_skipped = 0;
+    uint32_t host_owned_ranges_skipped = 0;
     {
         const std::lock_guard<std::mutex> alloc_lock(emuenv.mem.generation_mutex);
 
@@ -736,7 +762,45 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
                 skipped++;
                 continue;
             }
-            std::memcpy(emuenv.mem.memory.get() + region.addr, mem_raw.data() + region.offset, region.size);
+            const bool host_owned_region = std::any_of(host_owned.begin(), host_owned.end(),
+                [&](Address addr) { return addr >= region.addr && addr < region.addr + region.size; });
+            if (host_owned_region) {
+                // Leave it as it is. The guest's own view of this pool goes un-rewound, which can
+                // leave audio out of step until the next thing that resets it -- far better than
+                // installing another process's pointers and faulting on the first walk.
+                host_owned_skipped++;
+                continue;
+            }
+
+            // Copy the region, stepping over any host-owned range inside it. The ranges are few
+            // and small, so a linear scan per region is cheaper than any indexing would be.
+            uint8_t *const dest = emuenv.mem.memory.get() + region.addr;
+            const uint8_t *const src = mem_raw.data() + region.offset;
+            uint32_t at = 0;
+            while (at < region.size) {
+                uint32_t next_hole_start = region.size;
+                uint32_t next_hole_end = region.size;
+                for (const auto &[hole_addr, hole_size] : host_owned_ranges) {
+                    if (hole_addr + hole_size <= region.addr || hole_addr >= region.addr + region.size)
+                        continue;
+                    const uint32_t start = (hole_addr <= region.addr) ? 0 : hole_addr - region.addr;
+                    const uint32_t end = std::min(region.size, (hole_addr + hole_size) - region.addr);
+                    if (end <= at)
+                        continue;
+                    if (start < next_hole_start) {
+                        next_hole_start = std::max(start, at);
+                        next_hole_end = end;
+                    }
+                }
+
+                if (next_hole_start > at)
+                    std::memcpy(dest + at, src + at, next_hole_start - at);
+                if (next_hole_end > next_hole_start)
+                    host_owned_ranges_skipped++;
+                at = std::max(next_hole_end, next_hole_start);
+                if (next_hole_start == region.size)
+                    break;
+            }
         }
     }
 
@@ -747,6 +811,12 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
 
     if (skipped > 0)
         LOG_WARN("Savestate: {} region(s) are still not mapped and were skipped", skipped);
+
+    if (host_owned_skipped > 0)
+        LOG_INFO("Savestate: {} region(s) hold host objects and were left as they are", host_owned_skipped);
+
+    if (host_owned_ranges_skipped > 0)
+        LOG_INFO("Savestate: stepped over {} host-owned range(s) inside restored regions", host_owned_ranges_skipped);
 
     // --- restore CPU contexts -----------------------------------------------------------------
     Reader cr{ cpu_data, cpu_size, 0 };

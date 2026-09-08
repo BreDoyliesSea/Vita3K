@@ -23,6 +23,8 @@
 #include <util/lock_and_find.h>
 #include <util/tracy.h>
 
+#include <shared_mutex>
+
 TRACY_MODULE_NAME(SceAudio);
 
 enum SceAudioOutMode {
@@ -207,7 +209,16 @@ EXPORT(int, sceAudioOutOutput, int port, const void *buf) {
     }
     // is it really useful to update the thread status?
     thread->update_status(ThreadStatus::waiting);
-    emuenv.audio.audio_output(*prt, buf);
+    {
+        // audio_output reads the guest buffer directly -- cubeb memcpy's it into its own ring,
+        // SDL hands it to SDL_PutAudioStreamData -- and this thread reports 'wait' for the whole
+        // call. pause_threads() only suspends threads that are *running*, so a savestate can be
+        // rewriting guest memory while this read is in flight. That faulted here reliably, in
+        // memmove, on this thread. Take the barrier so a load waits for this to finish, and so
+        // this waits for a load in progress.
+        const std::shared_lock<std::shared_timed_mutex> guest_memory(emuenv.mem.savestate_lock);
+        emuenv.audio.audio_output(*prt, buf);
+    }
     thread->update_status(ThreadStatus::running);
 
     return prt->len;

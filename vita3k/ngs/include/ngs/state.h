@@ -38,4 +38,18 @@ void deinit(State &ngs, MemState &mem);
 // Tell every live voice module that guest memory has been rewound under it, so host-side decoder
 // positions can resynchronise. See ModuleRuntimeState::on_savestate_loaded.
 void on_savestate_loaded(State &ngs, const MemState &mem);
+
+// The guest addresses of every NGS mempool: the System and Rack memspaces.
+//
+// These are guest allocations, but the objects placement-new'd into them are *host* objects --
+// System, Rack and Voice carry std::vector buffers, a std::unique_ptr<std::mutex> and vtable
+// pointers, all of which are host addresses. A savestate captures those bytes like any other
+// guest memory, and restoring them into a different process installs pointers belonging to the
+// process that took the state. Walking them then faults immediately; measured as a read
+// violation in on_savestate_loaded on the first `for (Rack *rack : system->racks)`.
+//
+// Within one session the addresses still happen to be valid, which is why an in-session load
+// survives this and a load taken before a restart does not. Callers use this to leave these
+// regions alone.
+void collect_host_owned_memspaces(State &ngs, const MemState &mem, std::vector<Address> &out);
 } // namespace ngs

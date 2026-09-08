@@ -17,16 +17,30 @@
 
 #pragma once
 
+#include <gxm/state.h>
 #include <gxm/types.h>
 
 #include <array>
 #include <bitset>
 #include <string>
+#include <utility>
+#include <vector>
 
 struct EmuEnvState;
 struct GxmState;
 
 namespace gxm {
+// Guest byte ranges that hold host objects.
+//
+// SceGxmSyncObject carries a std::mutex and a condition_variable; SceGxmContext and
+// SceGxmRenderTarget carry std::unique_ptrs to renderer objects. All three are constructed into
+// *guest* memory, so their bytes end up in a savestate, and restoring a state taken by a
+// different process installs that process's host pointers. Callers leave these ranges alone.
+// Collect before guest memory is overwritten. See ngs::collect_host_owned_memspaces for the
+// same problem in NGS.
+void collect_host_owned_ranges(GxmState &gxm, const MemState &mem,
+    std::vector<std::pair<Address, uint32_t>> &out);
+
 // Color.
 SceGxmColorBaseFormat get_base_format(SceGxmColorFormat src);
 size_t bits_per_pixel(SceGxmColorBaseFormat base_format);
