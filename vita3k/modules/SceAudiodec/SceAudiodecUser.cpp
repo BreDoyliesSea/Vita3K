@@ -262,6 +262,16 @@ static int decode_audio_frames(EmuEnvState &emuenv, const char *export_name, Sce
         DecoderSize size;
         if (!decoder->send(es_data, ctrl->es_size_max)
             || !decoder->receive(pcm_data, &size)) {
+            // Flush before reporting the failure. A decoder keeps its position within the current
+            // superframe across calls, so a frame that fails to unpack leaves that position
+            // part-way into data it can no longer make sense of, and every subsequent frame fails
+            // the same way -- one bad frame becomes permanent silence.
+            //
+            // The NGS path already does exactly this ("flush or we'll get an error next time we
+            // want to decode" in ngs/src/modules/atrac9.cpp). This one did not, which is why audio
+            // never recovered here. The frame really did fail, so the error is still returned;
+            // this only stops it being contagious.
+            decoder->flush();
             return RET_ERROR(SCE_AUDIODEC_ERROR_API_FAIL);
         }
 
