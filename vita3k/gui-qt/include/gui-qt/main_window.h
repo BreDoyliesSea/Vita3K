@@ -116,7 +116,6 @@ private slots:
     void on_quicksave_triggered();
     void on_thread_dump_requested();
     void on_quickload_triggered();
-    bool wait_for_display_queue_idle(int timeout_ms);
     void run_with_guest_quiesced(const char *what, const std::function<savestate::Result()> &action);
     void on_ps_button();
     void on_toolbar_refresh();

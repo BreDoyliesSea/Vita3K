@@ -1471,16 +1471,28 @@ void MainWindow::on_thread_dump_requested() {
 //
 // An empty queue means no display callback is part-way through, which is what makes a snapshot
 // restorable -- see the matching check in savestate::save for why.
-bool MainWindow::wait_for_display_queue_idle(int timeout_ms) {
+// Wait for the GXM display queue to empty, which is when no display callback is part-way through
+// (the queue thread pops an entry only after its callback completes). A snapshot taken then is
+// consistent; one taken mid-callback is not, because the callback's progress lives in
+// renderer-side timestamps while the SceGxmSyncObject they are checked against lives in guest
+// memory, and a load rewinds one and not the other.
+//
+// This waits for a gap rather than creating one, and that distinction was learned the hard way.
+// Blocking sceGxmDisplayQueueAddEntry to force a gap does produce an empty queue -- in 19 ms
+// instead of hundreds -- but it parks the main guest thread inside an HLE call on a host
+// condition variable, which is precisely the kind of un-snapshottable host state this is trying
+// to avoid. States taken that way load and then hang. A gap that occurs on its own has the guest
+// genuinely between frames, which is the whole point.
+//
+// It also has to happen before the guest is quiesced: the queue is drained by a host thread
+// running a guest callback, so a paused guest can never drain it.
+bool wait_for_display_queue_gap(GxmState &gxm, int timeout_ms) {
     const auto started = std::chrono::steady_clock::now();
     const auto deadline = started + std::chrono::milliseconds(timeout_ms);
-    size_t smallest_seen = std::numeric_limits<size_t>::max();
     while (std::chrono::steady_clock::now() < deadline) {
         {
-            const std::lock_guard<std::mutex> lock(emuenv.gxm.display_queue.get_mutex());
-            const size_t pending = emuenv.gxm.display_queue.size();
-            smallest_seen = std::min(smallest_seen, pending);
-            if (pending == 0) {
+            const std::lock_guard<std::mutex> lock(gxm.display_queue.get_mutex());
+            if (gxm.display_queue.size() == 0) {
                 const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now() - started);
                 LOG_INFO("Savestate: display queue idle after {} ms", waited.count());
@@ -1489,15 +1501,14 @@ bool MainWindow::wait_for_display_queue_idle(int timeout_ms) {
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
-    LOG_WARN("Savestate: display queue never emptied in {} ms (smallest depth seen: {})",
-        timeout_ms, smallest_seen);
+    LOG_WARN("Savestate: no gap in the display queue within {} ms", timeout_ms);
     return false;
 }
 
 void MainWindow::on_quicksave_triggered() {
-    // The queue turns over about sixty times a second, so this normally returns immediately. If it
-    // does not, saying so beats writing a state that is known not to restore.
-    if (!wait_for_display_queue_idle(2000)) {
+    // Generous, because the gap is the game's to give: its depth was seen sitting at 1 for two
+    // full seconds under load, and taken after 644 ms and 19 ms in others.
+    if (!wait_for_display_queue_gap(emuenv.gxm, 10000)) {
         statusBar()->showMessage(tr("Quicksave: a frame is still in flight, try again"), 6000);
         return;
     }
