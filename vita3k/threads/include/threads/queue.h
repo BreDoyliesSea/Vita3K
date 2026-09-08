@@ -120,6 +120,14 @@ public:
         cond_.wait(mlock, [&]() { return aborted || queue_.empty(); });
     }
 
+    // Bounded form, for callers that must not block forever if the queue never drains.
+    // cond_ is notified on every pop, so this wakes inside the window the queue is empty rather
+    // than having to poll for it -- that window can be well under a millisecond.
+    bool wait_empty_for(const std::chrono::milliseconds timeout) {
+        std::unique_lock<std::mutex> mlock(mutex_);
+        return cond_.wait_for(mlock, timeout, [&]() { return aborted || queue_.empty(); });
+    }
+
     Queue() = default;
     Queue(const Queue &) = delete; // disable copying
     Queue &operator=(const Queue &) = delete; // disable assignment
