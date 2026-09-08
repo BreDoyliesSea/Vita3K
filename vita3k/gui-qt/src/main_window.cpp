@@ -1471,38 +1471,33 @@ void MainWindow::on_thread_dump_requested() {
 //
 // An empty queue means no display callback is part-way through, which is what makes a snapshot
 // restorable -- see the matching check in savestate::save for why.
-// Wait for the GXM display queue to empty, which is when no display callback is part-way through
-// (the queue thread pops an entry only after its callback completes). A snapshot taken then is
-// consistent; one taken mid-callback is not, because the callback's progress lives in
-// renderer-side timestamps while the SceGxmSyncObject they are checked against lives in guest
-// memory, and a load rewinds one and not the other.
+// Catch the moment the GXM display queue is empty, which is when no display callback is part-way
+// through -- the queue thread pops an entry only after its callback has completed. That matters
+// because a callback in flight has its progress in renderer-side timestamps while the
+// SceGxmSyncObject those are checked against lives in guest memory, and a load rewinds one and not
+// the other, leaving the queue thread waiting on a timestamp that will never arrive.
 //
-// This waits for a gap rather than creating one, and that distinction was learned the hard way.
-// Blocking sceGxmDisplayQueueAddEntry to force a gap does produce an empty queue -- in 19 ms
-// instead of hundreds -- but it parks the main guest thread inside an HLE call on a host
-// condition variable, which is precisely the kind of un-snapshottable host state this is trying
-// to avoid. States taken that way load and then hang. A gap that occurs on its own has the guest
-// genuinely between frames, which is the whole point.
+// Four approaches were tried. Blocking sceGxmDisplayQueueAddEntry, stopping the vblank clock, and
+// parking the display queue thread after its pop all reach a boundary quickly and reliably -- and
+// every one of them produces a state that loads and then hangs. The only load that has ever
+// worked was taken at a moment nothing was held and the queue simply happened to be empty. A
+// thread stopped by us is host-side wait state the snapshot cannot describe, wherever we stop it.
 //
-// It also has to happen before the guest is quiesced: the queue is drained by a host thread
-// running a guest callback, so a paused guest can never drain it.
+// So: hold nothing, and wait on the queue's own condition variable rather than polling for the
+// gap. It is notified on every pop, so this wakes inside a window that can be well under a
+// millisecond -- the window 1 ms polling kept missing. savestate::save re-checks under the pause,
+// because the guest can push the next frame between this returning and the guest being quiesced.
 bool wait_for_display_queue_gap(GxmState &gxm, int timeout_ms) {
     const auto started = std::chrono::steady_clock::now();
-    const auto deadline = started + std::chrono::milliseconds(timeout_ms);
-    while (std::chrono::steady_clock::now() < deadline) {
-        {
-            const std::lock_guard<std::mutex> lock(gxm.display_queue.get_mutex());
-            if (gxm.display_queue.size() == 0) {
-                const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::steady_clock::now() - started);
-                LOG_INFO("Savestate: display queue idle after {} ms", waited.count());
-                return true;
-            }
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-    LOG_WARN("Savestate: no gap in the display queue within {} ms", timeout_ms);
-    return false;
+    const bool empty = gxm.display_queue.wait_empty_for(std::chrono::milliseconds(timeout_ms));
+    const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - started);
+
+    if (empty)
+        LOG_INFO("Savestate: caught the display queue empty after {} ms", waited.count());
+    else
+        LOG_WARN("Savestate: display queue did not empty within {} ms", timeout_ms);
+    return empty;
 }
 
 void MainWindow::on_quicksave_triggered() {
@@ -1524,6 +1519,17 @@ void MainWindow::on_quickload_triggered() {
     // call at any moment. They resume as if their wait had returned, and the guest typically
     // destabilises within seconds. Say so plainly rather than letting it look like a bug in
     // the game.
+    // Load at the same kind of moment the save was taken at. The snapshot is caught while the
+    // display queue is empty, which is a particular phase of the guest's frame loop; arriving here
+    // at some other phase means the guest's threads are in different waits than the state records,
+    // and the load is refused. Matching the phase is what makes the two comparable -- without it
+    // every attempt was rejected with "thread 8 is waiting now but was not when the state was
+    // taken".
+    if (!wait_for_display_queue_gap(emuenv.gxm, 10000)) {
+        statusBar()->showMessage(tr("Quickload: could not catch a frame boundary, try again"), 6000);
+        return;
+    }
+
     run_with_guest_quiesced("Quickload", [this] {
         return savestate::load(emuenv, savestate::slot_path(emuenv, 0));
     });
