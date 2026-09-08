@@ -22,6 +22,7 @@
 #include <emuenv/state.h>
 #include <kernel/state.h>
 #include <renderer/state.h>
+#include <util/log.h>
 
 #include <chrono>
 #include <motion/functions.h>
@@ -36,6 +37,7 @@ static constexpr int predict_threshold = 3;
 static constexpr int max_expected_swapchain_size = 6;
 
 static void vblank_sync_thread(EmuEnvState &emuenv) {
+    logging::name_this_thread("vblank");
     DisplayState &display = emuenv.display;
 
     while (!display.abort.load()) {

@@ -30,6 +30,10 @@
 #include <util/lock_and_find.h>
 #include <util/log.h>
 
+#include <algorithm>
+#include <chrono>
+#include <thread>
+
 #include <SDL3/SDL_mutex.h>
 #include <SDL3/SDL_thread.h>
 
@@ -217,6 +221,45 @@ void KernelState::pause_threads() {
         paused_threads_status[thread->id] = thread->status;
         if (thread->status == ThreadStatus::running)
             thread->suspend();
+    }
+}
+
+bool KernelState::wait_for_threads_paused(std::chrono::milliseconds timeout, std::string *blocker) {
+    // Poll rather than wait on a condition variable: the transition to suspend happens in
+    // ThreadState::run_loop under the *thread's* own mutex, and there is no single place that
+    // signals "all of them are now parked". A short sleep between passes is cheap next to the
+    // work the caller is about to do.
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    for (;;) {
+        std::string still_running;
+        {
+            const std::lock_guard<std::mutex> lock(mutex);
+            for (const auto &[id, thread] : threads) {
+                if (!thread)
+                    continue;
+                // Only threads we asked to stop matter. One that was already waiting or dormant
+                // when pause_threads() ran is not executing guest code and never will be until
+                // it is resumed.
+                const auto recorded = paused_threads_status.find(id);
+                if (recorded == paused_threads_status.end() || recorded->second != ThreadStatus::run)
+                    continue;
+                if (thread->status == ThreadStatus::run) {
+                    still_running = fmt::format("{} \"{}\"", id, thread->name);
+                    break;
+                }
+            }
+        }
+
+        if (still_running.empty())
+            return true;
+
+        if (std::chrono::steady_clock::now() >= deadline) {
+            if (blocker)
+                *blocker = still_running;
+            return false;
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 }
 

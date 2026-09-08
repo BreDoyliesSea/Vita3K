@@ -1356,12 +1356,30 @@ bool MainWindow::run_with_guest_quiesced(const char *what, const std::function<s
     }
 
     m_app_session.set_pause_reason(app::AppSessionPauseReason::Savestate, true);
+
+    // set_pause_reason only asks the threads to stop. Wait until they actually have: the load
+    // path rewrites every byte of guest memory, and a thread still inside a guest block or an
+    // HLE import while that happens is reading a heap that is changing under it. This was
+    // measured as an access violation on an unrelated guest thread microseconds before the
+    // restore finished, plus a second one in memmove just after.
     savestate::Result result = savestate::Result::fail("did not run");
-    try {
-        result = action();
-    } catch (const std::exception &e) {
-        result = savestate::Result::fail(e.what());
+    std::string blocker;
+    bool render_parked = false;
+    if (!emuenv.kernel.wait_for_threads_paused(std::chrono::milliseconds(2000), &blocker)) {
+        result = savestate::Result::fail(fmt::format("thread {} would not stop", blocker));
+    } else if (!(render_parked = emuenv.renderer->park_render_thread(std::chrono::milliseconds(2000)))) {
+        // Stopping the guest is not enough: the render thread is ours, not the guest's, and it
+        // reads guest memory continuously. Refuse rather than rewrite the heap under it.
+        result = savestate::Result::fail("the render thread would not stop");
+    } else {
+        try {
+            result = action();
+        } catch (const std::exception &e) {
+            result = savestate::Result::fail(e.what());
+        }
     }
+    if (render_parked)
+        emuenv.renderer->unpark_render_thread();
     m_app_session.set_pause_reason(app::AppSessionPauseReason::Savestate, false);
 
     if (result) {

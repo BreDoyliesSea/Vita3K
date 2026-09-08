@@ -683,25 +683,23 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
         mr.pos += size;
     }
 
-    // Refuse any load that would need the address space rebuilt.
+    // Reconcile the address space, then restore, all under one hold of generation_mutex.
     //
-    // The reconciliation this used to do -- free the regions the state does not have, allocate the
-    // ones it does -- is not survivable. Freeing a guest region decommits pages that host-side
-    // structures still hold raw pointers into: the renderer, the texture cache, the GXM display
-    // queue. Nothing tells them, and the next thing that touches one faults. Measured across this
-    // session, every load that reported a non-zero reconciliation either crashed within seconds --
-    // in memmove, reading or writing an unmapped host address, with null dereferences on other
-    // threads right behind it -- or destabilised shortly after. Every load that ran clean for
-    // minutes needed no reconciliation at all.
+    // The regions the state does not have are released with free_for_savestate, which gives their
+    // pages back to the allocator WITHOUT decommitting them. That distinction is the whole fix.
+    // Host-side structures outside the guest -- the renderer, the texture cache, the GXM display
+    // queue -- hold raw pointers into guest memory and are never told a region has gone. When the
+    // ordinary free() decommitted during a load, the next one to touch an unmapped page faulted:
+    // measured repeatedly as a crash in memmove against an unmapped host address, with null
+    // dereferences on other threads immediately behind it. Leaving the pages mapped turns that
+    // into a stale read, and the restore below overwrites the bytes for every region the state
+    // actually has.
     //
-    // Holding generation_mutex across the whole operation was tried first, on the theory that the
-    // half-torn window between free and realloc was the problem. It is not: the faults are host
-    // code following pointers that were already stale, so no amount of locking helps.
-    //
-    // So a quicksave is restorable only into the address space it came from. In practice that
-    // means the same scene and roughly the same moment, which is what quickload is for. Anything
-    // further is a different point in the game, and saying so is better than crashing.
-    uint32_t skipped = 0;
+    // Locking the whole operation was tried first, on the theory that the window between free and
+    // realloc was the problem. It is not -- the faults are host code following pointers that were
+    // already stale -- but the single hold is kept, because the walk and the copy do want to be
+    // atomic with respect to the guest.
+    uint32_t freed = 0, reallocated = 0, unrecoverable = 0, skipped = 0;
     {
         const std::lock_guard<std::mutex> alloc_lock(emuenv.mem.generation_mutex);
 
@@ -714,23 +712,23 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
         for (const auto &region : saved)
             wanted.emplace(region.addr, region.size);
 
-        uint32_t would_free = 0, would_alloc = 0;
         for (const auto &entry : live) {
             const auto it = wanted.find(entry.first);
-            if (it == wanted.end() || it->second != entry.second)
-                would_free++;
-        }
-        for (const auto &entry : wanted) {
-            const auto it = live.find(entry.first);
-            if (it == live.end() || it->second != entry.second)
-                would_alloc++;
+            if (it == wanted.end() || it->second != entry.second) {
+                free_for_savestate(emuenv.mem, entry.first);
+                freed++;
+            }
         }
 
-        if (would_free > 0 || would_alloc > 0) {
-            return Result::fail(fmt::format(
-                "the guest's memory layout has moved on since the state was taken "
-                "({} region(s) would have to be freed and {} re-allocated)",
-                would_free, would_alloc));
+        for (const auto &entry : wanted) {
+            const auto it = live.find(entry.first);
+            if (it != live.end() && it->second == entry.second)
+                continue;
+            if (try_alloc_at_locked(emuenv.mem, entry.first, entry.second, "savestate") == 0) {
+                unrecoverable++;
+                continue;
+            }
+            reallocated++;
         }
 
         for (const auto &region : saved) {
@@ -741,6 +739,12 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
             std::memcpy(emuenv.mem.memory.get() + region.addr, mem_raw.data() + region.offset, region.size);
         }
     }
+
+    if (freed > 0 || reallocated > 0)
+        LOG_INFO("Savestate: address space reconciled ({} released, {} restored)", freed, reallocated);
+    if (unrecoverable > 0)
+        LOG_ERROR("Savestate: {} region(s) could not be re-allocated; the guest address space does not match the state", unrecoverable);
+
     if (skipped > 0)
         LOG_WARN("Savestate: {} region(s) are still not mapped and were skipped", skipped);
 

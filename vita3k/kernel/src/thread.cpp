@@ -163,6 +163,7 @@ void ThreadState::exit_delete(bool exit) {
 }
 
 void ThreadState::run_loop() {
+    logging::name_this_thread(fmt::format("guest {} {}", id, name));
     bool guest_returned = false;
 
     // Set thread-local CPU state so signal handlers can access it.

@@ -37,6 +37,7 @@
 #include <condition_variable>
 #include <functional>
 #include <map>
+#include <chrono>
 #include <mutex>
 #include <optional>
 #include <vector>
@@ -184,6 +185,16 @@ struct KernelState {
     bool is_threads_paused() { return !paused_threads_status.empty(); }
     void pause_threads();
     void resume_threads();
+
+    // pause_threads() only *requests* a stop: it sets suspend_requested and kicks the JIT out of
+    // run(), and the thread does not actually reach ThreadStatus::suspend until its own run_loop
+    // comes back around -- after the current guest block finishes, and after any HLE import it is
+    // inside of returns. Anything that rewrites guest memory underneath the guest has to wait for
+    // that to have happened, or it is racing threads that are still executing. Returns false if a
+    // thread was still running when the timeout expired, in which case the caller must not
+    // proceed. Names the offending thread for the log.
+    bool wait_for_threads_paused(std::chrono::milliseconds timeout, std::string *blocker = nullptr);
+
 
     // Kill all guest threads and block until they have exited. Must only be called from a host thread.
     void process_exit();
