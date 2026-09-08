@@ -1349,10 +1349,10 @@ void MainWindow::on_pause_triggered() {
 // guest thread outside the JIT, which is exactly the quiescence a consistent snapshot needs.
 // A dedicated pause reason keeps this independent of the user's own pause, so taking a state
 // while already paused does not resume the game underneath them.
-void MainWindow::run_with_guest_quiesced(const char *what, const std::function<savestate::Result()> &action) {
+bool MainWindow::run_with_guest_quiesced(const char *what, const std::function<savestate::Result()> &action) {
     if (!m_game_window) {
         statusBar()->showMessage(tr("%1: no game is running").arg(QString::fromUtf8(what)), 4000);
-        return;
+        return false;
     }
 
     m_app_session.set_pause_reason(app::AppSessionPauseReason::Savestate, true);
@@ -1366,12 +1366,14 @@ void MainWindow::run_with_guest_quiesced(const char *what, const std::function<s
 
     if (result) {
         statusBar()->showMessage(tr("%1 complete").arg(QString::fromUtf8(what)), 4000);
-    } else {
-        LOG_ERROR("{} failed: {}", what, result.reason);
-        statusBar()->showMessage(tr("%1 failed: %2").arg(QString::fromUtf8(what),
-                                     QString::fromStdString(result.reason)),
-            8000);
+        return true;
     }
+
+    LOG_ERROR("{} failed: {}", what, result.reason);
+    statusBar()->showMessage(tr("%1 failed: %2").arg(QString::fromUtf8(what),
+                                 QString::fromStdString(result.reason)),
+        8000);
+    return false;
 }
 
 void MainWindow::on_thread_dump_requested() {
@@ -1503,14 +1505,23 @@ bool wait_for_display_queue_gap(GxmState &gxm, int timeout_ms) {
 void MainWindow::on_quicksave_triggered() {
     // Generous, because the gap is the game's to give: its depth was seen sitting at 1 for two
     // full seconds under load, and taken after 644 ms and 19 ms in others.
-    if (!wait_for_display_queue_gap(emuenv.gxm, 10000)) {
-        statusBar()->showMessage(tr("Quicksave: a frame is still in flight, try again"), 6000);
-        return;
-    }
+    // Retry: catching the queue empty and quiescing the guest are not one atomic step, so the
+    // guest can push the next frame in between and savestate::save rightly refuses. The window is
+    // small and the boundary comes round every frame, so trying again lands almost immediately --
+    // and this is cheap to retry because a refused save has written nothing.
+    for (int attempt = 1; attempt <= 5; attempt++) {
+        if (!wait_for_display_queue_gap(emuenv.gxm, 10000)) {
+            statusBar()->showMessage(tr("Quicksave: a frame is still in flight, try again"), 6000);
+            return;
+        }
 
-    run_with_guest_quiesced("Quicksave", [this] {
-        return savestate::save(emuenv, savestate::slot_path(emuenv, 0));
-    });
+        if (run_with_guest_quiesced("Quicksave", [this] {
+                return savestate::save(emuenv, savestate::slot_path(emuenv, 0));
+            }))
+            return;
+
+        LOG_INFO("Savestate: the guest moved on before it could be quiesced, retrying ({}/5)", attempt);
+    }
 }
 
 void MainWindow::on_quickload_triggered() {
