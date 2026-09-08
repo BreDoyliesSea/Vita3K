@@ -22,6 +22,7 @@
 #include <threads/queue.h>
 
 #include <map>
+#include <set>
 #include <condition_variable>
 #include <mutex>
 #include <thread>
@@ -78,6 +79,12 @@ struct GxmState {
     Address last_immediate_context = 0;
     std::unordered_map<SceGxmContext *, Address> deferred_contexts;
     std::unordered_map<SceGxmRenderTarget *, Address> render_targets;
+    // Shader patchers, by guest address. A patcher and every program it creates are host objects
+    // -- std::maps, std::vectors, unique_ptrs to renderer objects -- constructed into guest
+    // memory, so a savestate load has to leave their bytes alone. Nothing else needed to know
+    // where they were until then. See gxm::collect_host_owned_ranges.
+    std::mutex shader_patcher_mutex;
+    std::set<Address> shader_patchers;
 
     void deinit() {
         if (display_host_thread.joinable())
