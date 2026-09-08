@@ -272,6 +272,10 @@ static LONG WINAPI exception_handler(PEXCEPTION_POINTERS pExp) noexcept {
     // Deliberately NOT called for every exception code. On EXCEPTION_STACK_OVERFLOW there is no
     // stack budget left to run it in -- it allocates a std::string and calls into dbghelp -- and
     // doing so killed the process outright before anything reached the log.
+    // Only for access violations. After a guard-page hit there is not enough stack left to
+    // resolve anything: SymFromAddr killed the process outright, and so did a plain map lookup
+    // plus a format. Identifying the thread that blew its stack needs a dump written from
+    // another thread, not more work on this one.
     if (ec == EXCEPTION_ACCESS_VIOLATION)
         log_fault_origin(pExp);
     switch (ec) {
