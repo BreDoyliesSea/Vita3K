@@ -750,6 +750,12 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
     gxm::collect_host_owned_ranges(emuenv.gxm, emuenv.mem, host_owned_ranges);
     ngs::collect_host_owned_ranges(emuenv.ngs, emuenv.mem, host_owned_ranges);
 
+    // Before anything touches guest memory. The renderer holds read-only protections over the
+    // textures and surfaces it has cached; hand them all back, and let their callbacks invalidate
+    // those caches, rather than tripping a page fault per range in the middle of the restore.
+    // Taken before generation_mutex so the two are never nested.
+    drop_all_protections(emuenv.mem);
+
     uint32_t freed = 0, reallocated = 0, unrecoverable = 0, skipped = 0;
     uint32_t host_owned_ranges_skipped = 0;
     uint32_t left_alone = 0;

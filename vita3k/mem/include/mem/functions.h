@@ -53,6 +53,9 @@ Address alloc(MemState &state, uint32_t size, const char *name, Address start_ad
 Address alloc_aligned(MemState &state, uint32_t size, const char *name, unsigned int alignment, Address start_addr = user_main_memory_start);
 void protect_inner(MemState &state, Address addr, uint32_t size, const MemPerm perm);
 void unprotect_inner(MemState &state, Address addr, uint32_t size);
+// Release every protected range, invoking each one's callback first. For savestate loading; see
+// the definition.
+void drop_all_protections(MemState &state);
 bool add_protect(MemState &state, Address addr, const uint32_t size, const MemPerm perm, const ProtectCallback &callback);
 void open_access_parent_protect_segment(MemState &state, Address addr);
 void close_access_parent_protect_segment(MemState &state, Address addr);
