@@ -172,6 +172,7 @@ void ThreadState::remove() {
 }
 
 void ThreadState::run_loop(bool top_level) {
+    logging::name_this_thread(fmt::format("guest {} {}", id, name));
     bool guest_returned = false;
 
     // Set thread-local CPU state so signal handlers can access it. The guard puts back what was

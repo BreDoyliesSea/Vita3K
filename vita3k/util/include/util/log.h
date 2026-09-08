@@ -67,6 +67,12 @@ void set_level(spdlog::level::level_enum log_level);
 ExitCode add_sink(const fs::path &log_path);
 void set_log_callback(std::function<void(std::string, int)> cb);
 
+// Name the calling OS thread for the crash handler. A fault report that says "thread 18400" is
+// not actionable; one that says "render" or "vblank" or a guest thread's own name says straight
+// away whether host code or the guest was at fault, which is the first thing worth knowing.
+void name_this_thread(std::string name);
+std::string current_thread_label();
+
 } // namespace logging
 
 #define RET_ERROR(error)                                                            \

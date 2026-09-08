@@ -138,6 +138,12 @@ void process_batches(renderer::State &state, const FeatureState &features, MemSt
         if (state.render_abort.load(std::memory_order_relaxed))
             return;
 
+        // A savestate is waiting for this thread to stop touching guest memory. Give up the
+        // batch loop rather than sit in the 500 ms wait below; the caller parks immediately
+        // after this returns.
+        if (state.park_requested.load(std::memory_order_acquire))
+            return;
+
         // overlay requested an async present
         if (state.async_flip_requested.load(std::memory_order_relaxed))
             return;
@@ -185,6 +191,7 @@ void reset_command_list(CommandList &command_list) {
 }
 
 static void render_loop(renderer::State &state, DisplayState &display, GxmState &gxm, MemState &mem, Config &config) {
+    logging::name_this_thread("render");
     if (state.precompile_requested) {
         auto progress_overlay = state.overlay_manager
             ? state.overlay_manager->create<overlay::shader_precompile_progress>()
@@ -249,6 +256,13 @@ static void render_loop(renderer::State &state, DisplayState &display, GxmState 
 #ifdef TRACY_ENABLE
         ZoneScopedN("Game rendering");
 #endif
+        // Between iterations this thread holds no guest state, which is the only point a
+        // savestate can safely rewrite guest memory from underneath it.
+        state.park_if_requested();
+
+        if (state.render_abort.load(std::memory_order_relaxed))
+            break;
+
         if (!state.set_current())
             break;
 

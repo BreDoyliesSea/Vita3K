@@ -36,7 +36,10 @@
 
 #include <functional>
 #include <iostream>
+#include <functional>
+#include <map>
 #include <mutex>
+#include <thread>
 #include <string>
 #include <vector>
 
@@ -179,6 +182,27 @@ void rebuild_default_logger() {
     spdlog::set_pattern(LOG_PATTERN);
 }
 
+// Names for the threads the crash handler is likely to report. A flat table rather than
+// thread_local: the handler needs to describe whichever thread faulted, and "thread 18400" on its
+// own says nothing about whether host code or the guest was at fault.
+static std::mutex s_thread_name_mutex;
+static std::map<uint64_t, std::string> s_thread_names;
+
+static uint64_t this_thread_key() {
+    return static_cast<uint64_t>(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+}
+
+void name_this_thread(std::string name) {
+    const std::lock_guard<std::mutex> lock(s_thread_name_mutex);
+    s_thread_names[this_thread_key()] = std::move(name);
+}
+
+std::string current_thread_label() {
+    const std::lock_guard<std::mutex> lock(s_thread_name_mutex);
+    const auto it = s_thread_names.find(this_thread_key());
+    return it == s_thread_names.end() ? std::string("\"?\"") : fmt::format("\"{}\"", it->second);
+}
+
 // log exceptions and flush log file on exceptions
 #ifdef _WIN32
 // Base and extent of our own executable image, resolved once at startup by walking the PE
@@ -232,13 +256,14 @@ static void resolve_own_image() {
 static void log_fault_origin(PEXCEPTION_POINTERS pExp) {
     const auto pc = reinterpret_cast<uintptr_t>(pExp->ExceptionRecord->ExceptionAddress);
     const std::string symbol = symbol_for(pc);
+    const std::string who = current_thread_label();
     if (s_exe_base && pc >= s_exe_base && pc < s_exe_base + s_exe_size) {
-        LOG_CRITICAL("  faulting instruction at Vita3K.exe+{}{} (thread {})",
-            log_hex(static_cast<uint64_t>(pc - s_exe_base)), symbol, GetCurrentThreadId());
+        LOG_CRITICAL("  faulting instruction at Vita3K.exe+{}{} (thread {} {})",
+            log_hex(static_cast<uint64_t>(pc - s_exe_base)), symbol, GetCurrentThreadId(), who);
     } else {
         LOG_CRITICAL("  faulting instruction at {}{}, outside our image - JIT-generated or another "
-                     "module (thread {})",
-            log_hex(static_cast<uint64_t>(pc)), symbol, GetCurrentThreadId());
+                     "module (thread {} {})",
+            log_hex(static_cast<uint64_t>(pc)), symbol, GetCurrentThreadId(), who);
     }
 }
 

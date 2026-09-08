@@ -71,6 +71,11 @@ void free(MemState &state, Address address);
 // allocator operations to be atomic with respect to each other. Used by savestate loading.
 Address try_alloc_at_locked(MemState &state, Address address, uint32_t size, const char *name);
 void free_locked(MemState &state, Address address);
+void free_inner_locked(MemState &state, Address address, bool decommit);
+
+// Frees the bookkeeping but leaves the pages mapped, so nothing holding a pointer into the region
+// faults. For savestate loading only -- see the comment on the definition.
+void free_for_savestate(MemState &state, Address address);
 
 // Visit every live allocation as (start address, size in bytes), in ascending address order.
 // The allocation table only marks the first page of each block, so callers cannot walk it
