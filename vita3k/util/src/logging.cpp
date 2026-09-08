@@ -57,7 +57,10 @@ static std::mutex s_log_callback_mutex;
 static void register_log_exception_handler();
 static void rebuild_default_logger();
 
-static void flush() {
+// Declared in util/log.h. Anything that might be followed by a crash should call this: the sink
+// is asynchronous, so the last seconds of the log are still queued when the process dies, and
+// that is exactly the part worth having.
+void flush() {
     spdlog::details::registry::instance().flush_all();
 }
 
