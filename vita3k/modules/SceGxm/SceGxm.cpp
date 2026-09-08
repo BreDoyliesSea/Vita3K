@@ -2879,6 +2879,12 @@ EXPORT(int, sceGxmInitialize, const SceGxmInitializeParams *params) {
     }
 
     emuenv.gxm.params = *params;
+    // Worth having in the log. This governs how the guest is paced between frames, which is what
+    // a savestate needs to know: at 1 the game is double buffered and sceGxmDisplayQueueAddEntry
+    // blocks on wait_empty(); above that the pacing comes from the queue filling up and push()
+    // blocking. Disgaea 3 reports 2, which ruled out a theory that it was vblank-paced.
+    LOG_INFO("GXM init: displayQueueMaxPendingCount={} callbackDataSize={}",
+        params->displayQueueMaxPendingCount, params->displayQueueCallbackDataSize);
     // hack, limit the number of frame rendering at the same time to at most 3
     // also, the last frame won't be in the queue so decrease the count by 1
     // the case where displayQueueMaxPendingCount is 1 handled in sceGxmDisplayQueueAddEntry
