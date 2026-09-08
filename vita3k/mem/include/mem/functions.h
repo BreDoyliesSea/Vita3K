@@ -67,6 +67,11 @@ Address alloc_at(MemState &state, Address address, uint32_t size, const char *na
 Address try_alloc_at(MemState &state, Address address, uint32_t size, const char *name);
 void free(MemState &state, Address address);
 
+// Variants for a caller that already holds MemState::generation_mutex and needs several
+// allocator operations to be atomic with respect to each other. Used by savestate loading.
+Address try_alloc_at_locked(MemState &state, Address address, uint32_t size, const char *name);
+void free_locked(MemState &state, Address address);
+
 // Visit every live allocation as (start address, size in bytes), in ascending address order.
 // The allocation table only marks the first page of each block, so callers cannot walk it
 // correctly without knowing the page layout - that knowledge stays here.
