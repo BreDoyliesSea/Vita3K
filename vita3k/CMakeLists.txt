@@ -256,6 +256,14 @@ endif()
 
 set_target_properties(vita3k PROPERTIES OUTPUT_NAME Vita3K)
 
+# A linker map, so a fault offset from a crash dump or from the Windows Application log can be
+# turned into a function name. Much cheaper than building the whole tree with debug info, and it
+# is the only way to read the dumps Windows Error Reporting is already writing: there is no
+# debugger installed on the machines this gets built on.
+if(MSVC)
+	target_link_options(vita3k PRIVATE /MAP)
+endif()
+
 if(NOT ANDROID)
 	set_target_properties(vita3k PROPERTIES
 		ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"

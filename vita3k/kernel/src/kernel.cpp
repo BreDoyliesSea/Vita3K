@@ -31,6 +31,10 @@
 #include <util/log.h>
 
 #include <algorithm>
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 #include <chrono>
 #include <thread>
 
@@ -63,6 +67,19 @@ struct ThreadParams {
 
 static int SDLCALL thread_function(void *data) {
     assert(data != nullptr);
+
+#ifdef _WIN32
+    // Reserve stack for the exception handler to run in after a guard-page hit.
+    //
+    // Without it, a stack overflow on a guest thread is unreportable: the handler's own
+    // LOG_CRITICAL goes through fmt and spdlog, runs off the end of what is left, smashes the
+    // /GS cookie on the way out, and the process dies as 0xC0000409 (stack cookie failure) with
+    // nothing in the log. Five crashes were read as buffer overruns before a dump showed the
+    // handler's own frames sitting on top of an EXCEPTION_STACK_OVERFLOW.
+    ULONG guarantee = 64 * 1024;
+    SetThreadStackGuarantee(&guarantee);
+#endif
+
     const ThreadParams params = *static_cast<const ThreadParams *>(data);
     SDL_SignalSemaphore(params.host_may_destroy_params);
     ThreadStatePtr thread = params.kernel->get_thread(params.thid);

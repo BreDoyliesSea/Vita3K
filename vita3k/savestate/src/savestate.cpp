@@ -657,7 +657,7 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
                     what = "is in a different call";
                 else
                     what = "is waiting on a different object";
-                return Result::fail(fmt::format(
+                return Result::retry(fmt::format(
                     "thread {} \"{}\" {} (state has it in semaphore {}, now {} on {})",
                     w.thread, thread->name, what, log_hex(w.args[0]),
                     now_nid ? import_name(now_nid) : "nothing", log_hex(thread->current_import_args[0])));
@@ -681,7 +681,7 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
             const auto recorded = std::find_if(parked.begin(), parked.end(),
                 [&](const ParkedWait &w) { return w.thread == pair.first; });
             if (recorded == parked.end()) {
-                return Result::fail(fmt::format("thread {} \"{}\" is waiting now but was not when the state was taken",
+                return Result::retry(fmt::format("thread {} \"{}\" is waiting now but was not when the state was taken",
                     pair.first, thread->name));
             }
             if (recorded->nid != nid || recorded->args[0] != thread->current_import_args[0]
@@ -689,7 +689,7 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
                 || recorded->args[2] != thread->current_import_args[2]) {
                 const char *const now = import_name(nid);
                 const char *const then = recorded->nid ? import_name(recorded->nid) : nullptr;
-                return Result::fail(fmt::format("thread {} \"{}\" is in {} now but was in {} when the state was taken",
+                return Result::retry(fmt::format("thread {} \"{}\" is in {} now but was in {} when the state was taken",
                     pair.first, thread->name, now ? now : "an unknown call", then ? then : "another call"));
             }
         }
