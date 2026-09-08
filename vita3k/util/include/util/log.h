@@ -73,6 +73,11 @@ void set_log_callback(std::function<void(std::string, int)> cb);
 void name_this_thread(std::string name);
 std::string current_thread_label();
 
+// Force the async logger to disk. Anything that might be followed by a crash should call this:
+// the sink is asynchronous, so the last few seconds of the log are still in a queue when the
+// process dies, and that is exactly the part worth having.
+void flush();
+
 } // namespace logging
 
 #define RET_ERROR(error)                                                            \

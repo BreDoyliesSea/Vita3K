@@ -56,6 +56,8 @@ constexpr uint32_t TAG_CPU = 0x20555043U; // "CPU "
 constexpr uint32_t TAG_WAIT = 0x54494157U; // "WAIT" - which HLE wait each parked thread is in
 constexpr uint32_t TAG_SYNC = 0x434E5953U; // "SYNC" - scalar state of the kernel sync primitives
 constexpr uint32_t TAG_FILE = 0x454C4946U; // "FILE" - read position of every open read-only file
+// "STK " - where each thread's guest stack was. Optional, so states written before it still load.
+constexpr uint32_t TAG_STACK = 0x204B5453U;
 
 // NIDs the restore path understands. A parked thread can only be carried across a load if its
 // wait is one of these.
@@ -406,6 +408,23 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
             positions.size(), files_skipped_writable);
     }
 
+    // --- where each thread's stack is ---------------------------------------------------------
+    // The two sessions' guest allocations diverge -- a single differently sized allocation early
+    // on shifts every thread stack after it by a page -- and the load re-lays-out the address
+    // space to match the state. ThreadState::stack is host-side and is not part of that, so
+    // without this it keeps pointing at where the stack used to be, and the next thread to be
+    // started resets its stack pointer into what is now a *different* thread's stack.
+    std::vector<uint8_t> stack_raw;
+    {
+        const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
+        put<uint32_t>(stack_raw, static_cast<uint32_t>(emuenv.kernel.threads.size()));
+        for (const auto &[id, thread] : emuenv.kernel.threads) {
+            put(stack_raw, id);
+            put<uint32_t>(stack_raw, thread ? thread->stack.get() : 0);
+            put<int32_t>(stack_raw, thread ? thread->stack_size : 0);
+        }
+    }
+
     // --- assemble ---------------------------------------------------------------------------
     std::vector<uint8_t> file;
     file.insert(file.end(), std::begin(MAGIC), std::end(MAGIC));
@@ -438,6 +457,11 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
     put<uint64_t>(file, file_raw.size());
     put<uint64_t>(file, file_raw.size());
     file.insert(file.end(), file_raw.begin(), file_raw.end());
+
+    put(file, TAG_STACK);
+    put<uint64_t>(file, stack_raw.size());
+    put<uint64_t>(file, stack_raw.size());
+    file.insert(file.end(), stack_raw.begin(), stack_raw.end());
 
     // Write to a temporary and rename into place, so an interrupted save cannot destroy the
     // previous good state.
@@ -522,6 +546,8 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
     size_t sync_size = 0;
     const uint8_t *file_data = nullptr;
     size_t file_size = 0;
+    const uint8_t *stack_data = nullptr;
+    size_t stack_size = 0;
 
     while (r.need(sizeof(uint32_t) + sizeof(uint64_t) * 2)) {
         uint32_t tag = 0;
@@ -555,6 +581,10 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
         case TAG_FILE:
             file_data = payload;
             file_size = static_cast<size_t>(stored);
+            break;
+        case TAG_STACK:
+            stack_data = payload;
+            stack_size = static_cast<size_t>(stored);
             break;
         default:
             LOG_WARN("Savestate: ignoring unknown chunk 0x{:08X}", tag);
@@ -724,6 +754,9 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
     std::vector<std::pair<Address, uint32_t>> host_owned_ranges;
     gxm::collect_host_owned_ranges(emuenv.gxm, emuenv.mem, host_owned_ranges);
 
+    for (const Address addr : host_owned)
+        LOG_INFO("Savestate: NGS mempool at {}", log_hex(addr));
+
     uint32_t freed = 0, reallocated = 0, unrecoverable = 0, skipped = 0, host_owned_skipped = 0;
     uint32_t host_owned_ranges_skipped = 0;
     {
@@ -741,6 +774,12 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
         for (const auto &entry : live) {
             const auto it = wanted.find(entry.first);
             if (it == wanted.end() || it->second != entry.second) {
+                // Loud on purpose. A load that releases anything is the one that goes wrong two
+                // seconds later; a load that reconciles nothing runs. Knowing which allocation
+                // it was is the whole question.
+                LOG_INFO("Savestate: releasing region at {} ({} page(s), state {})",
+                    log_hex(entry.first), entry.second,
+                    it == wanted.end() ? "does not have it" : fmt::format("has {} page(s)", it->second));
                 free_for_savestate(emuenv.mem, entry.first);
                 freed++;
             }
@@ -750,6 +789,7 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
             const auto it = live.find(entry.first);
             if (it != live.end() && it->second == entry.second)
                 continue;
+            LOG_INFO("Savestate: restoring region at {} ({} page(s))", log_hex(entry.first), entry.second);
             if (try_alloc_at_locked(emuenv.mem, entry.first, entry.second, "savestate") == 0) {
                 unrecoverable++;
                 continue;
@@ -817,6 +857,42 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
 
     if (host_owned_ranges_skipped > 0)
         LOG_INFO("Savestate: stepped over {} host-owned range(s) inside restored regions", host_owned_ranges_skipped);
+
+    // --- point each thread at its stack -------------------------------------------------------
+    // Must happen after the address space has been reconciled and before any thread runs again.
+    // Optional: states written before this chunk existed simply do not carry it, and are loaded
+    // as they were.
+    if (stack_data) {
+        Reader sk{ stack_data, stack_size, 0 };
+        uint32_t count = 0;
+        if (!sk.get(count))
+            return Result::fail("corrupt stack chunk");
+
+        const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
+        uint32_t moved = 0;
+        for (uint32_t i = 0; i < count; i++) {
+            SceUID id = 0;
+            uint32_t addr = 0;
+            int32_t size = 0;
+            if (!sk.get(id) || !sk.get(addr) || !sk.get(size))
+                return Result::fail("corrupt stack chunk");
+
+            const auto it = emuenv.kernel.threads.find(id);
+            if (it == emuenv.kernel.threads.end() || !it->second || addr == 0)
+                continue;
+            const auto &thread = it->second;
+            if (thread->stack.get() == addr)
+                continue;
+
+            // The old allocation was released by the reconciliation above, so the Block must not
+            // free it again.
+            thread->stack.rebase_for_savestate(addr);
+            thread->stack_size = size;
+            moved++;
+        }
+
+        LOG_INFO_IF(moved > 0, "Savestate: {} thread stack(s) moved to where the state has them", moved);
+    }
 
     // --- restore CPU contexts -----------------------------------------------------------------
     Reader cr{ cpu_data, cpu_size, 0 };
