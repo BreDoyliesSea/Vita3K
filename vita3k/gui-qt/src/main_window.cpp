@@ -108,6 +108,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <shared_mutex>
 #include <limits>
 #include <map>
 #include <optional>
@@ -1355,6 +1356,7 @@ bool MainWindow::run_with_guest_quiesced(const char *what, const std::function<s
         return false;
     }
 
+    logging::name_this_thread("savestate/gui");
     m_app_session.set_pause_reason(app::AppSessionPauseReason::Savestate, true);
 
     // set_pause_reason only asks the threads to stop. Wait until they actually have: the load
@@ -1365,12 +1367,19 @@ bool MainWindow::run_with_guest_quiesced(const char *what, const std::function<s
     savestate::Result result = savestate::Result::fail("did not run");
     std::string blocker;
     bool render_parked = false;
+    std::unique_lock<std::shared_timed_mutex> guest_memory;
     if (!emuenv.kernel.wait_for_threads_paused(std::chrono::milliseconds(2000), &blocker)) {
         result = savestate::Result::fail(fmt::format("thread {} would not stop", blocker));
     } else if (!(render_parked = emuenv.renderer->park_render_thread(std::chrono::milliseconds(2000)))) {
         // Stopping the guest is not enough: the render thread is ours, not the guest's, and it
         // reads guest memory continuously. Refuse rather than rewrite the heap under it.
         result = savestate::Result::fail("the render thread would not stop");
+    } else if (!(guest_memory = std::unique_lock<std::shared_timed_mutex>(
+                     emuenv.mem.savestate_lock, std::chrono::milliseconds(2000)))
+                    .owns_lock()) {
+        // And the HLE calls that read guest memory while their thread reports 'wait', which
+        // pause_threads() therefore never suspends. See MemState::savestate_lock.
+        result = savestate::Result::fail("guest memory is still in use by an HLE call");
     } else {
         try {
             result = action();
@@ -1554,17 +1563,37 @@ void MainWindow::on_quickload_triggered() {
     // and the load is refused. Matching the phase is what makes the two comparable -- without it
     // every attempt was rejected with "thread 8 is waiting now but was not when the state was
     // taken".
-    if (!wait_for_display_queue_gap(emuenv.gxm, 10000)) {
-        statusBar()->showMessage(tr("Quickload: could not catch a frame boundary, try again"), 6000);
-        return;
+    // Retry, for the same reason quicksave does. The gate above compares the guest's thread
+    // topology against the one the state recorded, and a background worker that happens to be
+    // awake right now will be back in its idle wait a frame or two later. A refused load has
+    // changed nothing, so trying again costs only the wait for the next frame boundary. It does
+    // not paper over the gate: a thread that has genuinely moved on for good never matches, and
+    // the last refusal is what gets reported.
+    savestate::Result last = savestate::Result::fail("did not run");
+    for (int attempt = 1; attempt <= 8; attempt++) {
+        if (!wait_for_display_queue_gap(emuenv.gxm, 10000)) {
+            statusBar()->showMessage(tr("Quickload: could not catch a frame boundary, try again"), 6000);
+            return;
+        }
+
+        bool succeeded = false;
+        run_with_guest_quiesced("Quickload", [&] {
+            last = savestate::load(emuenv, savestate::slot_path(emuenv, 0));
+            succeeded = static_cast<bool>(last);
+            return last;
+        });
+        if (succeeded) {
+            statusBar()->showMessage(
+                tr("Quickload is experimental: thread wait state is not restored and the game may become unstable."),
+                10000);
+            return;
+        }
+
+        LOG_INFO("Savestate: quickload attempt {}/8 refused ({})", attempt, last.reason);
     }
 
-    run_with_guest_quiesced("Quickload", [this] {
-        return savestate::load(emuenv, savestate::slot_path(emuenv, 0));
-    });
-    statusBar()->showMessage(
-        tr("Quickload is experimental: thread wait state is not restored and the game may become unstable."),
-        10000);
+    LOG_ERROR("Quickload gave up after 8 attempts: {}", last.reason);
+    statusBar()->showMessage(tr("Quickload failed: %1").arg(QString::fromStdString(last.reason)), 8000);
 }
 
 void MainWindow::on_stop_triggered() {

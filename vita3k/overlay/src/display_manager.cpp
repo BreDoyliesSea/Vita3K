@@ -218,6 +218,7 @@ void display_manager::attach_thread_input(
 }
 
 void display_manager::input_thread_loop() {
+    logging::name_this_thread("overlay input");
     // Avoid tail recursion by reinserting pushed-down items.
     std::vector<input_thread_context_t> interrupted_items;
 

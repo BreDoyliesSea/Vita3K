@@ -30,6 +30,7 @@
 namespace renderer::vulkan {
 
 void VKContext::wait_thread_function(const MemState &mem) {
+    logging::name_this_thread("vk gpu wait");
     // try to wait for multiple fences at the same time if possible
     std::vector<vk::Fence> fences;
 

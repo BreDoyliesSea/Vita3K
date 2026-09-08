@@ -24,6 +24,8 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
+#include <set>
 
 struct AllocMemPage {
     uint32_t allocated : 4;
@@ -65,6 +67,18 @@ struct MemExternalMapping {
 struct MemState {
     std::mutex generation_mutex;
     std::mutex protect_mutex;
+
+    // --- savestate barrier -------------------------------------------------------------------
+    // Held shared by anything that reads or writes guest memory outside the guest's own
+    // execution, and exclusively by a savestate while it rewrites that memory.
+    //
+    // Pausing the guest is not enough on its own. pause_threads() suspends the threads that are
+    // *running*; a thread parked in an HLE call is recorded as waiting and left alone -- and some
+    // HLE calls do their real work while nominally waiting. sceAudioOutOutput is the clearest
+    // case: it sets the thread's status to 'wait', then hands the guest's buffer straight to the
+    // audio backend, which memcpy's out of it. A load rewriting guest memory during that window
+    // faulted in memmove on the game's audio thread, repeatably.
+    std::shared_timed_mutex savestate_lock;
 
     uint32_t host_page_size = 0;
     Memory memory;
