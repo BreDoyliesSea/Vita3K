@@ -21,6 +21,8 @@
 #include <mem/ptr.h>
 #include <threads/queue.h>
 
+#include <atomic>
+#include <chrono>
 #include <map>
 #include <set>
 #include <condition_variable>
@@ -85,6 +87,7 @@ struct GxmState {
     // where they were until then. See gxm::collect_host_owned_ranges.
     std::mutex shader_patcher_mutex;
     std::set<Address> shader_patchers;
+
 
     void deinit() {
         if (display_host_thread.joinable())
