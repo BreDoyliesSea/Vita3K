@@ -19,6 +19,7 @@
 
 #include <mem/ptr.h>
 
+#include <utility>
 #include <vector>
 
 struct MemState;
@@ -39,17 +40,17 @@ void deinit(State &ngs, MemState &mem);
 // positions can resynchronise. See ModuleRuntimeState::on_savestate_loaded.
 void on_savestate_loaded(State &ngs, const MemState &mem);
 
-// The guest addresses of every NGS mempool: the System and Rack memspaces.
+// Guest byte ranges that hold host objects: the System, its Racks, and their Voices.
 //
-// These are guest allocations, but the objects placement-new'd into them are *host* objects --
-// System, Rack and Voice carry std::vector buffers, a std::unique_ptr<std::mutex> and vtable
-// pointers, all of which are host addresses. A savestate captures those bytes like any other
-// guest memory, and restoring them into a different process installs pointers belonging to the
-// process that took the state. Walking them then faults immediately; measured as a read
-// violation in on_savestate_loaded on the first `for (Rack *rack : system->racks)`.
+// These are constructed into guest memory but they are *host* objects -- std::vector buffers, a
+// std::unique_ptr<std::mutex>, vtable pointers, all host addresses. A savestate captures those
+// bytes like any other guest memory, and restoring a state taken by a different process installs
+// pointers belonging to the process that took it. Walking them then faults immediately; measured
+// as a read violation on the first `for (Rack *rack : system->racks)`.
 //
-// Within one session the addresses still happen to be valid, which is why an in-session load
-// survives this and a load taken before a restart does not. Callers use this to leave these
-// regions alone.
-void collect_host_owned_memspaces(State &ngs, const MemState &mem, std::vector<Address> &out);
+// Only the objects, not the pool around them: the guest's own parameter buffers share that pool
+// and must be rewound with the rest of guest memory. Collect before anything is overwritten.
+// See gxm::collect_host_owned_ranges for the same problem in GXM.
+void collect_host_owned_ranges(State &ngs, const MemState &mem,
+    std::vector<std::pair<Address, uint32_t>> &out);
 } // namespace ngs

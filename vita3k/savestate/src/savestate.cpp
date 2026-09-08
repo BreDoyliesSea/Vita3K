@@ -746,18 +746,11 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
     // like any other guest memory, but they contain this-process host pointers, so restoring a
     // state taken by a different process installs pointers into a heap that no longer exists.
     // Collected before anything is overwritten, while the walk is still safe.
-    std::vector<Address> host_owned;
-    ngs::collect_host_owned_memspaces(emuenv.ngs, emuenv.mem, host_owned);
-
-    // GXM keeps its host objects in smaller pieces of guest memory that sit alongside real guest
-    // data, so those are skipped by byte range rather than by whole region.
     std::vector<std::pair<Address, uint32_t>> host_owned_ranges;
     gxm::collect_host_owned_ranges(emuenv.gxm, emuenv.mem, host_owned_ranges);
+    ngs::collect_host_owned_ranges(emuenv.ngs, emuenv.mem, host_owned_ranges);
 
-    for (const Address addr : host_owned)
-        LOG_INFO("Savestate: NGS mempool at {}", log_hex(addr));
-
-    uint32_t freed = 0, reallocated = 0, unrecoverable = 0, skipped = 0, host_owned_skipped = 0;
+    uint32_t freed = 0, reallocated = 0, unrecoverable = 0, skipped = 0;
     uint32_t host_owned_ranges_skipped = 0;
     uint32_t left_alone = 0;
     {
@@ -827,16 +820,6 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
                 skipped++;
                 continue;
             }
-            const bool host_owned_region = std::any_of(host_owned.begin(), host_owned.end(),
-                [&](Address addr) { return addr >= region.addr && addr < region.addr + region.size; });
-            if (host_owned_region) {
-                // Leave it as it is. The guest's own view of this pool goes un-rewound, which can
-                // leave audio out of step until the next thing that resets it -- far better than
-                // installing another process's pointers and faulting on the first walk.
-                host_owned_skipped++;
-                continue;
-            }
-
             // Copy the region, stepping over any host-owned range inside it. The ranges are few
             // and small, so a linear scan per region is cheaper than any indexing would be.
             uint8_t *const dest = emuenv.mem.memory.get() + region.addr;
@@ -877,9 +860,6 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
 
     if (skipped > 0)
         LOG_WARN("Savestate: {} region(s) are still not mapped and were skipped", skipped);
-
-    if (host_owned_skipped > 0)
-        LOG_INFO("Savestate: {} region(s) hold host objects and were left as they are", host_owned_skipped);
 
     if (host_owned_ranges_skipped > 0)
         LOG_INFO("Savestate: stepped over {} host-owned range(s) inside restored regions", host_owned_ranges_skipped);

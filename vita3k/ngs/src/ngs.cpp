@@ -367,17 +367,27 @@ void deinit(State &ngs, MemState &mem) {
     ngs.definitions = Ptr<VoiceDefinition>(0);
 }
 
-void collect_host_owned_memspaces(State &ngs, const MemState &mem, std::vector<Address> &out) {
+void collect_host_owned_ranges(State &ngs, const MemState &mem,
+    std::vector<std::pair<Address, uint32_t>> &out) {
     // Must be called *before* guest memory is overwritten -- this walk is only safe while the
     // host pointers embedded in these objects are still this process's own.
+    //
+    // Only the objects themselves, not the mempool they sit in. The pool also holds the guest's
+    // own parameter buffers, and those have to be rewound with everything else: leaving the whole
+    // pool alone meant the host voice state described a moment the restored guest knew nothing
+    // about, and sceNgsSystemUpdate walked into it and aborted on a bogus vector length.
     for (System *system : ngs.systems) {
         if (!system)
             continue;
-        out.push_back(system->memspace.address());
+        out.emplace_back(Ptr<System>(system, mem).address(), static_cast<uint32_t>(sizeof(System)));
         for (Rack *rack : system->racks) {
             if (!rack)
                 continue;
-            out.push_back(rack->memspace.address());
+            out.emplace_back(Ptr<Rack>(rack, mem).address(), static_cast<uint32_t>(sizeof(Rack)));
+            for (const Ptr<Voice> &voice : rack->voices) {
+                if (voice)
+                    out.emplace_back(voice.address(), static_cast<uint32_t>(sizeof(Voice)));
+            }
         }
     }
 }
