@@ -33,6 +33,7 @@ public:
 signals:
     void ps_button_pressed();
     void fullscreen_toggled();
+    void fast_forward_cycled();
     void toggle_touch_pressed();
     void texture_replacement_toggled();
     void screenshot_requested();

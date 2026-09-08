@@ -55,6 +55,7 @@
 #include <config/state.h>
 #include <config/version.h>
 #include <ctrl/functions.h>
+#include <display/functions.h>
 #include <display/state.h>
 #include <gxm/state.h>
 #include <interface.h>
@@ -1024,6 +1025,9 @@ std::optional<AppLaunchRequest> MainWindow::boot_game_once(const AppLaunchReques
     connect(m_kb_filter, &CtrlKeyboardFilter::fullscreen_toggled,
         this, [this]() { on_toolbar_fullscreen(); });
 
+    connect(m_kb_filter, &CtrlKeyboardFilter::fast_forward_cycled,
+        this, [this]() { on_fast_forward_cycled(); });
+
     connect(m_kb_filter, &CtrlKeyboardFilter::texture_replacement_toggled,
         this, [this]() { toggle_texture_replacement(emuenv); });
 
@@ -1333,6 +1337,23 @@ void MainWindow::on_stop_triggered() {
     m_app_session.set_pause_reason(app::AppSessionPauseReason::User, false);
 
     on_game_closed();
+}
+
+void MainWindow::on_fast_forward_cycled() {
+    // Unlike a savestate this does not quiesce the guest. Changing the speed only changes how long
+    // the vblank generator sleeps between frames, which it re-reads every frame, so there is
+    // nothing to pause and no state to keep consistent.
+    if (!m_game_window) {
+        statusBar()->showMessage(tr("Fast-forward: no game is running"), 4000);
+        return;
+    }
+
+    const uint32_t speed = cycle_speed_multiplier(emuenv.display);
+    LOG_INFO("Fast-forward: {}x", speed);
+    if (speed == 1)
+        statusBar()->showMessage(tr("Fast-forward off (normal speed)"), 3000);
+    else
+        statusBar()->showMessage(tr("Fast-forward %1x").arg(speed), 3000);
 }
 
 void MainWindow::on_ps_button() {

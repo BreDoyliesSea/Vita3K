@@ -114,6 +114,7 @@ private slots:
     void on_ps_button();
     void on_toolbar_refresh();
     void on_toolbar_fullscreen();
+    void on_fast_forward_cycled();
     void on_toolbar_start();
     void on_app_selection_changed(const app::AppEntry *app);
     void on_context_menu_requested(const QPoint &global_pos, const std::vector<const app::AppEntry *> &apps);
