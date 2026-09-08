@@ -117,7 +117,7 @@ private slots:
     void on_fast_forward_cycled();
     void on_thread_dump_requested();
     void on_quickload_triggered();
-    void run_with_guest_quiesced(const char *what, const std::function<savestate::Result()> &action);
+    bool run_with_guest_quiesced(const char *what, const std::function<savestate::Result()> &action);
     void on_ps_button();
     void on_toolbar_refresh();
     void on_toolbar_fullscreen();
