@@ -595,6 +595,24 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
     if (!mem_packed || !cpu_data || !wait_data || !sync_data || !file_data)
         return Result::fail("state is missing a required chunk");
 
+    // The display queue must be empty here, for the same reason the save requires it, and it has
+    // to be re-checked now rather than trusted from before the pause. The queue's host thread
+    // drives a *guest* thread: it calls run_guest_function on SceGxmDisplayQueue, which resets
+    // that thread's program counter and stack pointer and sets it running. Restoring thread
+    // contexts while that is in flight leaves the thread resuming from a stale program counter --
+    // measured as a write to 0x400000000 from JIT code on "guest 337 SceGxmDisplayQueue", after
+    // which the frame loop stopped advancing and the last frame was presented forever.
+    //
+    // With the queue empty the host thread is blocked waiting for an entry and the guest that
+    // would push one is paused, so no callback can start. Retryable: the boundary comes round
+    // every frame.
+    {
+        const std::lock_guard<std::mutex> queue_lock(emuenv.gxm.display_queue.get_mutex());
+        const size_t pending = emuenv.gxm.display_queue.size();
+        if (pending > 0)
+            return Result::retry(fmt::format("a frame is still in flight ({} display queue entries)", pending));
+    }
+
     // --- gate: is the guest still parked the way the state expects? --------------------------
     // Run before anything is written. Restoring guest memory to a snapshot while the threads sit
     // in different waits than they did is what makes a load look successful and then fall over
