@@ -1613,6 +1613,12 @@ void MainWindow::on_quickload_triggered() {
             return;
         }
 
+        if (!last.retryable) {
+            // Nothing about the guest will make this state loadable -- a different build, a
+            // different game. Retrying costs a quiesce cycle per attempt and the guest feels it.
+            break;
+        }
+
         LOG_INFO("Savestate: quickload attempt {}/8 refused ({})", attempt, last.reason);
     }
 

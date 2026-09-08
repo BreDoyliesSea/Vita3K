@@ -34,16 +34,24 @@ inline constexpr uint32_t FORMAT_VERSION = 3;
 struct Result {
     bool success = false;
     std::string reason;
+    // Whether trying again in a frame or two could succeed. The guest's thread topology drifts
+    // and comes back, so a load refused for that is worth retrying; a state from another build or
+    // another game never becomes loadable, and retrying one costs the guest a quiesce cycle per
+    // attempt for nothing.
+    bool retryable = false;
 
     explicit operator bool() const {
         return success;
     }
 
     static Result ok() {
-        return { true, {} };
+        return { true, {}, false };
     }
     static Result fail(std::string why) {
-        return { false, std::move(why) };
+        return { false, std::move(why), false };
+    }
+    static Result retry(std::string why) {
+        return { false, std::move(why), true };
     }
 };
 
