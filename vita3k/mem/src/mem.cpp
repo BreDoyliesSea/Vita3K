@@ -433,6 +433,31 @@ bool handle_access_violation(MemState &state, uint8_t *addr, bool write) noexcep
     return true;
 }
 
+// Give every protected range back, telling its owner first.
+//
+// The renderer marks guest memory read-only to notice when the guest overwrites a texture or a
+// render surface, and the callback on each range is what invalidates the cached copy. A savestate
+// load rewrites guest memory wholesale and directly, so those callbacks would otherwise fire one
+// page fault at a time *during* the restore -- on the loading thread, with the render thread
+// parked -- and any range that survived would then describe a texture whose bytes had changed
+// with nobody told.
+//
+// Callbacks run under protect_mutex, which is what handle_access_violation does too.
+void drop_all_protections(MemState &state) {
+    const std::lock_guard<std::mutex> lock(state.protect_mutex);
+    while (!state.protect_tree.empty()) {
+        const auto it = state.protect_tree.begin();
+        const Address addr = it->first;
+        ProtectSegmentInfo info = std::move(it->second);
+        state.protect_tree.erase(it);
+
+        for (auto &[block_addr, block] : info.blocks)
+            block.callback(addr, true);
+
+        unprotect_inner(state, addr, info.size);
+    }
+}
+
 bool add_protect(MemState &state, Address addr, const uint32_t size, const MemPerm perm, const ProtectCallback &callback) {
     const std::lock_guard<std::mutex> lock(state.protect_mutex);
     ProtectSegmentInfo protect(size, perm);
