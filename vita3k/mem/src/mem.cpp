@@ -468,6 +468,15 @@ Address alloc_at(MemState &state, Address address, uint32_t size, const char *na
 
 Address try_alloc_at(MemState &state, Address address, uint32_t size, const char *name) {
     const std::lock_guard<std::mutex> lock(state.generation_mutex);
+    return try_alloc_at_locked(state, address, size, name);
+}
+
+// Caller must already hold generation_mutex. Exists for savestate loading, which frees a set of
+// regions and reallocates them: taking the lock per call leaves the guest's address space visibly
+// half-torn between calls, and Vita3K's own host threads -- the GXM display queue and the renderer
+// among them -- keep dereferencing guest pointers throughout. That window is not theoretical; it
+// crashed the emulator in memmove on the first attempt of every soak run.
+Address try_alloc_at_locked(MemState &state, Address address, uint32_t size, const char *name) {
     const uint32_t wanted_page = address / STANDARD_PAGE_SIZE;
     size += address % STANDARD_PAGE_SIZE;
     const uint32_t page_count = align(size, STANDARD_PAGE_SIZE) / STANDARD_PAGE_SIZE;
@@ -501,6 +510,11 @@ void for_each_allocation(const MemState &state, const std::function<void(Address
 
 void free(MemState &state, Address address) {
     const std::lock_guard<std::mutex> lock(state.generation_mutex);
+    free_locked(state, address);
+}
+
+// Caller must already hold generation_mutex. See try_alloc_at_locked.
+void free_locked(MemState &state, Address address) {
     const uint32_t page_num = address / STANDARD_PAGE_SIZE;
     assert(page_num >= 0);
 
