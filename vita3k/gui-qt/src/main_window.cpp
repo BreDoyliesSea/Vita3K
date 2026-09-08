@@ -1390,6 +1390,10 @@ bool MainWindow::run_with_guest_quiesced(const char *what, const std::function<s
             result = savestate::Result::fail(e.what());
         }
     }
+    // Get what just happened onto disk before the guest is let go. A load that goes wrong takes
+    // the process with it a second or two later, and the async sink loses the last of the log.
+    logging::flush();
+
     if (render_parked)
         emuenv.renderer->unpark_render_thread();
     m_app_session.set_pause_reason(app::AppSessionPauseReason::Savestate, false);
