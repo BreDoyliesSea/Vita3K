@@ -22,6 +22,7 @@
 #include <threads/queue.h>
 
 #include <map>
+#include <condition_variable>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
