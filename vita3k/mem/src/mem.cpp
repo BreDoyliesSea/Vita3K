@@ -623,6 +623,26 @@ void free(MemState &state, Address address) {
 
 // Caller must already hold generation_mutex. See try_alloc_at_locked.
 void free_locked(MemState &state, Address address) {
+    free_inner_locked(state, address, true);
+}
+
+// Release the allocator's bookkeeping for a region but leave its pages committed.
+//
+// For savestate loading. The ordinary free() decommits, and that is what makes a load dangerous:
+// host-side structures outside the guest -- the renderer, the texture cache, the GXM display queue
+// -- hold raw pointers into guest memory and are not told when a region goes away. The next one to
+// touch an unmapped page faults, which is exactly how loads were dying, in memmove with an
+// unmapped host address and null dereferences on other threads behind it.
+//
+// Leaving the pages mapped means such a pointer reads stale bytes instead of faulting, and the
+// restore overwrites those bytes for every region the state actually has. The cost is that pages
+// the state does not want stay committed until the guest frees them again through the normal path;
+// the allocator bookkeeping is correct, so it can hand them straight back out.
+void free_for_savestate(MemState &state, Address address) {
+    free_inner_locked(state, address, false);
+}
+
+void free_inner_locked(MemState &state, Address address, bool decommit) {
     const uint32_t page_num = address / STANDARD_PAGE_SIZE;
     assert(page_num >= 0);
 
@@ -638,6 +658,10 @@ void free_locked(MemState &state, Address address) {
     }
 
     assert(!state.use_page_table || state.page_table[address / KiB(4)] == state.memory.get());
+
+    if (!decommit)
+        return;
+
     const Address region_start = page_num * STANDARD_PAGE_SIZE;
     const Address region_end = region_start + page.size * STANDARD_PAGE_SIZE;
 

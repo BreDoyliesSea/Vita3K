@@ -150,6 +150,55 @@ struct State {
 
     std::atomic<bool> paused{ false };
 
+    // --- savestate park handshake -------------------------------------------------------------
+    // Pausing the guest stops guest threads, but the render thread is a host thread and keeps
+    // running: process_batch walks guest memory to read vertex data, uniforms and textures, and
+    // the display path follows guest pointers out of SceGxmSyncObject. A savestate load rewrites
+    // every byte of guest memory underneath all of that. Measured as an access violation on a
+    // host thread microseconds before the restore finished (a null read, following a guest
+    // pointer that had just been overwritten) and a second in memmove reading a guest address
+    // just after it.
+    //
+    // So the render thread is asked to stop between batches and to say when it has. Nothing is
+    // held while parked, which matters: the load takes generation_mutex and kernel.mutex, and the
+    // render thread must not be blocked on anything the loading thread could want.
+    std::atomic<bool> park_requested{ false };
+    bool parked = false;
+    std::mutex park_mutex;
+    std::condition_variable park_cond;
+
+    // Called from the render thread at a point where it holds no guest state.
+    void park_if_requested() {
+        if (!park_requested.load(std::memory_order_acquire))
+            return;
+        std::unique_lock<std::mutex> lock(park_mutex);
+        parked = true;
+        park_cond.notify_all();
+        park_cond.wait(lock, [this] {
+            return !park_requested.load(std::memory_order_acquire) || render_abort.load(std::memory_order_relaxed);
+        });
+        parked = false;
+        park_cond.notify_all();
+    }
+
+    // Called from the thread doing the savestate. Returns false if the render thread did not
+    // reach a safe point in time, in which case the caller must not touch guest memory.
+    bool park_render_thread(std::chrono::milliseconds timeout) {
+        park_requested.store(true, std::memory_order_release);
+        std::unique_lock<std::mutex> lock(park_mutex);
+        return park_cond.wait_for(lock, timeout, [this] {
+            return parked || render_abort.load(std::memory_order_relaxed);
+        });
+    }
+
+    void unpark_render_thread() {
+        {
+            const std::lock_guard<std::mutex> lock(park_mutex);
+            park_requested.store(false, std::memory_order_release);
+        }
+        park_cond.notify_all();
+    }
+
     // Non-owning pointer to dialog state for native common dialog overlays.
     DialogState *common_dialog = nullptr;
     int sys_date_format = 0;
