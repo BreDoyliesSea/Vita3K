@@ -1362,27 +1362,6 @@ struct SceGxmRenderTarget {
     SceUID driverMemBlock;
 };
 
-// See the declaration in gxm/functions.h. Defined here because SceGxmContext and
-// SceGxmRenderTarget are only complete in this translation unit.
-void gxm::collect_host_owned_ranges(GxmState &gxm, const MemState &mem,
-    std::vector<std::pair<Address, uint32_t>> &out) {
-    {
-        const std::lock_guard<std::mutex> lock(gxm.sync_objects_mutex);
-        for (SceGxmSyncObject *sync_object : gxm.sync_objects) {
-            if (!sync_object)
-                continue;
-            out.emplace_back(Ptr<SceGxmSyncObject>(sync_object, mem).address(),
-                static_cast<uint32_t>(sizeof(SceGxmSyncObject)));
-        }
-    }
-
-    if (gxm.immediate_context)
-        out.emplace_back(gxm.immediate_context, static_cast<uint32_t>(sizeof(SceGxmContext)));
-    for (const auto &[_, address] : gxm.deferred_contexts)
-        out.emplace_back(address, static_cast<uint32_t>(sizeof(SceGxmContext)));
-    for (const auto &[_, address] : gxm.render_targets)
-        out.emplace_back(address, static_cast<uint32_t>(sizeof(SceGxmRenderTarget)));
-}
 
 
 static int destroy_gxm_render_target(EmuEnvState &emuenv, SceGxmRenderTarget *render_target, const Address render_target_addr, const bool force_backend_destroy) {
@@ -1450,6 +1429,73 @@ struct SceGxmShaderPatcher {
     FragmentProgramCache fragment_program_cache;
     SceGxmShaderPatcherParams params;
 };
+
+// See the declaration in gxm/functions.h. Defined here because SceGxmContext and
+// SceGxmRenderTarget are only complete in this translation unit.
+void gxm::collect_host_owned_ranges(GxmState &gxm, const MemState &mem,
+    std::vector<std::pair<Address, uint32_t>> &out) {
+    {
+        const std::lock_guard<std::mutex> lock(gxm.sync_objects_mutex);
+        for (SceGxmSyncObject *sync_object : gxm.sync_objects) {
+            if (!sync_object)
+                continue;
+            out.emplace_back(Ptr<SceGxmSyncObject>(sync_object, mem).address(),
+                static_cast<uint32_t>(sizeof(SceGxmSyncObject)));
+        }
+    }
+
+    // A context is preserved only from its host members onward. Everything before that is
+    // GxmContextState -- the surfaces, viewports, vertex streams and uniform buffer pointers the
+    // guest set -- and those are guest addresses that the load moves. Preserving them whole meant
+    // the first draw after a load followed a uniform buffer pointer into memory that had been
+    // rewound out from under it, and faulted in gxmSetUniformBuffers. They have to come back with
+    // the rest of guest memory; the guest sets them again every frame anyway.
+    const auto preserve_context_tail = [&](Address address) {
+        const SceGxmContext *context = Ptr<SceGxmContext>(address).get(mem);
+        if (!context) {
+            out.emplace_back(address, static_cast<uint32_t>(sizeof(SceGxmContext)));
+            return;
+        }
+        // Taken from the live object rather than offsetof, which is only conditionally supported
+        // on a type like this one.
+        const auto host_offset = static_cast<uint32_t>(
+            reinterpret_cast<const char *>(&context->renderer) - reinterpret_cast<const char *>(context));
+        out.emplace_back(address + host_offset, static_cast<uint32_t>(sizeof(SceGxmContext)) - host_offset);
+    };
+
+    if (gxm.immediate_context)
+        preserve_context_tail(gxm.immediate_context);
+    for (const auto &[_, address] : gxm.deferred_contexts)
+        preserve_context_tail(address);
+
+    // A render target is host-owned all the way through: a unique_ptr and four values the guest
+    // gave us once at creation and never revisits.
+    for (const auto &[_, address] : gxm.render_targets)
+        out.emplace_back(address, static_cast<uint32_t>(sizeof(SceGxmRenderTarget)));
+
+    // And the shader patchers, with every program they have handed out. A patcher is two
+    // std::maps; a program is a unique_ptr to a compiled renderer program plus, for vertex
+    // programs, two std::vectors. Restoring their bytes from another process installs that
+    // process's pointers, and the first draw after the load dereferences one -- measured as a
+    // fault in gxmSetUniformBuffers reading uniform_buffer_sizes through a stale renderer_data.
+    {
+        const std::lock_guard<std::mutex> lock(gxm.shader_patcher_mutex);
+        for (const Address address : gxm.shader_patchers) {
+            SceGxmShaderPatcher *patcher = Ptr<SceGxmShaderPatcher>(address).get(mem);
+            if (!patcher)
+                continue;
+            out.emplace_back(address, static_cast<uint32_t>(sizeof(SceGxmShaderPatcher)));
+            for (const auto &[_, program] : patcher->vertex_program_cache) {
+                if (program)
+                    out.emplace_back(program.address(), static_cast<uint32_t>(sizeof(SceGxmVertexProgram)));
+            }
+            for (const auto &[_, program] : patcher->fragment_program_cache) {
+                if (program)
+                    out.emplace_back(program.address(), static_cast<uint32_t>(sizeof(SceGxmFragmentProgram)));
+            }
+        }
+    }
+}
 
 // clang-format off
 static const size_t size_mask_gxp = 228;
@@ -4573,6 +4619,10 @@ EXPORT(int, sceGxmShaderPatcherCreate, const SceGxmShaderPatcherParams *params, 
         return RET_ERROR(SCE_GXM_ERROR_OUT_OF_MEMORY);
     }
     shaderPatcher->get(emuenv.mem)->params = *params;
+    {
+        const std::lock_guard<std::mutex> lock(emuenv.gxm.shader_patcher_mutex);
+        emuenv.gxm.shader_patchers.insert(shaderPatcher->address());
+    }
     return 0;
 }
 
@@ -4706,6 +4756,10 @@ EXPORT(int, sceGxmShaderPatcherDestroy, Ptr<SceGxmShaderPatcher> shaderPatcher) 
     if (!shaderPatcher)
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
 
+    {
+        const std::lock_guard<std::mutex> lock(emuenv.gxm.shader_patcher_mutex);
+        emuenv.gxm.shader_patchers.erase(shaderPatcher.address());
+    }
     free_callbacked(emuenv, thread_id, shaderPatcher.get(emuenv.mem), shaderPatcher);
 
     return 0;
