@@ -178,6 +178,18 @@ void ThreadState::run_loop() {
     ++call_level;
     const bool top_level = call_level == 1;
 
+    // Each nested frame here is a guest callback entered from inside another one, and each costs
+    // real host stack. Runaway nesting is how a session dies with EXCEPTION_STACK_OVERFLOW, at
+    // which point there is no stack left to report anything from -- the handler cannot even
+    // format a line. Complain while there is still room to do it, once per thread, and name the
+    // thread: a guest that is genuinely this deep is already wrong.
+    if (call_level == 32 && !deep_nesting_reported) {
+        deep_nesting_reported = true;
+        LOG_ERROR("Thread {} \"{}\" is {} guest callbacks deep at pc={} -- this ends in a stack overflow",
+            id, name, call_level, log_hex(read_pc(*cpu)));
+        logging::flush();
+    }
+
     auto run_thread_end_callback = [&]() {
         if (!run_end_callback)
             return;
