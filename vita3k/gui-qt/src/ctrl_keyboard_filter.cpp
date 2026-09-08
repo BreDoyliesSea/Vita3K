@@ -76,6 +76,9 @@ bool CtrlKeyboardFilter::eventFilter(QObject *watched, QEvent *event) {
         if (pressed && matches(cfg.keyboard_gui_fullscreen, cfg.keyboard_gui_fullscreen_alt))
             emit fullscreen_toggled();
 
+        if (pressed && matches(cfg.keyboard_fast_forward, cfg.keyboard_fast_forward_alt))
+            emit fast_forward_cycled();
+
         if (pressed && matches(cfg.keyboard_gui_toggle_touch, cfg.keyboard_gui_toggle_touch_alt))
             toggle_touchscreen(m_emuenv.touch);
 
