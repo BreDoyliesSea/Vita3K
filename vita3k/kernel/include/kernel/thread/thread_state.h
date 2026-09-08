@@ -154,6 +154,8 @@ private:
     // Number of active run_loop frames. The top-level host thread keeps one
     // frame alive (run_loop()) while parked dormant; callbacks add nested frames.
     int call_level = 0;
+    // So the warning about runaway nesting is logged once, not on every frame past the threshold.
+    bool deep_nesting_reported = false;
 
     // when calling sceKernelStartThread
     bool run_start_callback = false;

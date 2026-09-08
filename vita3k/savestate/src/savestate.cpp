@@ -759,6 +759,7 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
 
     uint32_t freed = 0, reallocated = 0, unrecoverable = 0, skipped = 0, host_owned_skipped = 0;
     uint32_t host_owned_ranges_skipped = 0;
+    uint32_t left_alone = 0;
     {
         const std::lock_guard<std::mutex> alloc_lock(emuenv.mem.generation_mutex);
 
@@ -771,25 +772,49 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
         for (const auto &region : saved)
             wanted.emplace(region.addr, region.size);
 
+        // Release as little as possible.
+        //
+        // Every allocation the guest has made since the state was taken is also referenced by
+        // something host-side that the load does not know about -- a queued display callback's
+        // data, a renderer buffer, a texture. Releasing one gives its pages back to the allocator
+        // while those references still exist, and the session dies about two seconds later:
+        // measured repeatedly, and only ever on a load that released something. A load that
+        // released nothing always ran.
+        //
+        // Leaving an extra allocation alone costs a few pages that the guest will never ask about
+        // -- the allocator is host-side, so the restored guest cannot see it, and it will not be
+        // handed out again. So free only where it is actually necessary: a region at the same
+        // address with a different size, or one standing on ground the state needs.
         for (const auto &entry : live) {
             const auto it = wanted.find(entry.first);
-            if (it == wanted.end() || it->second != entry.second) {
-                // Loud on purpose. A load that releases anything is the one that goes wrong two
-                // seconds later; a load that reconciles nothing runs. Knowing which allocation
-                // it was is the whole question.
-                LOG_INFO("Savestate: releasing region at {} ({} page(s), state {})",
-                    log_hex(entry.first), entry.second,
-                    it == wanted.end() ? "does not have it" : fmt::format("has {} page(s)", it->second));
-                free_for_savestate(emuenv.mem, entry.first);
-                freed++;
+            if (it != wanted.end() && it->second == entry.second)
+                continue;
+
+            const bool wrong_size = (it != wanted.end());
+            const bool in_the_way = std::any_of(wanted.begin(), wanted.end(), [&](const auto &want) {
+                if (live.find(want.first) != live.end() && live.at(want.first) == want.second)
+                    return false; // already there, will not be allocated
+                return want.first < entry.first + entry.second && entry.first < want.first + want.second;
+            });
+
+            if (!wrong_size && !in_the_way) {
+                left_alone++;
+                continue;
             }
+
+            LOG_INFO("Savestate: releasing region at {} ({} bytes, state {}, {})",
+                log_hex(entry.first), entry.second,
+                wrong_size ? fmt::format("has {} bytes", it->second) : "does not have it",
+                in_the_way ? "in the way of one the state needs" : "wrong size");
+            free_for_savestate(emuenv.mem, entry.first);
+            freed++;
         }
 
         for (const auto &entry : wanted) {
             const auto it = live.find(entry.first);
             if (it != live.end() && it->second == entry.second)
                 continue;
-            LOG_INFO("Savestate: restoring region at {} ({} page(s))", log_hex(entry.first), entry.second);
+            LOG_INFO("Savestate: restoring region at {} ({} bytes)", log_hex(entry.first), entry.second);
             if (try_alloc_at_locked(emuenv.mem, entry.first, entry.second, "savestate") == 0) {
                 unrecoverable++;
                 continue;
@@ -844,8 +869,9 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
         }
     }
 
-    if (freed > 0 || reallocated > 0)
-        LOG_INFO("Savestate: address space reconciled ({} released, {} restored)", freed, reallocated);
+    if (freed > 0 || reallocated > 0 || left_alone > 0)
+        LOG_INFO("Savestate: address space reconciled ({} released, {} restored, {} left alone)",
+            freed, reallocated, left_alone);
     if (unrecoverable > 0)
         LOG_ERROR("Savestate: {} region(s) could not be re-allocated; the guest address space does not match the state", unrecoverable);
 
