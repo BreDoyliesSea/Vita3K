@@ -396,6 +396,23 @@ void on_savestate_loaded(State &ngs, const MemState &mem) {
     for (System *system : ngs.systems) {
         if (!system)
             continue;
+
+        // Start the scheduler from nothing.
+        //
+        // The queue holds raw Voice pointers describing what was playing a moment ago, and the
+        // pending operations describe work queued against that moment. The guest's side of all of
+        // it has just been rewound to a different one. Walking the old queue against the new guest
+        // state faulted in VoiceScheduler::update, in the memmove that copies the queue, a few
+        // tens of milliseconds after every load.
+        //
+        // Whatever was playing stops. The guest re-queues voices through sceNgsVoicePlay as it
+        // carries on, so this costs the tail of a sound, not the audio.
+        {
+            const std::lock_guard<std::recursive_mutex> lock(system->voice_scheduler.mutex);
+            system->voice_scheduler.queue.clear();
+            while (!system->voice_scheduler.operations_pending.empty())
+                system->voice_scheduler.operations_pending.pop();
+        }
         for (Rack *rack : system->racks) {
             if (!rack)
                 continue;
