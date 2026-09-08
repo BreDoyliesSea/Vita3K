@@ -54,6 +54,7 @@ constexpr uint32_t TAG_MEM = 0x204D454DU; // "MEM "
 constexpr uint32_t TAG_CPU = 0x20555043U; // "CPU "
 constexpr uint32_t TAG_WAIT = 0x54494157U; // "WAIT" - which HLE wait each parked thread is in
 constexpr uint32_t TAG_SYNC = 0x434E5953U; // "SYNC" - scalar state of the kernel sync primitives
+constexpr uint32_t TAG_FILE = 0x454C4946U; // "FILE" - read position of every open read-only file
 
 // NIDs the restore path understands. A parked thread can only be carried across a load if its
 // wait is one of these.
@@ -366,6 +367,44 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
         put_mutexes(emuenv.kernel.lwmutexes);
     }
 
+    // --- FILE: where each open read-only file is positioned -------------------------------------
+    // The offset of an open file lives in the host FILE*, not in guest memory, so nothing above
+    // captures it. A load rewinds the guest's idea of how far through a file it is while the host
+    // handle stays where it got to, and the two disagree from then on.
+    //
+    // Streamed audio is where this shows: the BGM thread reads the next chunk of a .pak into a
+    // ring buffer whose indices *are* in the snapshot. Rewind those without rewinding the file and
+    // the stream stops advancing -- the symptom being a fragment of music repeating.
+    //
+    // Read-only descriptors only. Rewinding a writable handle would leave the guest's next writes
+    // landing over data it has already written -- savedata is open for writing while a save
+    // dialog is up -- and that is a good deal worse than desynchronised audio. A guest that
+    // reopens or re-seeks a write handle after a load recovers on its own; one whose save file
+    // has been overwritten does not.
+    std::vector<uint8_t> file_raw;
+    uint32_t files_skipped_writable = 0;
+    {
+        std::vector<std::pair<SceUID, int64_t>> positions;
+        for (const auto &[fd, file] : emuenv.io.std_files) {
+            if (!file.is_regular_file())
+                continue;
+            if (file.can_write_file()) {
+                files_skipped_writable++;
+                continue;
+            }
+            const SceOff at = file.tell();
+            if (at >= 0)
+                positions.emplace_back(fd, static_cast<int64_t>(at));
+        }
+        put<uint32_t>(file_raw, static_cast<uint32_t>(positions.size()));
+        for (const auto &[fd, at] : positions) {
+            put(file_raw, fd);
+            put(file_raw, at);
+        }
+        LOG_INFO("Savestate: recorded {} read-only file position(s), skipped {} writable",
+            positions.size(), files_skipped_writable);
+    }
+
     // --- assemble ---------------------------------------------------------------------------
     std::vector<uint8_t> file;
     file.insert(file.end(), std::begin(MAGIC), std::end(MAGIC));
@@ -393,6 +432,11 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
     put<uint64_t>(file, sync_raw.size());
     put<uint64_t>(file, sync_raw.size());
     file.insert(file.end(), sync_raw.begin(), sync_raw.end());
+
+    put(file, TAG_FILE);
+    put<uint64_t>(file, file_raw.size());
+    put<uint64_t>(file, file_raw.size());
+    file.insert(file.end(), file_raw.begin(), file_raw.end());
 
     // Write to a temporary and rename into place, so an interrupted save cannot destroy the
     // previous good state.
@@ -475,6 +519,8 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
     size_t wait_size = 0;
     const uint8_t *sync_data = nullptr;
     size_t sync_size = 0;
+    const uint8_t *file_data = nullptr;
+    size_t file_size = 0;
 
     while (r.need(sizeof(uint32_t) + sizeof(uint64_t) * 2)) {
         uint32_t tag = 0;
@@ -505,13 +551,17 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
             sync_data = payload;
             sync_size = static_cast<size_t>(stored);
             break;
+        case TAG_FILE:
+            file_data = payload;
+            file_size = static_cast<size_t>(stored);
+            break;
         default:
             LOG_WARN("Savestate: ignoring unknown chunk 0x{:08X}", tag);
             break;
         }
     }
 
-    if (!mem_packed || !cpu_data || !wait_data || !sync_data)
+    if (!mem_packed || !cpu_data || !wait_data || !sync_data || !file_data)
         return Result::fail("state is missing a required chunk");
 
     // --- gate: is the guest still parked the way the state expects? --------------------------
@@ -808,6 +858,32 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
             return Result::fail("corrupt sync chunk");
     }
 
+    // --- restore read-only file positions ---------------------------------------------------
+    // A descriptor that has since been closed, or has become writable, is skipped rather than
+    // forced.
+    uint32_t files_restored = 0, files_gone = 0;
+    {
+        Reader fr{ file_data, file_size, 0 };
+        uint32_t count = 0;
+        if (!fr.get(count))
+            return Result::fail("corrupt file chunk");
+        for (uint32_t i = 0; i < count; i++) {
+            SceUID fd = 0;
+            int64_t at = 0;
+            if (!fr.get(fd) || !fr.get(at))
+                return Result::fail("corrupt file chunk");
+            const auto it = emuenv.io.std_files.find(fd);
+            if (it == emuenv.io.std_files.end() || it->second.can_write_file()) {
+                files_gone++;
+                continue;
+            }
+            if (it->second.seek(static_cast<SceOff>(at), SCE_SEEK_SET))
+                files_restored++;
+            else
+                files_gone++;
+        }
+    }
+
     // Restoring the counts above wrote numbers the waiting-thread queues know nothing about. A
     // waiter can now be satisfiable with nobody left to wake it, because semaphore_signal is the
     // only thing that ever wakes one -- which presents as the guest hanging with a correct-looking
@@ -820,8 +896,9 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
     // them to resynchronise.
     ngs::on_savestate_loaded(emuenv.ngs, emuenv.mem);
 
-    LOG_INFO("Savestate loaded: {} ({} regions, {}/{} threads restored, {} sync object(s) restored, {} gone)",
-        path.string(), region_count, restored, thread_count, sync_restored, sync_skipped);
+    LOG_INFO("Savestate loaded: {} ({} regions, {}/{} threads, {} sync object(s), {} file position(s); {} sync and {} file gone)",
+        path.string(), region_count, restored, thread_count, sync_restored, files_restored,
+        sync_skipped, files_gone);
     return Result::ok();
 }
 
