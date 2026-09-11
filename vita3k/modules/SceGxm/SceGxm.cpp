@@ -3157,7 +3157,26 @@ EXPORT(int, sceGxmNotificationWait, const SceGxmNotification *notification) {
 
     std::unique_lock<std::mutex> lock(emuenv.renderer->notification_mutex);
     if (*value != target_value) {
-        emuenv.renderer->notification_ready.wait(lock, [&]() { return *value == target_value || emuenv.display.abort.load(); });
+        // Say so while waiting. A thread blocked here used to report that it was running, so a
+        // pause waited for it to stop and gave up, and a savestate could not take it out.
+        const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
+        auto *const renderer = emuenv.renderer.get();
+        {
+            const std::lock_guard<std::mutex> thread_lock(thread->mutex);
+            thread->update_status(ThreadStatus::wait);
+        }
+        {
+            const ScopedWait scoped_wait(*thread, { [renderer] {
+                const std::lock_guard<std::mutex> notification_lock(renderer->notification_mutex);
+                renderer->notification_ready.notify_all();
+            } });
+            renderer->notification_ready.wait(lock, [&]() {
+                return *value == target_value || emuenv.display.abort.load() || thread->wait_abandoned();
+            });
+        }
+        const std::lock_guard<std::mutex> thread_lock(thread->mutex);
+        if (thread->status == ThreadStatus::wait)
+            thread->update_status(ThreadStatus::run);
     }
 
     return 0;

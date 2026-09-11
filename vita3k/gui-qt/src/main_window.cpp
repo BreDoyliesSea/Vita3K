@@ -1542,10 +1542,10 @@ void MainWindow::on_quicksave_triggered() {
     // and this is cheap to retry because a refused save has written nothing.
     //
     // 60 attempts: a save also refuses a moment a load could not restart (see savestate::save).
-    // Measured over 30 saves in battle, about four attempts in five were refused -- mostly the
-    // display queue thread caught in sceDisplayWaitVblankStart -- and the slowest save took 15.
-    // At that rate 30 attempts would give up about once in a thousand saves, 60 about once in a
-    // million. A refused attempt costs a frame or two.
+    // Measured over 30 saves in battle, about four attempts in five were refused while the display
+    // queue thread's vblank wait could not be restarted, and about one in two since, all of them a
+    // frame in flight. At four in five, 30 attempts would give up about once in a thousand saves
+    // and 60 about once in a million. A refused attempt costs a frame or two.
     constexpr int max_attempts = 60;
     savestate::Result last = savestate::Result::fail("did not run");
     int attempts = 0;

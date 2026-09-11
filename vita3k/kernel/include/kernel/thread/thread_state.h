@@ -158,6 +158,28 @@ struct ThreadState {
         return held_for_load.load(std::memory_order_acquire);
     }
 
+    // How a savestate load takes this thread out of the HLE wait it is parked in. Every blocking
+    // call registers one for as long as it is parked (ScopedWait, below), so the load needs no
+    // knowledge of the individual calls.
+    struct WaitRelease {
+        // Ends the wait without it being satisfied, and wakes the thread. Empty for a wait that
+        // cannot be woken and ends on its own (sceAudioOutOutput).
+        std::function<void()> release;
+        // Whether making the call again from its start is equivalent to staying in it. A save
+        // refuses a moment when a thread is in a wait that is not.
+        bool restartable = true;
+    };
+    void enter_wait(WaitRelease how);
+    void leave_wait();
+    std::optional<WaitRelease> current_wait() const;
+
+    // Set once a savestate load has armed this thread (continue_from_on_return) and is ending its
+    // wait. A wait that would otherwise go back to sleep, or run guest callbacks, on waking checks
+    // this and returns instead.
+    bool wait_abandoned() const {
+        return abandon_wait.load(std::memory_order_acquire);
+    }
+
 private:
     // Whether the thread is exiting or being deleted. Called with mutex held.
     bool exiting() const { return exit_requested || delete_requested; }
@@ -177,6 +199,11 @@ private:
     // Set by continue_from_on_return(), consumed in run_loop() when the call returns.
     std::optional<CPUContext> context_on_return;
     std::atomic<bool> held_for_load{ false };
+    std::atomic<bool> abandon_wait{ false };
+    // Guards wait_release only, and is never held while calling anything, so a wait can register
+    // under whatever locks it already holds.
+    mutable std::mutex wait_release_mutex;
+    std::optional<WaitRelease> wait_release;
     // Single stepping mode.
     bool single_stepping = false;
 
@@ -216,6 +243,22 @@ private:
     std::mutex end_waiters_mutex;
     // Threads blocked in sceKernelWaitThreadEnd on this one.
     WaitQueue<EndWaitEntry> end_waiters;
+};
+
+// Registers how to release a wait for as long as it is in scope (see ThreadState::WaitRelease).
+struct ScopedWait {
+    ScopedWait(ThreadState &thread, ThreadState::WaitRelease how)
+        : thread(thread) {
+        thread.enter_wait(std::move(how));
+    }
+    ~ScopedWait() {
+        thread.leave_wait();
+    }
+    ScopedWait(const ScopedWait &) = delete;
+    ScopedWait &operator=(const ScopedWait &) = delete;
+
+private:
+    ThreadState &thread;
 };
 
 typedef std::shared_ptr<ThreadState> ThreadStatePtr;

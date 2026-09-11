@@ -232,6 +232,9 @@ EXPORT(int, sceAudioOutOutput, int port, const void *buf) {
 
     // is it really useful to update the thread status?
     thread->update_status(ThreadStatus::waiting);
+    // Nothing can wake this and nothing needs to: it ends once the device has taken the buffer. It
+    // is registered anyway, so a savestate knows the call can be made again (ThreadState::WaitRelease).
+    const ScopedWait scoped_wait(*thread, ThreadState::WaitRelease{});
     {
         // audio_output reads the guest buffer directly -- cubeb memcpy's it into its own ring,
         // SDL hands it to SDL_PutAudioStreamData -- and this thread reports 'wait' for the whole
