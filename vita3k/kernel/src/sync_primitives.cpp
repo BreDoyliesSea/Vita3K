@@ -618,6 +618,13 @@ SceInt32 Condvar::wait(MemState &mem, const ThreadStatePtr &thread, SceUInt32 *t
     if (!r || *r != SCE_KERNEL_OK)
         return guest_result(r);
 
+    // Taken out of the wait by a savestate load: its registers are about to be replaced. Taking
+    // the mutex back now would block on whichever paused thread holds it, and leave this thread
+    // in a wait no load can restart -- measured as FIOS2's "SceFiosLibdeflt1" stuck here on the
+    // first load in four games, and every save after it refused.
+    if (thread->wait_abandoned())
+        return SCE_KERNEL_ERROR_WAIT_CANCEL;
+
     guard.unlock();
     // Taking the mutex back is still part of the condition variable wait
     return associated_mutex->acquire(mem, thread, 1, timeout, false, { lightweight() ? SCE_KERNEL_WAITTYPE_LW_COND_LW_MUTEX : SCE_KERNEL_WAITTYPE_COND_MUTEX, uid }, callbacks);

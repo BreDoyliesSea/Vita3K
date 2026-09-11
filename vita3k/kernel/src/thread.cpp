@@ -591,9 +591,17 @@ void ThreadState::resume(bool step) {
     }
 }
 
-void ThreadState::suspend_on_return() {
-    const std::lock_guard<std::mutex> lock(mutex);
-    suspend_requested = true;
+ThreadStatus ThreadState::request_pause() {
+    std::unique_lock<std::mutex> lock(mutex);
+    const ThreadStatus now = status;
+    // A waiting thread cannot be stopped where it is, but run_loop checks this the moment its call
+    // returns, before any more guest code runs.
+    if (now == ThreadStatus::run || now == ThreadStatus::wait)
+        suspend_requested = true;
+    lock.unlock();
+    if (now == ThreadStatus::run)
+        stop(*cpu);
+    return now;
 }
 
 bool ThreadState::resume_after_pause() {

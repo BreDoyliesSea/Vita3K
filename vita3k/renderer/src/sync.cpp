@@ -133,6 +133,21 @@ void finish(State &state, Context *context) {
     }
 }
 
+bool wait_gpu_idle(State &state, int timeout_ms) {
+    // Only the Vulkan backend with memory mapping has a separate thread writing GPU results into
+    // guest memory as work completes; everywhere else the render thread does it itself.
+    if (state.current_backend != Backend::Vulkan || !state.features.enable_memory_mapping)
+        return true;
+
+    // The wait thread handles its requests in order, so a callback queued now runs once everything
+    // already submitted has landed. Shared, because on a timeout the callback still runs later.
+    auto &vk_state = static_cast<vulkan::VKState &>(state);
+    auto landed = std::make_shared<std::promise<void>>();
+    std::future<void> future = landed->get_future();
+    vk_state.request_queue.push(vulkan::CallbackRequest{ new vulkan::CallbackRequestFunction([landed] { landed->set_value(); }) });
+    return future.wait_for(std::chrono::milliseconds(timeout_ms)) == std::future_status::ready;
+}
+
 int wait_for_status(State &state, int *status, int signal, bool wake_on_equal) {
     std::unique_lock<std::mutex> lock(state.command_finish_one_mutex);
     const bool wake_on_unequal = !wake_on_equal;

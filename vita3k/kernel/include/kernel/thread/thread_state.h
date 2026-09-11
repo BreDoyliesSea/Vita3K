@@ -138,10 +138,10 @@ struct ThreadState {
         return call_level;
     }
 
-    // Park in ThreadStatus::suspend the moment the HLE call this thread is waiting in returns,
-    // before it runs any more guest code. KernelState::pause_threads uses it for threads that are
-    // waiting rather than running, which suspend() cannot stop.
-    void suspend_on_return();
+    // For KernelState::pause_threads: stop this thread whether it is running guest code or waiting in
+    // an HLE call (then it parks the moment the call returns), and return the status it had -- read
+    // once, under the thread's lock, so the status recorded and the stop applied always agree.
+    ThreadStatus request_pause();
 
     // End of a pause for a thread that was waiting when it began: resume it if its call returned
     // and it parked, otherwise cancel the request. Returns true if it was resumed.
