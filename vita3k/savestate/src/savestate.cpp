@@ -21,6 +21,7 @@
 #include <cpu/functions.h>
 #include <emuenv/state.h>
 #include <gxm/state.h>
+#include <io/functions.h>
 #include <io/state.h>
 #include <kernel/state.h>
 #include <kernel/sync_primitives.h>
@@ -35,6 +36,7 @@
 #include <miniz.h>
 
 #include <algorithm>
+#include <tuple>
 #include <cstring>
 #include <ctime>
 #include <fstream>
@@ -58,6 +60,8 @@ constexpr uint32_t TAG_SYNC = 0x434E5953U; // "SYNC" - scalar state of the kerne
 constexpr uint32_t TAG_FILE = 0x454C4946U; // "FILE" - read position of every open read-only file
 // "STK " - where each thread's guest stack was. Optional, so states written before it still load.
 constexpr uint32_t TAG_STACK = 0x204B5453U;
+// "FTBL" - what file each open read-only descriptor refers to. Optional, so older states still load.
+constexpr uint32_t TAG_FTBL = 0x4C425446U;
 
 // NIDs the restore path understands. A parked thread can only be carried across a load if its
 // wait is one of these.
@@ -408,6 +412,34 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
             positions.size(), files_skipped_writable);
     }
 
+    // --- what each descriptor refers to -------------------------------------------------------
+    // Descriptors come from a counter that only ever goes up, so a descriptor's number depends on
+    // every file the session has opened. The guest's memory holds the numbers it was given, and a
+    // load rewinds that memory into a session whose counter took a different path: restoring
+    // positions by number then seeks, and the guest then reads, whatever file holds that number
+    // *now*. Measured as music broken after a load into a fresh session that had opened fewer
+    // sound packs than the one the state was taken in -- the load reported a file "gone" and the
+    // music stream read from the wrong place. Record what each number meant.
+    std::vector<uint8_t> ftbl_raw;
+    {
+        std::vector<std::tuple<SceUID, int32_t, int64_t, std::string>> entries;
+        for (const auto &[fd, file] : emuenv.io.std_files) {
+            if (!file.is_regular_file() || file.can_write_file())
+                continue;
+            const SceOff at = file.tell();
+            if (at >= 0)
+                entries.emplace_back(fd, file.get_open_mode(), static_cast<int64_t>(at), std::string(file.get_vita_loc()));
+        }
+        put<int32_t>(ftbl_raw, static_cast<int32_t>(emuenv.io.next_fd));
+        put<uint32_t>(ftbl_raw, static_cast<uint32_t>(entries.size()));
+        for (const auto &[fd, flags, at, path] : entries) {
+            put(ftbl_raw, fd);
+            put(ftbl_raw, flags);
+            put(ftbl_raw, at);
+            put_string(ftbl_raw, path);
+        }
+    }
+
     // --- where each thread's stack is ---------------------------------------------------------
     // The two sessions' guest allocations diverge -- a single differently sized allocation early
     // on shifts every thread stack after it by a page -- and the load re-lays-out the address
@@ -462,6 +494,11 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
     put<uint64_t>(file, stack_raw.size());
     put<uint64_t>(file, stack_raw.size());
     file.insert(file.end(), stack_raw.begin(), stack_raw.end());
+
+    put(file, TAG_FTBL);
+    put<uint64_t>(file, ftbl_raw.size());
+    put<uint64_t>(file, ftbl_raw.size());
+    file.insert(file.end(), ftbl_raw.begin(), ftbl_raw.end());
 
     // Write to a temporary and rename into place, so an interrupted save cannot destroy the
     // previous good state.
@@ -548,6 +585,8 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
     size_t file_size = 0;
     const uint8_t *stack_data = nullptr;
     size_t stack_size = 0;
+    const uint8_t *ftbl_data = nullptr;
+    size_t ftbl_size = 0;
 
     while (r.need(sizeof(uint32_t) + sizeof(uint64_t) * 2)) {
         uint32_t tag = 0;
@@ -585,6 +624,10 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
         case TAG_STACK:
             stack_data = payload;
             stack_size = static_cast<size_t>(stored);
+            break;
+        case TAG_FTBL:
+            ftbl_data = payload;
+            ftbl_size = static_cast<size_t>(stored);
             break;
         default:
             LOG_WARN("Savestate: ignoring unknown chunk 0x{:08X}", tag);
@@ -1044,11 +1087,65 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
             return Result::fail("corrupt sync chunk");
     }
 
-    // --- restore read-only file positions ---------------------------------------------------
-    // A descriptor that has since been closed, or has become writable, is skipped rather than
-    // forced.
-    uint32_t files_restored = 0, files_gone = 0;
-    {
+    // --- restore the guest's file table ----------------------------------------------------
+    // With the file table recorded, make every descriptor the guest holds refer to the file it
+    // referred to when the state was taken, reopening it under that number if this session has
+    // something else there or nothing at all. Without the table (older states), fall back to
+    // seeking by number, which is only right when the two sessions opened files identically.
+    uint32_t files_restored = 0, files_gone = 0, files_reopened = 0;
+    if (ftbl_data) {
+        Reader tr{ ftbl_data, ftbl_size, 0 };
+        int32_t saved_next_fd = 0;
+        uint32_t count = 0;
+        if (!tr.get(saved_next_fd) || !tr.get(count))
+            return Result::fail("corrupt file table chunk");
+        for (uint32_t i = 0; i < count; i++) {
+            SceUID fd = 0;
+            int32_t flags = 0;
+            int64_t at = 0;
+            std::string path;
+            if (!tr.get(fd) || !tr.get(flags) || !tr.get(at) || !tr.get_string(path))
+                return Result::fail("corrupt file table chunk");
+
+            auto it = emuenv.io.std_files.find(fd);
+            if (it != emuenv.io.std_files.end() && !it->second.can_write_file() && path == it->second.get_vita_loc()) {
+                if (it->second.seek(static_cast<SceOff>(at), SCE_SEEK_SET))
+                    files_restored++;
+                else
+                    files_gone++;
+                continue;
+            }
+
+            // The number means something else in this session, or nothing. A writable file
+            // there is left alone: it is somebody's save data, and closing it is worse than one
+            // stream reading from the wrong place.
+            if (it != emuenv.io.std_files.end() && it->second.can_write_file()) {
+                LOG_WARN("Savestate: descriptor {} is {} (writable) here but was {} in the state; leaving it",
+                    fd, it->second.get_vita_loc(), path);
+                files_gone++;
+                continue;
+            }
+            const std::string was = (it != emuenv.io.std_files.end()) ? std::string(it->second.get_vita_loc()) : std::string("nothing");
+            if (it != emuenv.io.std_files.end())
+                emuenv.io.std_files.erase(it);
+
+            const SceUID fresh = open_file(emuenv.io, path.c_str(), flags, emuenv.vita_fs_path, "savestate");
+            if (fresh < 0) {
+                LOG_WARN("Savestate: could not reopen {} for descriptor {}", path, fd);
+                files_gone++;
+                continue;
+            }
+            auto node = emuenv.io.std_files.extract(fresh);
+            node.key() = fd;
+            const auto placed = emuenv.io.std_files.insert(std::move(node));
+            placed.position->second.seek(static_cast<SceOff>(at), SCE_SEEK_SET);
+            LOG_INFO("Savestate: descriptor {} was {} here; reopened {} under it", fd, was, path);
+            files_reopened++;
+        }
+        // Numbers the restored guest holds must never be handed out again.
+        if (emuenv.io.next_fd < saved_next_fd)
+            emuenv.io.next_fd = saved_next_fd;
+    } else {
         Reader fr{ file_data, file_size, 0 };
         uint32_t count = 0;
         if (!fr.get(count))
@@ -1082,8 +1179,8 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
     // them to resynchronise.
     ngs::on_savestate_loaded(emuenv.ngs, emuenv.mem);
 
-    LOG_INFO("Savestate loaded: {} ({} regions, {}/{} threads, {} sync object(s), {} file position(s); {} sync and {} file gone)",
-        path.string(), region_count, restored, thread_count, sync_restored, files_restored,
+    LOG_INFO("Savestate loaded: {} ({} regions, {}/{} threads, {} sync object(s), {} file position(s), {} reopened; {} sync and {} file gone)",
+        path.string(), region_count, restored, thread_count, sync_restored, files_restored, files_reopened,
         sync_skipped, files_gone);
     return Result::ok();
 }
