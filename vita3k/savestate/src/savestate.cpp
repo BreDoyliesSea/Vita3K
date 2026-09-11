@@ -905,6 +905,27 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
         }
     }
 
+    // --- are the GXM objects the state refers to still where it had them? ---------------------
+    // They are not moved by a load, so if the game's heap put them elsewhere in this session the
+    // restored guest would hand back addresses with no live object behind them. Refuse instead.
+    if (gxml_data) {
+        Reader gr{ gxml_data, gxml_size, 0 };
+        gxm::HostObjectLayout layout;
+        for (std::vector<Address> *list : { &layout.contexts, &layout.render_targets, &layout.sync_objects, &layout.shader_patchers, &layout.vertex_programs, &layout.fragment_programs }) {
+            uint32_t count = 0;
+            if (!gr.get(count))
+                return Result::fail("corrupt GXM layout chunk");
+            list->resize(count);
+            for (Address &address : *list) {
+                if (!gr.get(address))
+                    return Result::fail("corrupt GXM layout chunk");
+            }
+        }
+        const std::string why = gxm::check_layout(emuenv.gxm, emuenv.mem, layout);
+        if (!why.empty())
+            return Result::fail("the graphics objects are laid out differently in this session: " + why);
+    }
+
     // --- can the NGS objects be moved to where the state had them? ----------------------------
     // Decided here, before anything is touched, so a refusal leaves the session as it was.
     std::optional<ngs::SavedLayout> ngs_layout;
