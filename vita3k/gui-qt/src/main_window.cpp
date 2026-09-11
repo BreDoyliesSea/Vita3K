@@ -1594,7 +1594,9 @@ void MainWindow::on_quickload_triggered() {
     // not paper over the gate: a thread that has genuinely moved on for good never matches, and
     // the last refusal is what gets reported.
     savestate::Result last = savestate::Result::fail("did not run");
+    int attempts = 0;
     for (int attempt = 1; attempt <= 8; attempt++) {
+        attempts = attempt;
         if (!wait_for_display_queue_gap(emuenv.gxm, 10000)) {
             statusBar()->showMessage(tr("Quickload: could not catch a frame boundary, try again"), 6000);
             return;
@@ -1628,7 +1630,7 @@ void MainWindow::on_quickload_triggered() {
         std::this_thread::sleep_for(std::chrono::milliseconds(33));
     }
 
-    LOG_ERROR("Quickload gave up after 8 attempts: {}", last.reason);
+    LOG_ERROR("Quickload gave up after {} attempt(s): {}", attempts, last.reason);
     statusBar()->showMessage(tr("Quickload failed: %1").arg(QString::fromStdString(last.reason)), 8000);
 }
 

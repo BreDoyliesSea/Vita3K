@@ -65,6 +65,9 @@ constexpr uint32_t TAG_STACK = 0x204B5453U;
 constexpr uint32_t TAG_FTBL = 0x4C425446U;
 // "NGSL" - where each NGS system, rack and voice was. Optional, so older states still load.
 constexpr uint32_t TAG_NGSL = 0x4C53474EU;
+// "GXML" - where every GXM host object was. Optional, so older states still load.
+constexpr uint32_t TAG_GXML = 0x4C4D5847U;
+
 
 // NIDs the restore path understands. A parked thread can only be carried across a load if its
 // wait is one of these.
@@ -479,6 +482,18 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
         }
     }
 
+    // --- where the GXM objects are ------------------------------------------------------------
+    // See gxm::check_layout. A load refuses a state whose objects are not all still where it had them.
+    std::vector<uint8_t> gxml_raw;
+    {
+        const gxm::HostObjectLayout layout = gxm::capture_layout(emuenv.gxm, emuenv.mem);
+        for (const std::vector<Address> *list : { &layout.contexts, &layout.render_targets, &layout.sync_objects, &layout.shader_patchers, &layout.vertex_programs, &layout.fragment_programs }) {
+            put<uint32_t>(gxml_raw, static_cast<uint32_t>(list->size()));
+            for (const Address address : *list)
+                put<uint32_t>(gxml_raw, address);
+        }
+    }
+
     // --- assemble ---------------------------------------------------------------------------
     std::vector<uint8_t> file;
     file.insert(file.end(), std::begin(MAGIC), std::end(MAGIC));
@@ -527,6 +542,11 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
     put<uint64_t>(file, ngsl_raw.size());
     file.insert(file.end(), ngsl_raw.begin(), ngsl_raw.end());
 
+    put(file, TAG_GXML);
+    put<uint64_t>(file, gxml_raw.size());
+    put<uint64_t>(file, gxml_raw.size());
+    file.insert(file.end(), gxml_raw.begin(), gxml_raw.end());
+
     // Write to a temporary and rename into place, so an interrupted save cannot destroy the
     // previous good state.
     boost::system::error_code err;
@@ -551,6 +571,7 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
         static_cast<double>(file.size()) / (1024.0 * 1024.0));
     return Result::ok();
 }
+
 
 Result load(EmuEnvState &emuenv, const fs::path &path) {
     if (emuenv.io.title_id.empty())
@@ -616,6 +637,8 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
     size_t ftbl_size = 0;
     const uint8_t *ngsl_data = nullptr;
     size_t ngsl_size = 0;
+    const uint8_t *gxml_data = nullptr;
+    size_t gxml_size = 0;
 
     while (r.need(sizeof(uint32_t) + sizeof(uint64_t) * 2)) {
         uint32_t tag = 0;
@@ -661,6 +684,10 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
         case TAG_NGSL:
             ngsl_data = payload;
             ngsl_size = static_cast<size_t>(stored);
+            break;
+        case TAG_GXML:
+            gxml_data = payload;
+            gxml_size = static_cast<size_t>(stored);
             break;
         default:
             LOG_WARN("Savestate: ignoring unknown chunk 0x{:08X}", tag);
