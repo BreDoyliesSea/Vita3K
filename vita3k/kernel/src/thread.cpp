@@ -21,6 +21,7 @@
 #include <kernel/state.h>
 #include <kernel/sync_primitives.h>
 #include <mem/ptr.h>
+#include <mem/state.h>
 #include <util/align.h>
 
 #include <util/log.h>
@@ -28,6 +29,7 @@
 #include <cassert>
 #include <cstring>
 #include <memory>
+#include <shared_mutex>
 #include <sstream>
 #include <utility>
 
@@ -184,6 +186,13 @@ void ThreadState::run_loop(bool top_level) {
     } cpu_state_guard;
     set_current_cpu_state(cpu.get());
 
+    struct DepthGuard {
+        std::atomic<int> &depth;
+        explicit DepthGuard(std::atomic<int> &depth)
+            : depth(depth) { depth.fetch_add(1, std::memory_order_acq_rel); }
+        ~DepthGuard() { depth.fetch_sub(1, std::memory_order_acq_rel); }
+    } depth_guard(run_loop_depth);
+
     std::unique_lock<std::mutex> lock(mutex);
 
     auto run_thread_end_callback = [&]() {
@@ -302,6 +311,24 @@ void ThreadState::run_loop(bool top_level) {
                 dispatch_abort(*cpu);
 
             lock.lock();
+
+            // A savestate load took this thread out of the call that just returned, and left it
+            // the state's registers to continue from (continue_from_on_return). Wait for the load
+            // to finish -- it holds savestate_lock exclusively for its whole length -- and then
+            // carry on from those rather than from wherever the call left off.
+            if (context_on_return) {
+                const CPUContext ctx = *context_on_return;
+                context_on_return.reset();
+                lock.unlock();
+                held_for_load.store(true, std::memory_order_release);
+                {
+                    const std::shared_lock<std::shared_timed_mutex> wait_for_load(mem.savestate_lock);
+                }
+                held_for_load.store(false, std::memory_order_release);
+                load_context(*cpu, ctx);
+                clear_exclusive(*cpu);
+                lock.lock();
+            }
 
             last_stop = syscall ? StopPoint::syscall : StopPoint::guest_code;
             // A finished step or a breakpoint holds the thread for the debugger
@@ -610,6 +637,7 @@ void ThreadState::wait_while_held(std::unique_lock<std::mutex> &lock, StopPoint 
     if (!holds.any() || exiting())
         return;
     stop_point = where;
+    parked = true;
     // The holds can change while the thread waits, and with them what its status shows
     while (holds.any() && !exiting()) {
         const ThreadStatus shown = holds.shown() ? ThreadStatus::suspended : ThreadStatus::running;
@@ -617,6 +645,7 @@ void ThreadState::wait_while_held(std::unique_lock<std::mutex> &lock, StopPoint 
             update_status(shown);
         status_cond.wait(lock);
     }
+    parked = false;
     if (status != ThreadStatus::running)
         update_status(ThreadStatus::running);
 }
@@ -685,6 +714,17 @@ int ThreadState::vm_resume() {
     // The gate waits for this, and so may a suspend that waits for the thread to stop
     status_cond.notify_all();
     return 0;
+}
+
+bool ThreadState::continue_from_on_return(uint32_t nid, const CPUContext &ctx) {
+    // run_loop checks for this under the same mutex after every call returns, and call_import
+    // puts the outer NID back before that. So a thread seen here as still inside `nid` has not yet
+    // been through the check, and will find the context when it gets there.
+    const std::lock_guard<std::mutex> lock(mutex);
+    if (status != ThreadStatus::waiting || current_import_nid.load(std::memory_order_relaxed) != nid)
+        return false;
+    context_on_return = ctx;
+    return true;
 }
 
 std::string ThreadState::log_stack_traceback() const {

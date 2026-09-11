@@ -75,12 +75,11 @@ using WaitSignature = std::vector<HeldWait>; // sorted by thread
 // Which threads are held in such a wait right now. Safe to call while the guest runs.
 WaitSignature wait_signature(EmuEnvState &emuenv);
 
-// Both expect the guest to already be quiesced by the caller (see AppSessionPauseReason).
-// Neither pauses or resumes on its own.
-//
-// With `expected`, the save is refused (retryably) unless the guest is held in exactly those
-// waits: see the check at the top of save() for why a quicksave wants that.
-Result save(EmuEnvState &emuenv, const fs::path &path, const WaitSignature *expected = nullptr);
+// Both expect the guest to already be quiesced by the caller (see AppSessionPauseReason) and
+// MemState::savestate_lock to be held exclusively. Neither pauses or resumes on its own. load()
+// relies on the lock beyond its own return: the threads it takes out of their calls wait on it
+// before they continue, so they start when the caller lets go of it.
+Result save(EmuEnvState &emuenv, const fs::path &path);
 Result load(EmuEnvState &emuenv, const fs::path &path);
 
 } // namespace savestate

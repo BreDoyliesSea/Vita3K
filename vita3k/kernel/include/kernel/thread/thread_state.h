@@ -182,6 +182,30 @@ struct ThreadState {
     bool in_wait() const { return status == ThreadStatus::waiting || (status == ThreadStatus::suspended && stop_point == StopPoint::syscall); }
     std::string log_stack_traceback() const;
 
+    // --- pausing and savestates -----------------------------------------------------------------
+    // Whether the thread is running guest code or an HLE call that has not set a wait status, rather
+    // than waiting, dormant or held at its gate.
+    bool running_unheld() {
+        const std::lock_guard<std::mutex> lock(mutex);
+        return status == ThreadStatus::running && !parked;
+    }
+
+    // Depth of run_loop frames: 1 for a thread at its top level, more inside a callback.
+    int nesting_level() const {
+        return run_loop_depth.load(std::memory_order_acquire);
+    }
+
+    // Savestate load. If the thread is still waiting inside the import `nid`, arrange that when the
+    // call returns it waits for the load to finish -- the load holds MemState::savestate_lock
+    // exclusively -- and then continues from `ctx` rather than from wherever the call left it.
+    // Returns false if it is no longer in that call.
+    bool continue_from_on_return(uint32_t nid, const CPUContext &ctx);
+
+    // True while the thread is waiting on the load after continue_from_on_return.
+    bool held_for_savestate() const {
+        return held_for_load.load(std::memory_order_acquire);
+    }
+
 private:
     // How a thread ends, each value stronger than the ones before it
     enum class Ending : uint8_t {
@@ -236,6 +260,13 @@ private:
     bool step_requested = false;
     // Where the thread stopped the last time something held it
     StopPoint stop_point = StopPoint::guest_code;
+    // Set by continue_from_on_return(), consumed in run_loop() when the call returns.
+    std::optional<CPUContext> context_on_return;
+    std::atomic<bool> held_for_load{ false };
+    // Set while wait_while_held keeps the thread at its gate
+    bool parked = false;
+    // Number of active run_loop levels: 1 at the top level, one more for each nested callback.
+    std::atomic<int> run_loop_depth{ 0 };
 
     // when calling sceKernelStartThread
     bool run_start_callback = false;
