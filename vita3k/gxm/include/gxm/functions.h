@@ -41,6 +41,28 @@ namespace gxm {
 void collect_host_owned_ranges(GxmState &gxm, const MemState &mem,
     std::vector<std::pair<Address, uint32_t>> &out);
 
+// Where every GXM host object was when a savestate was taken, by kind, each list sorted.
+//
+// These objects are not moved by a load (unlike the NGS ones), so a state is only safe to load if
+// every object it refers to is still at the same address in this session. When the game's heap is
+// laid out differently they are not: measured by pushing the heap up 16 MiB before loading a state
+// from a normal session, which moved the immediate context and the shader patcher by exactly that,
+// and the first sceGxmBeginScene after the load followed the saved context's dead renderer pointer.
+struct HostObjectLayout {
+    std::vector<Address> contexts;
+    std::vector<Address> render_targets;
+    std::vector<Address> sync_objects;
+    std::vector<Address> shader_patchers;
+    std::vector<Address> vertex_programs;
+    std::vector<Address> fragment_programs;
+};
+
+HostObjectLayout capture_layout(GxmState &gxm, const MemState &mem);
+
+// Empty if every object in `saved` is a live object of the same kind at the same address here,
+// otherwise which one is not. Extra live objects are fine: the restored guest does not know them.
+std::string check_layout(GxmState &gxm, const MemState &mem, const HostObjectLayout &saved);
+
 // Color.
 SceGxmColorBaseFormat get_base_format(SceGxmColorFormat src);
 size_t bits_per_pixel(SceGxmColorBaseFormat base_format);
