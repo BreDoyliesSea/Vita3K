@@ -242,10 +242,28 @@ Result save(EmuEnvState &emuenv, const fs::path &path, const WaitSignature *expe
     // finds them the same. A thread passing through is very unlikely to be caught twice. Checked
     // first, before the expensive part, and retryable: the next frame is usually steady again. A
     // refusal writes nothing, so the last good quicksave stays in the slot.
-    if (expected) {
-        const WaitSignature now = wait_signature(emuenv);
-        if (now != *expected)
-            return Result::retry(describe_wait_change(emuenv, *expected, now));
+    const WaitSignature now = wait_signature(emuenv);
+    if (expected && now != *expected)
+        return Result::retry(describe_wait_change(emuenv, *expected, now));
+
+    // --- is every held wait one a load can find again? ------------------------------------------
+    // The load only knows how to match semaphore waits (see the gate in load()). A state with a
+    // thread held in anything else -- an event flag, a mutex, a vblank wait -- is refused by every
+    // load, permanently, so do not write one. Retryable, because such waits come and go as well:
+    // the GXM display queue thread is in sceDisplayWaitVblankStart at some frame gaps and not others.
+    for (const HeldWait &w : now) {
+        if (w.nid == NID_sceKernelWaitSema)
+            continue;
+        std::string thread_name = "?";
+        {
+            const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
+            const auto it = emuenv.kernel.threads.find(w.thread);
+            if (it != emuenv.kernel.threads.end() && it->second)
+                thread_name = it->second->name;
+        }
+        const char *const call = w.nid ? import_name(w.nid) : nullptr;
+        return Result::retry(fmt::format("thread {} \"{}\" is parked in {}, which a load could not restore",
+            w.thread, thread_name, call ? call : fmt::format("{}", log_hex(w.nid))));
     }
 
     // --- MEM: every live allocation, verbatim ---------------------------------------------
