@@ -1600,6 +1600,12 @@ void MainWindow::on_quickload_triggered() {
         }
 
         LOG_INFO("Savestate: quickload attempt {}/8 refused ({})", attempt, last.reason);
+
+        // Let the guest actually run before asking again. Retrying is only worth anything because
+        // the threads drift back into their idle waits a frame or two later; with the display queue
+        // already empty the next attempt otherwise follows within the same millisecond, and all
+        // eight were measured landing in one. Two frames at 60 fps.
+        std::this_thread::sleep_for(std::chrono::milliseconds(33));
     }
 
     LOG_ERROR("Quickload gave up after 8 attempts: {}", last.reason);
