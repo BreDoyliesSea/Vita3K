@@ -397,22 +397,15 @@ void on_savestate_loaded(State &ngs, const MemState &mem) {
         if (!system)
             continue;
 
-        // Start the scheduler from nothing.
+        // Keep the scheduler exactly as it is.
         //
-        // The queue holds raw Voice pointers describing what was playing a moment ago, and the
-        // pending operations describe work queued against that moment. The guest's side of all of
-        // it has just been rewound to a different one. Walking the old queue against the new guest
-        // state faulted in VoiceScheduler::update, in the memmove that copies the queue, a few
-        // tens of milliseconds after every load.
-        //
-        // Whatever was playing stops. The guest re-queues voices through sceNgsVoicePlay as it
-        // carries on, so this costs the tail of a sound, not the audio.
-        {
-            const std::lock_guard<std::recursive_mutex> lock(system->voice_scheduler.mutex);
-            system->voice_scheduler.queue.clear();
-            while (!system->voice_scheduler.operations_pending.empty())
-                system->voice_scheduler.operations_pending.pop();
-        }
+        // The queue holds the voices that are playing, and those Voice objects are preserved across
+        // the load (see collect_host_owned_ranges), so the queue still describes them correctly.
+        // Clearing it was tried and was wrong: the game starts its music and master voices once,
+        // when a scene begins, and never queues them again. After a load the scheduler sat at zero
+        // voices, the guest kept submitting whatever was left in its output buffer, and the music
+        // became one short fragment looping -- on every load, measured as 2 voices queued before
+        // and 0 after, for good.
         for (Rack *rack : system->racks) {
             if (!rack)
                 continue;
