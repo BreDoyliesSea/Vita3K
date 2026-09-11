@@ -1560,19 +1560,49 @@ void MainWindow::on_quicksave_triggered() {
     // guest can push the next frame in between and savestate::save rightly refuses. The window is
     // small and the boundary comes round every frame, so trying again lands almost immediately --
     // and this is cheap to retry because a refused save has written nothing.
-    for (int attempt = 1; attempt <= 5; attempt++) {
+    //
+    // Each attempt also samples which waits the guest's threads are held in, lets it run two
+    // frames, and has the save refuse unless it finds the same ones. A state saved while a thread
+    // was only passing through a wait can never be loaded; see the check at the top of
+    // savestate::save.
+    //
+    // 30 attempts, not 10: over 25 saves in battle most needed 0-3, but one needed 10. The display
+    // queue thread is in sceDisplayWaitVblankStart at some frame gaps and not others, so an attempt
+    // there is close to a coin flip. A refused attempt costs about two frames.
+    constexpr int max_attempts = 30;
+    savestate::Result last = savestate::Result::fail("did not run");
+    int attempts = 0;
+    for (int attempt = 1; attempt <= max_attempts; attempt++) {
+        attempts = attempt;
+        if (!wait_for_display_queue_gap(emuenv.gxm, 10000)) {
+            statusBar()->showMessage(tr("Quicksave: a frame is still in flight, try again"), 6000);
+            return;
+        }
+        const savestate::WaitSignature settled = savestate::wait_signature(emuenv);
+        std::this_thread::sleep_for(std::chrono::milliseconds(33));
         if (!wait_for_display_queue_gap(emuenv.gxm, 10000)) {
             statusBar()->showMessage(tr("Quicksave: a frame is still in flight, try again"), 6000);
             return;
         }
 
-        if (run_with_guest_quiesced("Quicksave", [this] {
-                return savestate::save(emuenv, savestate::slot_path(emuenv, 0));
-            }))
+        // Stays this if the guest could not be quiesced and the save never ran.
+        last = savestate::Result::retry("the guest could not be stopped");
+        bool succeeded = false;
+        run_with_guest_quiesced("Quicksave", [&] {
+            last = savestate::save(emuenv, savestate::slot_path(emuenv, 0), &settled);
+            succeeded = static_cast<bool>(last);
+            return last;
+        });
+        if (succeeded)
             return;
+        if (!last.retryable)
+            break;
 
-        LOG_INFO("Savestate: the guest moved on before it could be quiesced, retrying ({}/5)", attempt);
+        LOG_INFO("Savestate: quicksave attempt {}/10 refused ({})", attempt, last.reason);
     }
+
+    LOG_ERROR("Quicksave gave up after {} attempt(s): {}", attempts, last.reason);
+    statusBar()->showMessage(tr("Quicksave failed, the previous quicksave is kept: %1").arg(QString::fromStdString(last.reason)), 8000);
 }
 
 void MainWindow::on_quickload_triggered() {

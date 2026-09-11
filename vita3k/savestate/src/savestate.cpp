@@ -173,9 +173,80 @@ fs::path slot_path(const EmuEnvState &emuenv, const int slot) {
     return emuenv.vita_fs_path / "savestates" / emuenv.io.title_id / fmt::format("slot{}.vst", slot);
 }
 
-Result save(EmuEnvState &emuenv, const fs::path &path) {
+WaitSignature wait_signature(EmuEnvState &emuenv) {
+    // With the guest running this reads `status` under the kernel lock without the thread's own
+    // lock, as KernelState::wait_for_threads_paused does, and the arguments only for a thread that
+    // is already parked and so not writing them. A stale read costs one refused save, not a bad
+    // one: save() takes its own reading with the guest quiesced and that is what gets compared.
+    WaitSignature out;
+    const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
+    for (const auto &[uid, thread] : emuenv.kernel.threads) {
+        if (!thread || thread->status != ThreadStatus::wait)
+            continue;
+        const uint32_t nid = thread->current_import_nid.load(std::memory_order_relaxed);
+        if (is_self_completing_wait(nid))
+            continue;
+        out.push_back({ uid, nid, { thread->current_import_args[0], thread->current_import_args[1], thread->current_import_args[2] } });
+    }
+    std::sort(out.begin(), out.end(), [](const HeldWait &a, const HeldWait &b) { return a.thread < b.thread; });
+    return out;
+}
+
+// Which thread's wait differs between two signatures, in words.
+static std::string describe_wait_change(EmuEnvState &emuenv, const WaitSignature &before, const WaitSignature &now) {
+    const auto find = [](const WaitSignature &signature, int32_t thread) -> const HeldWait * {
+        const auto it = std::find_if(signature.begin(), signature.end(), [&](const HeldWait &w) { return w.thread == thread; });
+        return it == signature.end() ? nullptr : &*it;
+    };
+    const auto name_of = [&](int32_t thread) -> std::string {
+        const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
+        const auto it = emuenv.kernel.threads.find(thread);
+        return it != emuenv.kernel.threads.end() && it->second ? it->second->name : std::string("?");
+    };
+    const auto wait_text = [](const HeldWait &w) {
+        const char *const name = w.nid ? import_name(w.nid) : nullptr;
+        return fmt::format("{} on {}", name ? name : fmt::format("{}", log_hex(w.nid)), log_hex(w.args[0]));
+    };
+
+    for (const HeldWait &w : now) {
+        const HeldWait *const then = find(before, w.thread);
+        if (!then)
+            return fmt::format("caught a thread between waits: {} \"{}\" is in {} now and was not two frames ago",
+                w.thread, name_of(w.thread), wait_text(w));
+        if (!(*then == w))
+            return fmt::format("caught a thread between waits: {} \"{}\" is in {} now and was in {} two frames ago",
+                w.thread, name_of(w.thread), wait_text(w), wait_text(*then));
+    }
+    for (const HeldWait &w : before) {
+        if (!find(now, w.thread))
+            return fmt::format("caught a thread between waits: {} \"{}\" was in {} two frames ago and is not now",
+                w.thread, name_of(w.thread), wait_text(w));
+    }
+    return "caught a thread between waits";
+}
+
+Result save(EmuEnvState &emuenv, const fs::path &path, const WaitSignature *expected) {
     if (emuenv.io.title_id.empty())
         return Result::fail("no application is running");
+
+    // --- is the guest held the way it was a moment ago? -----------------------------------------
+    // A load has to find every thread in exactly the wait the state recorded, and it looks at the
+    // same point in the frame the save did. That only works if the save recorded the waits the
+    // guest normally sits in at that point. Most threads do sit in the same one frame after frame,
+    // but some pass through a wait now and then -- "EducationPoint" normally loops on a 10 ms delay
+    // and is occasionally caught on semaphore 0x16F -- and a state saved at such a moment asks every
+    // later load for a wait that load will almost never see. Measured: all eight attempts of a load
+    // refused with "thread 369 "EducationPoint" is in a different call".
+    //
+    // So a quicksave samples the waits, lets the guest run a couple of frames, and saves only if it
+    // finds them the same. A thread passing through is very unlikely to be caught twice. Checked
+    // first, before the expensive part, and retryable: the next frame is usually steady again. A
+    // refusal writes nothing, so the last good quicksave stays in the slot.
+    if (expected) {
+        const WaitSignature now = wait_signature(emuenv);
+        if (now != *expected)
+            return Result::retry(describe_wait_change(emuenv, *expected, now));
+    }
 
     // --- MEM: every live allocation, verbatim ---------------------------------------------
     std::vector<uint8_t> mem_raw;
@@ -311,7 +382,7 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
         const std::lock_guard<std::mutex> queue_lock(emuenv.gxm.display_queue.get_mutex());
         const size_t pending = emuenv.gxm.display_queue.size();
         if (pending > 0)
-            return Result::fail(fmt::format("a frame is still in flight ({} display queue entries)", pending));
+            return Result::retry(fmt::format("a frame is still in flight ({} display queue entries)", pending));
     }
 
     // --- WAIT: what each parked thread is blocked in ------------------------------------------
