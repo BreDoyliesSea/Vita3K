@@ -63,6 +63,11 @@ HostObjectLayout capture_layout(GxmState &gxm, const MemState &mem);
 // otherwise which one is not. Extra live objects are fine: the restored guest does not know them.
 std::string check_layout(GxmState &gxm, const MemState &mem, const HostObjectLayout &saved);
 
+// Whether the guest is between sceGxmBeginScene and sceGxmEndScene on its immediate context. The
+// renderer mirrors this once it has run everything submitted, so a savestate taken or loaded at
+// such a moment leaves the renderer recording a scene the restored guest knows nothing about.
+bool scene_in_progress(GxmState &gxm, const MemState &mem);
+
 // Color.
 SceGxmColorBaseFormat get_base_format(SceGxmColorFormat src);
 size_t bits_per_pixel(SceGxmColorBaseFormat base_format);

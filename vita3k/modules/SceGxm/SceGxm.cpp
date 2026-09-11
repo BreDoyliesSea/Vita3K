@@ -1537,6 +1537,13 @@ gxm::HostObjectLayout gxm::capture_layout(GxmState &gxm, const MemState &mem) {
     return layout;
 }
 
+bool gxm::scene_in_progress(GxmState &gxm, const MemState &mem) {
+    if (!gxm.immediate_context)
+        return false;
+    const SceGxmContext *const context = Ptr<const SceGxmContext>(gxm.immediate_context).get(mem);
+    return context && context->state.active;
+}
+
 std::string gxm::check_layout(GxmState &gxm, const MemState &mem, const HostObjectLayout &saved) {
     const HostObjectLayout live = capture_layout(gxm, mem);
     const auto check = [](const char *kind, const std::vector<Address> &saved_list, const std::vector<Address> &live_list) -> std::string {

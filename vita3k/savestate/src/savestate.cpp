@@ -347,6 +347,14 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
             return Result::retry(fmt::format("a frame is still in flight ({} display queue entries)", pending));
     }
 
+    // Nor in the middle of drawing a scene. The renderer mirrors the guest's scene state --
+    // everything the guest submitted has run by now (MainWindow::run_with_guest_quiesced drains it)
+    // -- and restoring a guest outside a scene into a renderer still recording one makes the next
+    // sceGxmBeginScene fail to start ("already recording") and the texture upload after it fault
+    // in the driver. Measured on Disgaea 4 and Project DIVA f, about 40 ms after a load.
+    if (gxm::scene_in_progress(emuenv.gxm, emuenv.mem))
+        return Result::retry("a scene is still being drawn");
+
     // --- WAIT: what each parked thread is blocked in ------------------------------------------
     // A thread in ThreadStatus::wait is inside a host C++ frame that no snapshot can describe.
     // Rather than try to rebuild that frame on load, record what the wait *is*, so the load can
@@ -842,6 +850,14 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
         if (pending > 0)
             return Result::retry(fmt::format("a frame is still in flight ({} display queue entries)", pending));
     }
+
+    // Nor in the middle of drawing a scene. The renderer mirrors the guest's scene state --
+    // everything the guest submitted has run by now (MainWindow::run_with_guest_quiesced drains it)
+    // -- and restoring a guest outside a scene into a renderer still recording one makes the next
+    // sceGxmBeginScene fail to start ("already recording") and the texture upload after it fault
+    // in the driver. Measured on Disgaea 4 and Project DIVA f, about 40 ms after a load.
+    if (gxm::scene_in_progress(emuenv.gxm, emuenv.mem))
+        return Result::retry("a scene is still being drawn");
 
     // --- which threads the load has to restart --------------------------------------------------
     // A thread parked in an HLE call is inside a host C++ frame that no snapshot describes. Rather

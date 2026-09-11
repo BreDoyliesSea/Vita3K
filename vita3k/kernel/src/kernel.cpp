@@ -271,7 +271,11 @@ bool KernelState::wait_for_threads_paused(std::chrono::milliseconds timeout, std
                 // A thread that is waiting or dormant runs no guest code, and the pause holds it
                 // at its gate before it can run any again.
                 if (thread->running_unheld()) {
-                    still_running = fmt::format("{} \"{}\"", id, thread->name);
+                    // Say which HLE call it is in, if any: a thread that will not stop is usually
+                    // one blocked in a call that does not report its wait.
+                    const uint32_t nid = thread->current_import_nid.load(std::memory_order_relaxed);
+                    still_running = nid ? fmt::format("{} \"{}\" (in import {:#010x})", id, thread->name, nid)
+                                        : fmt::format("{} \"{}\"", id, thread->name);
                     break;
                 }
             }

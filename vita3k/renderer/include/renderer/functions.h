@@ -43,6 +43,10 @@ void create(SceGxmSyncObject *sync, State &state);
 void destroy(SceGxmSyncObject *sync, State &state);
 void finish(State &state, Context *context);
 
+// Savestate support: wait up to timeout_ms for every GPU result already submitted to be written
+// back into guest memory (notifications, sync objects, buffer syncs). False on a timeout.
+bool wait_gpu_idle(State &state, int timeout_ms);
+
 enum class SyncWaitResult {
     Ready,
     TimedOut,
