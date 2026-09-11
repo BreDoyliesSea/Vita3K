@@ -46,6 +46,8 @@
 #include <util/log.h>
 
 #include <util/tracy.h>
+#include <algorithm>
+#include <tuple>
 TRACY_MODULE_NAME(SceGxm);
 
 template <>
@@ -1495,6 +1497,69 @@ void gxm::collect_host_owned_ranges(GxmState &gxm, const MemState &mem,
             }
         }
     }
+}
+
+gxm::HostObjectLayout gxm::capture_layout(GxmState &gxm, const MemState &mem) {
+    HostObjectLayout layout;
+    if (gxm.immediate_context)
+        layout.contexts.push_back(gxm.immediate_context);
+    for (const auto &[_, address] : gxm.deferred_contexts)
+        layout.contexts.push_back(address);
+    for (const auto &[_, address] : gxm.render_targets)
+        layout.render_targets.push_back(address);
+    {
+        const std::lock_guard<std::mutex> lock(gxm.sync_objects_mutex);
+        for (SceGxmSyncObject *sync_object : gxm.sync_objects) {
+            if (sync_object)
+                layout.sync_objects.push_back(Ptr<SceGxmSyncObject>(sync_object, mem).address());
+        }
+    }
+    {
+        const std::lock_guard<std::mutex> lock(gxm.shader_patcher_mutex);
+        for (const Address address : gxm.shader_patchers) {
+            layout.shader_patchers.push_back(address);
+            const SceGxmShaderPatcher *patcher = Ptr<SceGxmShaderPatcher>(address).get(mem);
+            if (!patcher)
+                continue;
+            for (const auto &[_, program] : patcher->vertex_program_cache) {
+                if (program)
+                    layout.vertex_programs.push_back(program.address());
+            }
+            for (const auto &[_, program] : patcher->fragment_program_cache) {
+                if (program)
+                    layout.fragment_programs.push_back(program.address());
+            }
+        }
+    }
+    for (auto *list : { &layout.contexts, &layout.render_targets, &layout.sync_objects, &layout.shader_patchers,
+             &layout.vertex_programs, &layout.fragment_programs })
+        std::sort(list->begin(), list->end());
+    return layout;
+}
+
+std::string gxm::check_layout(GxmState &gxm, const MemState &mem, const HostObjectLayout &saved) {
+    const HostObjectLayout live = capture_layout(gxm, mem);
+    const auto check = [](const char *kind, const std::vector<Address> &saved_list, const std::vector<Address> &live_list) -> std::string {
+        for (const Address address : saved_list) {
+            if (!std::binary_search(live_list.begin(), live_list.end(), address)) {
+                return fmt::format("the state has a {} at {}, and this session has none there ({} {}(s) here, first at {})",
+                    kind, log_hex(address), live_list.size(), kind, live_list.empty() ? std::string("-") : log_hex(live_list.front()));
+            }
+        }
+        return {};
+    };
+    for (const auto &[kind, saved_list, live_list] : {
+             std::tuple{ "context", &saved.contexts, &live.contexts },
+             std::tuple{ "render target", &saved.render_targets, &live.render_targets },
+             std::tuple{ "sync object", &saved.sync_objects, &live.sync_objects },
+             std::tuple{ "shader patcher", &saved.shader_patchers, &live.shader_patchers },
+             std::tuple{ "vertex program", &saved.vertex_programs, &live.vertex_programs },
+             std::tuple{ "fragment program", &saved.fragment_programs, &live.fragment_programs } }) {
+        std::string why = check(kind, *saved_list, *live_list);
+        if (!why.empty())
+            return why;
+    }
+    return {};
 }
 
 // clang-format off
