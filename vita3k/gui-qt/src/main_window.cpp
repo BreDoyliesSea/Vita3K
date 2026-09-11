@@ -1346,6 +1346,21 @@ void MainWindow::on_pause_triggered() {
     refresh_emulation_actions();
 }
 
+// Let the renderer finish what it already has before a save or load. With the guest stopped nothing
+// new arrives. A batch left in the queue would run after a load against guest memory the load has
+// rewritten -- measured as a crash in the texture upload path on Disgaea 4's second load -- and
+// run_with_guest_quiesced refuses, retryably, if any are still there. And the GPU has to finish too:
+// the thread that waits for it writes notification values, sync timestamps and buffer syncs into
+// guest memory as work completes, and nothing stops it for a load. A write landing after the
+// restore overwrote the restored guest's GPU notification counter, measured as Gravity Rush falling
+// to 2 fps for good after a load. False if the GPU did not finish in time.
+static bool drain_renderer(renderer::State &renderer) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+    while (renderer.command_buffer_queue.size() > 0 && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    return renderer::wait_gpu_idle(renderer, 500);
+}
+
 // Quicksave and quickload both need the guest fully stopped. pause_threads() parks every
 // guest thread outside the JIT, which is exactly the quiescence a consistent snapshot needs.
 // A dedicated pause reason keeps this independent of the user's own pause, so taking a state
@@ -1370,10 +1385,16 @@ bool MainWindow::run_with_guest_quiesced(const char *what, const std::function<s
     std::unique_lock<std::shared_timed_mutex> guest_memory;
     if (!emuenv.kernel.wait_for_threads_paused(std::chrono::milliseconds(2000), &blocker)) {
         result = savestate::Result::fail(fmt::format("thread {} would not stop", blocker));
+    } else if (!drain_renderer(*emuenv.renderer)) {
+        result = savestate::Result::retry("the GPU still has work in flight");
     } else if (!(render_parked = emuenv.renderer->park_render_thread(std::chrono::milliseconds(2000)))) {
         // Stopping the guest is not enough: the render thread is ours, not the guest's, and it
         // reads guest memory continuously. Refuse rather than rewrite the heap under it.
         result = savestate::Result::fail("the render thread would not stop");
+    } else if (const size_t batches = emuenv.renderer->command_buffer_queue.size(); batches > 0) {
+        // Work built against guest memory as it is now. A state saved with it in flight expects
+        // the renderer to finish it; a load would have it run against rewritten memory.
+        result = savestate::Result::retry(fmt::format("the renderer still has {} batch(es) queued", batches));
     } else if (!(guest_memory = std::unique_lock<std::shared_timed_mutex>(
                      emuenv.mem.savestate_lock, std::chrono::milliseconds(2000)))
                     .owns_lock()) {
@@ -1520,17 +1541,35 @@ void MainWindow::on_thread_dump_requested() {
 // gap. It is notified on every pop, so this wakes inside a window that can be well under a
 // millisecond -- the window 1 ms polling kept missing. savestate::save re-checks under the pause,
 // because the guest can push the next frame between this returning and the guest being quiesced.
-bool wait_for_display_queue_gap(GxmState &gxm, int timeout_ms) {
+bool wait_for_display_queue_gap(EmuEnvState &emuenv, int timeout_ms) {
+    GxmState &gxm = emuenv.gxm;
     const auto started = std::chrono::steady_clock::now();
     const bool empty = gxm.display_queue.wait_empty_for(std::chrono::milliseconds(timeout_ms));
     const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - started);
 
-    if (empty)
+    if (empty) {
         LOG_INFO("Savestate: caught the display queue empty after {} ms", waited.count());
-    else
-        LOG_WARN("Savestate: display queue did not empty within {} ms", timeout_ms);
-    return empty;
+        return true;
+    }
+
+    LOG_WARN("Savestate: display queue did not empty within {} ms", timeout_ms);
+    // A queue that never empties is a display callback that never finishes. Say where the thread
+    // running it is, so the log answers what it is stuck on.
+    if (const ThreadStatePtr thread = emuenv.kernel.get_thread(gxm.display_queue_thread)) {
+        const char *status = "?";
+        switch (thread->status) {
+        case ThreadStatus::run: status = "running"; break;
+        case ThreadStatus::dormant: status = "dormant"; break;
+        case ThreadStatus::suspend: status = "suspended"; break;
+        case ThreadStatus::wait: status = "waiting"; break;
+        }
+        const uint32_t nid = thread->current_import_nid.load(std::memory_order_relaxed);
+        const char *const call = nid ? import_name(nid) : nullptr;
+        LOG_WARN("Savestate: display queue thread {} \"{}\" is {} at pc {} in {}", thread->id, thread->name, status,
+            log_hex(read_pc(*thread->cpu)), call ? call : (nid ? "an unnamed import" : "guest code"));
+    }
+    return false;
 }
 
 void MainWindow::on_quicksave_triggered() {
@@ -1551,7 +1590,7 @@ void MainWindow::on_quicksave_triggered() {
     int attempts = 0;
     for (int attempt = 1; attempt <= max_attempts; attempt++) {
         attempts = attempt;
-        if (!wait_for_display_queue_gap(emuenv.gxm, 10000)) {
+        if (!wait_for_display_queue_gap(emuenv, 10000)) {
             statusBar()->showMessage(tr("Quicksave: a frame is still in flight, try again"), 6000);
             return;
         }
@@ -1590,15 +1629,23 @@ void MainWindow::on_quickload_triggered() {
     // callback -- and a thread in a call the load cannot interrupt. Those pass within a frame or
     // two, and a refused load has changed nothing, so trying again costs only the wait for the
     // next boundary. The last refusal is what gets reported.
+    //
+    // 60 attempts, as for quicksave: Gravity Rush keeps a frame queued nearly all the time, and
+    // every one of its loads gave up after 8 on "a frame is still in flight" while its saves,
+    // allowed 60, got through.
+    constexpr int max_attempts = 60;
     savestate::Result last = savestate::Result::fail("did not run");
     int attempts = 0;
-    for (int attempt = 1; attempt <= 8; attempt++) {
+    for (int attempt = 1; attempt <= max_attempts; attempt++) {
         attempts = attempt;
-        if (!wait_for_display_queue_gap(emuenv.gxm, 10000)) {
+        if (!wait_for_display_queue_gap(emuenv, 10000)) {
             statusBar()->showMessage(tr("Quickload: could not catch a frame boundary, try again"), 6000);
             return;
         }
 
+        // Stays this if the guest could not be quiesced -- a thread would not stop, or the renderer
+        // still had work queued -- and the load never ran. Both pass within a frame or two.
+        last = savestate::Result::retry("the guest could not be stopped with nothing in flight");
         bool succeeded = false;
         run_with_guest_quiesced("Quickload", [&] {
             last = savestate::load(emuenv, savestate::slot_path(emuenv, 0));
@@ -1614,7 +1661,7 @@ void MainWindow::on_quickload_triggered() {
             break;
         }
 
-        LOG_INFO("Savestate: quickload attempt {}/8 refused ({})", attempt, last.reason);
+        LOG_INFO("Savestate: quickload attempt {}/{} refused ({})", attempt, max_attempts, last.reason);
 
         // Let the guest actually run before asking again. Retrying is only worth anything because
         // the threads drift back into their idle waits a frame or two later; with the display queue

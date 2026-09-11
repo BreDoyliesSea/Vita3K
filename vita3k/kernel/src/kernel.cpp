@@ -235,15 +235,14 @@ void KernelState::process_exit() {
 void KernelState::pause_threads() {
     const std::lock_guard<std::mutex> lock(mutex);
     for (auto &[_, thread] : threads) {
-        paused_threads_status[thread->id] = thread->status;
-        if (thread->status == ThreadStatus::running)
-            thread->suspend();
-        else if (thread->status == ThreadStatus::wait)
-            // suspend() only stops a thread that is running guest code. One waiting in an HLE call
-            // would otherwise go straight back to guest code the moment its wait ended -- a 10 ms
-            // delay runs out during every save and load -- and run while guest memory is being
-            // copied or rewritten. Have it park on the way out instead.
-            thread->suspend_on_return();
+        // One reading of the status, taken under the thread's lock, both recorded and acted on.
+        // Reading it twice let a thread started in between -- SceGxmDisplayQueue, which the display
+        // queue's host thread starts with start() at any moment -- be stopped while recorded as
+        // dormant, and resume_threads never resumed it: Gravity Rush's display queue wedged for
+        // good after two quickload attempts. A waiting thread is stopped too, on its way out of its
+        // call; otherwise a 10 ms delay running out mid-save sent it back into guest code while
+        // guest memory was being copied or rewritten.
+        paused_threads_status[thread->id] = thread->request_pause();
     }
 }
 
@@ -267,7 +266,11 @@ bool KernelState::wait_for_threads_paused(std::chrono::milliseconds timeout, std
                 if (recorded == paused_threads_status.end() || recorded->second != ThreadStatus::run)
                     continue;
                 if (thread->status == ThreadStatus::run) {
-                    still_running = fmt::format("{} \"{}\"", id, thread->name);
+                    // Say which HLE call it is in, if any: a thread that will not stop is usually
+                    // one blocked in a call that does not report its wait.
+                    const uint32_t nid = thread->current_import_nid.load(std::memory_order_relaxed);
+                    still_running = nid ? fmt::format("{} \"{}\" (in import {:#010x})", id, thread->name, nid)
+                                        : fmt::format("{} \"{}\"", id, thread->name);
                     break;
                 }
             }
