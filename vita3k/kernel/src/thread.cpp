@@ -281,6 +281,7 @@ void ThreadState::run_loop() {
             if (context_on_return) {
                 const CPUContext ctx = *context_on_return;
                 context_on_return.reset();
+                abandon_wait.store(false, std::memory_order_release);
                 lock.unlock();
                 held_for_load.store(true, std::memory_order_release);
                 {
@@ -612,7 +613,23 @@ bool ThreadState::continue_from_on_return(uint32_t nid, const CPUContext &ctx) {
     if (status != ThreadStatus::wait || current_import_nid.load(std::memory_order_relaxed) != nid)
         return false;
     context_on_return = ctx;
+    abandon_wait.store(true, std::memory_order_release);
     return true;
+}
+
+void ThreadState::enter_wait(WaitRelease how) {
+    const std::lock_guard<std::mutex> lock(wait_release_mutex);
+    wait_release = std::move(how);
+}
+
+void ThreadState::leave_wait() {
+    const std::lock_guard<std::mutex> lock(wait_release_mutex);
+    wait_release.reset();
+}
+
+std::optional<ThreadState::WaitRelease> ThreadState::current_wait() const {
+    const std::lock_guard<std::mutex> lock(wait_release_mutex);
+    return wait_release;
 }
 
 std::string ThreadState::log_stack_traceback() const {
