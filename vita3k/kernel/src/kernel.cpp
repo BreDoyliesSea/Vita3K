@@ -238,6 +238,12 @@ void KernelState::pause_threads() {
         paused_threads_status[thread->id] = thread->status;
         if (thread->status == ThreadStatus::running)
             thread->suspend();
+        else if (thread->status == ThreadStatus::wait)
+            // suspend() only stops a thread that is running guest code. One waiting in an HLE call
+            // would otherwise go straight back to guest code the moment its wait ended -- a 10 ms
+            // delay runs out during every save and load -- and run while guest memory is being
+            // copied or rewritten. Have it park on the way out instead.
+            thread->suspend_on_return();
     }
 }
 
@@ -282,9 +288,17 @@ bool KernelState::wait_for_threads_paused(std::chrono::milliseconds timeout, std
 
 void KernelState::resume_threads() {
     const std::lock_guard<std::mutex> lock(mutex);
-    for (auto &[_, thread] : threads) {
-        if (paused_threads_status[thread->id] == ThreadStatus::running)
-            thread->resume();
+    for (auto &[id, thread] : threads) {
+        // Only threads this pause stopped. Looking them up with operator[] defaulted a thread
+        // created during the pause to ThreadStatus::running -- enumerator 0 -- and started it.
+        const auto recorded = paused_threads_status.find(id);
+        if (recorded == paused_threads_status.end())
+            continue;
+        // A thread that was running may have gone into a wait on its way to stopping, and one that
+        // was waiting may have come out and parked. Resume whichever has parked, and leave the
+        // ones still waiting where they are rather than waking them out of it.
+        if (recorded->second == ThreadStatus::running || recorded->second == ThreadStatus::waiting)
+            thread->resume_after_pause();
     }
     paused_threads_status.clear();
 }
