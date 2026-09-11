@@ -1574,13 +1574,13 @@ EXPORT(int, sceKernelRegisterCallbackToEvent) {
 
 EXPORT(int, sceKernelResumeThreadForVM, SceUID threadId) {
     TRACY_FUNC(sceKernelResumeThreadForVM, threadId);
-    STUBBED("STUB");
 
     const ThreadStatePtr thread = emuenv.kernel.get_thread(threadId);
     if (!thread)
         return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_THREAD_ID);
 
-    thread->resume();
+    if (!thread->resume_for_vm())
+        LOG_WARN("sceKernelResumeThreadForVM: thread {} \"{}\" was not suspended", threadId, thread->name);
 
     return 0;
 }
@@ -1671,13 +1671,15 @@ EXPORT(int, sceKernelStopTimer, SceUID timer_handle) {
 
 EXPORT(int, sceKernelSuspendThreadForVM, SceUID threadId) {
     TRACY_FUNC(sceKernelSuspendThreadForVM, threadId);
-    STUBBED("STUB");
 
     const ThreadStatePtr thread = emuenv.kernel.get_thread(threadId);
     if (!thread)
         return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_THREAD_ID);
 
-    thread->suspend();
+    // Mono's garbage collector reads the thread's registers next, and scans its stack, so it has
+    // to have actually stopped rather than merely been asked to.
+    if (!thread->suspend_for_vm(1000))
+        LOG_WARN("sceKernelSuspendThreadForVM: thread {} \"{}\" was still running guest code after 1 s", threadId, thread->name);
 
     return 0;
 }

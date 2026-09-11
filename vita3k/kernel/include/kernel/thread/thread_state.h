@@ -24,6 +24,7 @@
 #include <mem/block.h>
 #include <mem/ptr.h>
 
+#include <atomic>
 #include <condition_variable>
 #include <list>
 #include <mutex>
@@ -115,6 +116,15 @@ struct ThreadState {
     // Adds a callback this thread created. Called by the thread itself.
     void add_callback(const CallbackPtr &cb);
 
+    // sceKernelSuspendThreadForVM / ResumeThreadForVM, with which Mono's garbage collector stops the
+    // other threads, reads their registers and lets them go. Unlike suspend(), suspend_for_vm()
+    // returns only once the thread has stopped running guest code (false if it had not within
+    // timeout_ms), and the calls nest: resume_for_vm() undoes exactly one of them, even one still
+    // taking effect, and never ends a suspend that came from anywhere else. Returns false if the
+    // thread was not suspended.
+    bool suspend_for_vm(int timeout_ms);
+    bool resume_for_vm();
+
     void suspend();
     void resume(bool step = false);
     std::string log_stack_traceback() const;
@@ -146,6 +156,13 @@ private:
     bool run_start_callback = false;
     // when calling sceKernelExitThread or sceKernelExitDeleteThread
     bool run_end_callback = false;
+
+    // Outstanding suspend_for_vm() calls; while any are, run_loop parks rather than run guest code.
+    int vm_suspend_count = 0;
+    // Whether the current park is for the VM alone, and so ended by the last resume_for_vm().
+    bool parked_for_vm = false;
+    // True only while run() or step() is executing guest code.
+    std::atomic<bool> in_guest_code{ false };
 
     MemState &mem;
 

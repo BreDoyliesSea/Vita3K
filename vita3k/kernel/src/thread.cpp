@@ -25,6 +25,7 @@
 #include <util/log.h>
 
 #include <cassert>
+#include <chrono>
 #include <cstring>
 #include <memory>
 #include <sstream>
@@ -237,14 +238,24 @@ void ThreadState::run_loop() {
 
         // Active JIT loop. Lock held on entry and exit; unlocked only around run/step.
         while (!delete_requested && !exit_requested && !guest_returned && status == ThreadStatus::running) {
+            // Held by suspend_for_vm(). Checked before running anything, so that neither a thread
+            // started while held nor one that something else resumed gets to run guest code.
+            if (vm_suspend_count > 0) {
+                parked_for_vm = true;
+                update_status(ThreadStatus::suspended);
+                continue;
+            }
+
             const bool do_step = single_stepping;
             if (do_step)
                 single_stepping = false;
 
+            in_guest_code = true;
             lock.unlock();
 
             // Single step or run
             const int res = do_step ? step(*cpu) : run(*cpu);
+            in_guest_code = false;
 
             // handle svc call if this was what stopped the cpu
             if (cpu->svc_called) {
@@ -263,6 +274,12 @@ void ThreadState::run_loop() {
                 suspend_requested = false;
                 update_status(ThreadStatus::suspended);
             }
+
+            // Held by suspend_for_vm(). A stop that something else asked for as well is not
+            // resume_for_vm()'s to end.
+            parked_for_vm = status == ThreadStatus::running && vm_suspend_count > 0;
+            if (parked_for_vm)
+                update_status(ThreadStatus::suspended);
 
             // Guest function for this run_loop returned (or errored).
             if (res != 0) {
@@ -534,6 +551,35 @@ void ThreadState::add_callback(const CallbackPtr &cb) {
 
 Address ThreadState::stack_top() const {
     return stack.get() + stack_size;
+}
+
+bool ThreadState::suspend_for_vm(int timeout_ms) {
+    std::unique_lock<std::mutex> lock(mutex);
+    ++vm_suspend_count;
+    if (status == ThreadStatus::running)
+        stop(*cpu);
+
+    // Waiting in an HLE call or parked, the thread runs no guest code until run_loop has seen the
+    // count; running guest code, it stops at the end of the current block. Leaving guest code for
+    // an HLE call notifies no one, so poll as well as wait.
+    const auto stopped = [&] { return status != ThreadStatus::running || !in_guest_code; };
+    for (int waited_ms = 0; !stopped(); ++waited_ms) {
+        if (waited_ms >= timeout_ms)
+            return false;
+        status_cond.wait_for(lock, std::chrono::milliseconds(1));
+    }
+    return true;
+}
+
+bool ThreadState::resume_for_vm() {
+    const std::lock_guard<std::mutex> lock(mutex);
+    if (vm_suspend_count == 0)
+        return false;
+    if (--vm_suspend_count == 0 && status == ThreadStatus::suspended && parked_for_vm) {
+        parked_for_vm = false;
+        update_status(ThreadStatus::running);
+    }
+    return true;
 }
 
 void ThreadState::suspend() {
