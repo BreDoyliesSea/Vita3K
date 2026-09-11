@@ -71,13 +71,13 @@ struct ThreadState {
 
     // NID of the HLE import this thread is currently executing, 0 when it is running guest code,
     // and the ABI argument registers it was called with. Maintained by call_import(). A thread in
-    // ThreadStatus::wait is parked inside one of these, in a host C++ frame that no snapshot of
+    // ThreadStatus::waiting is parked inside one of these, in a host C++ frame that no snapshot of
     // guest memory can describe, so together these are what a restore would need in order to
     // re-enter the call rather than reconstruct the frame.
     //
     // The NID is atomic because a savestate reads it from another thread that may still be
     // running. The arguments are plain: they are only ever read for a thread already parked in
-    // ThreadStatus::wait, which by definition is not writing them.
+    // ThreadStatus::waiting, which by definition is not writing them.
     std::atomic<uint32_t> current_import_nid{ 0 };
     uint32_t current_import_args[4]{};
 
@@ -127,6 +127,15 @@ struct ThreadState {
     void notify_callbacks();
     // Adds a callback this thread created. Called by the thread itself.
     void add_callback(const CallbackPtr &cb);
+
+    // sceKernelSuspendThreadForVM / ResumeThreadForVM, with which Mono's garbage collector stops the
+    // other threads, reads their registers and lets them go. Unlike suspend(), suspend_for_vm()
+    // returns only once the thread has stopped running guest code (false if it had not within
+    // timeout_ms), and the calls nest: resume_for_vm() undoes exactly one of them, even one still
+    // taking effect, and never ends a suspend that came from anywhere else. Returns false if the
+    // thread was not suspended.
+    bool suspend_for_vm(int timeout_ms);
+    bool resume_for_vm();
 
     void suspend();
     void resume(bool step = false);
@@ -217,6 +226,13 @@ private:
     bool run_start_callback = false;
     // when calling sceKernelExitThread or sceKernelExitDeleteThread
     bool run_end_callback = false;
+
+    // Outstanding suspend_for_vm() calls; while any are, run_loop parks rather than run guest code.
+    int vm_suspend_count = 0;
+    // Whether the current park is for the VM alone, and so ended by the last resume_for_vm().
+    bool parked_for_vm = false;
+    // True only while run() or step() is executing guest code.
+    std::atomic<bool> in_guest_code{ false };
 
     MemState &mem;
 
