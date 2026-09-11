@@ -60,21 +60,6 @@ struct Result {
 // <pref-path>/savestates/<TITLEID>/slot<N>.vst
 fs::path slot_path(const EmuEnvState &emuenv, int slot);
 
-// One guest thread parked in a wait that only another thread can end -- the waits a load has to
-// find again exactly as recorded. Waits that end on their own (a delay, an audio buffer) are left
-// out, as the load leaves them out.
-struct HeldWait {
-    int32_t thread; // SceUID
-    uint32_t nid;
-    uint32_t args[3];
-
-    bool operator==(const HeldWait &) const = default;
-};
-using WaitSignature = std::vector<HeldWait>; // sorted by thread
-
-// Which threads are held in such a wait right now. Safe to call while the guest runs.
-WaitSignature wait_signature(EmuEnvState &emuenv);
-
 // Both expect the guest to already be quiesced by the caller (see AppSessionPauseReason) and
 // MemState::savestate_lock to be held exclusively. Neither pauses or resumes on its own. load()
 // relies on the lock beyond its own return: the threads it takes out of their calls wait on it

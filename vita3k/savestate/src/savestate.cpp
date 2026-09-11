@@ -71,28 +71,9 @@ constexpr uint32_t TAG_NGSL = 0x4C53474EU;
 constexpr uint32_t TAG_GXML = 0x4C4D5847U;
 // "THRD" - each thread's status and callback depth. A load needs it to restart waits.
 constexpr uint32_t TAG_THRD = 0x44524854U;
+// "SYN2" - rwlock owners, message pipe contents, timers. Optional, so older states still load.
+constexpr uint32_t TAG_SYN2 = 0x324E5953U;
 
-
-// NIDs the restore path understands. A parked thread can only be carried across a load if its
-// wait is one of these.
-constexpr uint32_t NID_sceKernelWaitSema = 0x0C7B834BU;
-constexpr uint32_t NID_sceKernelDelayThread = 0x4B675D05U;
-constexpr uint32_t NID_sceAudioOutOutput = 0x02DB3F5FU;
-
-// Waits that finish on their own in bounded real time whatever the guest does: a fixed delay, and
-// an audio buffer the device drains. They need no matching across a load -- whichever one such a
-// thread happens to be in, it will fall out of it shortly and rejoin the guest's own loop.
-// A semaphore wait is different: it ends only when another thread signals, so a thread sitting in
-// one is part of the state and has to still be sitting in the same one.
-bool is_self_completing_wait(uint32_t nid) {
-    return nid == NID_sceKernelDelayThread || nid == NID_sceAudioOutOutput;
-}
-
-// Waits a load can restart: ones it can put a thread back at the start of, so that it makes the
-// same call again.
-bool is_restartable_wait(uint32_t nid) {
-    return nid == NID_sceKernelWaitSema || is_self_completing_wait(nid);
-}
 
 // Point a context saved inside an HLE call back at the call itself, so the thread makes it again
 // when it resumes. Import stubs are ARM -- `svc #0`, `mov pc, lr`, then the NID -- and a thread
@@ -202,56 +183,30 @@ fs::path slot_path(const EmuEnvState &emuenv, const int slot) {
     return emuenv.vita_fs_path / "savestates" / emuenv.io.title_id / fmt::format("slot{}.vst", slot);
 }
 
-WaitSignature wait_signature(EmuEnvState &emuenv) {
-    // With the guest running this reads `status` under the kernel lock without the thread's own
-    // lock, as KernelState::wait_for_threads_paused does, and the arguments only for a thread that
-    // is already parked and so not writing them. A stale read costs one refused save, not a bad
-    // one: save() takes its own reading with the guest quiesced and that is what gets compared.
-    WaitSignature out;
-    const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
-    for (const auto &[uid, thread] : emuenv.kernel.threads) {
-        if (!thread || thread->status != ThreadStatus::wait)
-            continue;
-        const uint32_t nid = thread->current_import_nid.load(std::memory_order_relaxed);
-        if (is_self_completing_wait(nid))
-            continue;
-        out.push_back({ uid, nid, { thread->current_import_args[0], thread->current_import_args[1], thread->current_import_args[2] } });
-    }
-    std::sort(out.begin(), out.end(), [](const HeldWait &a, const HeldWait &b) { return a.thread < b.thread; });
-    return out;
-}
-
 Result save(EmuEnvState &emuenv, const fs::path &path) {
     if (emuenv.io.title_id.empty())
         return Result::fail("no application is running");
 
-    const WaitSignature now = wait_signature(emuenv);
-
     // --- is every thread one a load can restart? ------------------------------------------------
-    // A load puts each thread the state has parked back at its call (see "restart" in load()), and
-    // can do that for a semaphore wait, a delay or an audio write. A state with a thread held in
-    // anything else -- an event flag, a mutex, a vblank wait -- or waiting inside a callback, where
-    // the host frames around the call are gone, would be refused by every load, so do not write
-    // one. Retryable, because such moments pass: the GXM display queue thread is in
-    // sceDisplayWaitVblankStart at some frame gaps and not others.
-    for (const HeldWait &w : now) {
-        if (w.nid == NID_sceKernelWaitSema)
-            continue;
-        std::string thread_name = "?";
-        {
-            const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
-            const auto it = emuenv.kernel.threads.find(w.thread);
-            if (it != emuenv.kernel.threads.end() && it->second)
-                thread_name = it->second->name;
-        }
-        const char *const call = w.nid ? import_name(w.nid) : nullptr;
-        return Result::retry(fmt::format("thread {} \"{}\" is parked in {}, which a load could not restart",
-            w.thread, thread_name, call ? call : fmt::format("{}", log_hex(w.nid))));
-    }
+    // A load puts each thread the state has parked back at the start of its call (see "restart" in
+    // load()). That is only the same as leaving it parked if the call says so -- every blocking
+    // call registers how it is released and whether it can be made again (ThreadState::
+    // WaitRelease) -- and only at a thread's top level: inside a callback, the host frames around
+    // the call are gone. A state with a thread anywhere else would be refused by every load, so do
+    // not write one. Retryable, because such moments pass.
     {
         const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
         for (const auto &[uid, thread] : emuenv.kernel.threads) {
-            if (thread && thread->status == ThreadStatus::wait && thread->nesting_level() > 1)
+            if (!thread || thread->status != ThreadStatus::wait)
+                continue;
+            const std::optional<ThreadState::WaitRelease> wait = thread->current_wait();
+            if (!wait || !wait->restartable) {
+                const uint32_t nid = thread->current_import_nid.load(std::memory_order_relaxed);
+                const char *const call = nid ? import_name(nid) : nullptr;
+                return Result::retry(fmt::format("thread {} \"{}\" is parked in {}, which a load could not restart",
+                    uid, thread->name, call ? call : fmt::format("{}", log_hex(nid))));
+            }
+            if (thread->nesting_level() > 1)
                 return Result::retry(fmt::format("thread {} \"{}\" is waiting inside a callback, where a load could not restart it",
                     uid, thread->name));
         }
@@ -313,9 +268,8 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
         // A thread in ThreadStatus::wait is blocked inside a host C++ frame in one of the
         // sync primitive helpers, and WaitingThreadData holds raw pointers into that frame's
         // locals (was_canceled, outBits, result_pattern...). None of that lives in guest
-        // memory or registers, so those threads cannot be restored by any snapshot of the
-        // guest. Report how many there are: it decides whether restricting save points to
-        // "nothing is blocked" is even achievable.
+        // memory or registers, so a load does not restore it: it makes the call again (see
+        // "restart" in load()). Report how many there are.
         int running = 0, dormant = 0, waiting = 0, suspended = 0;
         for (const auto &pair : emuenv.kernel.threads) {
             if (!pair.second)
@@ -329,9 +283,8 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
         }
         LOG_INFO("Savestate: thread status at snapshot - run {}, dormant {}, wait {}, suspend {}",
             running, dormant, waiting, suspended);
-        LOG_WARN_IF(waiting > 0,
-            "Savestate: {} thread(s) are blocked inside an HLE call; their wait state cannot be captured "
-            "and they will resume as if the wait had returned",
+        LOG_INFO_IF(waiting > 0,
+            "Savestate: {} thread(s) are parked inside an HLE call; a load puts each back at the start of it",
             waiting);
 
         // Which calls, specifically. Restoring a blocked thread means re-entering the import it
@@ -477,6 +430,57 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
         };
         put_mutexes(emuenv.kernel.mutexes);
         put_mutexes(emuenv.kernel.lwmutexes);
+    }
+
+    // --- SYN2: the rest of the sync primitives ---------------------------------------------------
+    // What SYNC leaves out: which threads hold each rwlock, what is sitting in each message pipe,
+    // and where each timer is. Condition variables have nothing but their queue, which a load
+    // rebuilds by restarting the waits. Timer deadlines are kept on a host clock that means nothing
+    // to another session, so they are stored relative to now.
+    std::vector<uint8_t> syn2_raw;
+    {
+        const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
+
+        put<uint32_t>(syn2_raw, static_cast<uint32_t>(emuenv.kernel.rwlocks.size()));
+        for (const auto &[uid, rwlock] : emuenv.kernel.rwlocks) {
+            put(syn2_raw, uid);
+            put<uint32_t>(syn2_raw, rwlock ? static_cast<uint32_t>(rwlock->state) : 0);
+            put<uint32_t>(syn2_raw, rwlock ? static_cast<uint32_t>(rwlock->owners.size()) : 0);
+            if (rwlock) {
+                for (const auto &[owner, count] : rwlock->owners) {
+                    put<SceUID>(syn2_raw, owner ? owner->id : 0);
+                    put<int32_t>(syn2_raw, count);
+                }
+            }
+        }
+
+        put<uint32_t>(syn2_raw, static_cast<uint32_t>(emuenv.kernel.msgpipes.size()));
+        for (const auto &[uid, pipe] : emuenv.kernel.msgpipes) {
+            put(syn2_raw, uid);
+            std::vector<uint8_t> bytes;
+            if (pipe) {
+                bytes.resize(pipe->data_buffer.Used());
+                pipe->data_buffer.Peek(bytes.data(), bytes.size());
+            }
+            put<uint32_t>(syn2_raw, static_cast<uint32_t>(bytes.size()));
+            syn2_raw.insert(syn2_raw.end(), bytes.begin(), bytes.end());
+        }
+
+        const uint64_t now = sync_timer_clock();
+        const auto relative = [now](uint64_t when) {
+            return when == std::numeric_limits<uint64_t>::max() ? std::numeric_limits<int64_t>::max() : static_cast<int64_t>(when - now);
+        };
+        put<uint32_t>(syn2_raw, static_cast<uint32_t>(emuenv.kernel.timers.size()));
+        for (const auto &[uid, timer] : emuenv.kernel.timers) {
+            put(syn2_raw, uid);
+            const uint8_t flags = timer
+                ? static_cast<uint8_t>((timer->is_started ? 1 : 0) | (timer->is_repeat ? 2 : 0) | (timer->is_pulse ? 4 : 0) | (timer->event_set ? 8 : 0))
+                : 0;
+            put<uint8_t>(syn2_raw, flags);
+            put<uint64_t>(syn2_raw, timer ? timer->event_interval : 0);
+            put<int64_t>(syn2_raw, timer ? relative(timer->next_event) : 0);
+            put<int64_t>(syn2_raw, timer ? static_cast<int64_t>(timer->time - now) : 0);
+        }
     }
 
     // --- FILE: where each open read-only file is positioned -------------------------------------
@@ -651,6 +655,11 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
     put<uint64_t>(file, thrd_raw.size());
     file.insert(file.end(), thrd_raw.begin(), thrd_raw.end());
 
+    put(file, TAG_SYN2);
+    put<uint64_t>(file, syn2_raw.size());
+    put<uint64_t>(file, syn2_raw.size());
+    file.insert(file.end(), syn2_raw.begin(), syn2_raw.end());
+
     // Write to a temporary and rename into place, so an interrupted save cannot destroy the
     // previous good state.
     boost::system::error_code err;
@@ -745,6 +754,8 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
     size_t gxml_size = 0;
     const uint8_t *thrd_data = nullptr;
     size_t thrd_size = 0;
+    const uint8_t *syn2_data = nullptr;
+    size_t syn2_size = 0;
 
     while (r.need(sizeof(uint32_t) + sizeof(uint64_t) * 2)) {
         uint32_t tag = 0;
@@ -798,6 +809,10 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
         case TAG_THRD:
             thrd_data = payload;
             thrd_size = static_cast<size_t>(stored);
+            break;
+        case TAG_SYN2:
+            syn2_data = payload;
+            syn2_size = static_cast<size_t>(stored);
             break;
         default:
             LOG_WARN("Savestate: ignoring unknown chunk 0x{:08X}", tag);
@@ -897,7 +912,7 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
     struct Release {
         ThreadStatePtr thread;
         uint32_t nid;
-        SceUID semaphore; // for sceKernelWaitSema
+        std::function<void()> release; // empty: ends on its own
     };
     std::vector<Release> releases;
     uint32_t restarts = 0;
@@ -927,12 +942,10 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
             // The state's side: a thread parked in a call goes back to the start of it.
             const auto p = parked.find(id);
             if (p != parked.end()) {
-                const uint32_t nid = p->second.nid;
-                if (!is_restartable_wait(nid)) {
-                    const char *const name = nid ? import_name(nid) : nullptr;
-                    return Result::fail(fmt::format("thread {} was parked in {}, which a load cannot restart",
-                        id, name ? name : fmt::format("{}", log_hex(nid))));
-                }
+                // The save only writes a state whose parked threads are all in calls that can be made
+                // again (see the check at the top of save()).
+                if (p->second.nid == 0)
+                    return Result::fail(fmt::format("thread {} was parked outside any call", id));
                 if (saved->second.level != 1)
                     return Result::fail(fmt::format("thread {} was parked inside a callback, where a load cannot restart it", id));
                 const std::string why = rewind_to_call(emuenv.mem, ctx);
@@ -948,17 +961,10 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
                 const std::string call = name ? name : fmt::format("{}", log_hex(nid));
                 if (thread->nesting_level() != 1)
                     return Result::retry(fmt::format("thread {} \"{}\" is in {} inside a callback", id, thread->name, call));
-                if (nid == NID_sceKernelWaitSema) {
-                    const SceUID semaphore = static_cast<SceUID>(thread->current_import_args[0]);
-                    if (emuenv.kernel.semaphores.find(semaphore) == emuenv.kernel.semaphores.end())
-                        return Result::retry(fmt::format("thread {} \"{}\" is waiting on semaphore {}, which does not exist",
-                            id, thread->name, log_hex(semaphore)));
-                    releases.push_back({ thread, nid, semaphore });
-                } else if (is_self_completing_wait(nid)) {
-                    releases.push_back({ thread, nid, 0 });
-                } else {
+                const std::optional<ThreadState::WaitRelease> wait = thread->current_wait();
+                if (!wait)
                     return Result::retry(fmt::format("thread {} \"{}\" is in {}, which a load cannot interrupt", id, thread->name, call));
-                }
+                releases.push_back({ thread, nid, wait->release });
             }
 
             // For the log only: how many threads the all-or-nothing match this replaced would have
@@ -1107,10 +1113,10 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
     // --- restart: take every waiting thread out of its call ------------------------------------
     // Nothing from here on refuses, so this is the point of no return. Each thread waiting now is
     // armed to continue from the state's registers once its call returns
-    // (ThreadState::continue_from_on_return), and its call is then ended: a semaphore wait or a
-    // delay is woken here, and the thread parks on savestate_lock until this load lets go of it.
-    // A thread writing audio is blocked on that lock inside sceAudioOutOutput already. It cannot be
-    // woken and does not need to be: it reaches its armed registers by itself once the load ends.
+    // (ThreadState::continue_from_on_return), and its call is then ended through the release its
+    // wait registered (ThreadState::WaitRelease); the thread parks on savestate_lock until this load
+    // lets go of it. A wait with no release -- sceAudioOutOutput, blocked on that same lock --
+    // cannot be woken and does not need to be: it reaches its armed registers once the load ends.
     std::set<SceUID> armed;
     std::vector<ThreadStatePtr> left_on_their_own;
     for (const Release &r : releases) {
@@ -1122,14 +1128,9 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
             continue;
         }
         armed.insert(r.thread->id);
-        if (r.nid == NID_sceKernelWaitSema) {
-            // False only if something signalled it in the meantime, which ends the call anyway.
-            semaphore_release_for_savestate(emuenv.kernel, r.semaphore, r.thread);
-        } else if (r.nid == NID_sceKernelDelayThread) {
-            const std::lock_guard<std::mutex> thread_lock(r.thread->mutex);
-            if (r.thread->status == ThreadStatus::wait)
-                r.thread->update_status(ThreadStatus::run);
-        }
+        // Does nothing if something ended the wait in the meantime, which ends the call anyway.
+        if (r.release)
+            r.release();
     }
 
     // Let the woken ones get out of their calls before memory is touched: on the way out they still
@@ -1142,7 +1143,7 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
             LOG_ERROR("Savestate: thread {} \"{}\" did not get out of its call; restoring anyway", thread->id, thread->name);
     };
     for (const Release &r : releases) {
-        if (armed.contains(r.thread->id) && r.nid != NID_sceAudioOutOutput)
+        if (armed.contains(r.thread->id) && r.release)
             wait_until(r.thread, [&] { return r.thread->held_for_savestate(); });
     }
     for (const ThreadStatePtr &thread : left_on_their_own) {
@@ -1421,6 +1422,76 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
 
         if (!ok)
             return Result::fail("corrupt sync chunk");
+    }
+
+    // --- restore the rest of the sync primitives (SYN2) ------------------------------------------
+    // Past the point of no return, so a chunk that does not parse is reported, not refused.
+    if (syn2_data) {
+        Reader xr{ syn2_data, syn2_size, 0 };
+        const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
+        uint32_t count = 0;
+        bool ok = xr.get(count);
+        for (uint32_t i = 0; ok && i < count; i++) {
+            SceUID uid = 0;
+            uint32_t state = 0, owner_count = 0;
+            ok = xr.get(uid) && xr.get(state) && xr.get(owner_count);
+            RWLockOwners owners;
+            for (uint32_t j = 0; ok && j < owner_count; j++) {
+                SceUID owner = 0;
+                int32_t held = 0;
+                ok = xr.get(owner) && xr.get(held);
+                const auto t = emuenv.kernel.threads.find(owner);
+                if (ok && t != emuenv.kernel.threads.end() && t->second)
+                    owners.emplace(t->second, held);
+            }
+            const auto it = emuenv.kernel.rwlocks.find(uid);
+            if (ok && it != emuenv.kernel.rwlocks.end() && it->second) {
+                it->second->state = static_cast<RWLockState>(state);
+                it->second->owners = std::move(owners);
+            }
+        }
+
+        ok = ok && xr.get(count);
+        for (uint32_t i = 0; ok && i < count; i++) {
+            SceUID uid = 0;
+            uint32_t used = 0;
+            ok = xr.get(uid) && xr.get(used) && xr.need(used);
+            if (!ok)
+                break;
+            const uint8_t *const bytes = xr.data + xr.pos;
+            xr.pos += used;
+            const auto it = emuenv.kernel.msgpipes.find(uid);
+            if (it != emuenv.kernel.msgpipes.end() && it->second) {
+                ByteRingBuffer &buffer = it->second->data_buffer;
+                std::vector<uint8_t> discard(buffer.Used());
+                buffer.Remove(discard.data(), discard.size());
+                buffer.Insert(bytes, used);
+            }
+        }
+
+        const uint64_t now = sync_timer_clock();
+        ok = ok && xr.get(count);
+        for (uint32_t i = 0; ok && i < count; i++) {
+            SceUID uid = 0;
+            uint8_t flags = 0;
+            uint64_t interval = 0;
+            int64_t next = 0, time = 0;
+            ok = xr.get(uid) && xr.get(flags) && xr.get(interval) && xr.get(next) && xr.get(time);
+            const auto it = emuenv.kernel.timers.find(uid);
+            if (ok && it != emuenv.kernel.timers.end() && it->second) {
+                Timer &timer = *it->second;
+                timer.is_started = flags & 1;
+                timer.is_repeat = flags & 2;
+                timer.is_pulse = flags & 4;
+                timer.event_set = flags & 8;
+                timer.event_interval = interval;
+                timer.next_event = next == std::numeric_limits<int64_t>::max() ? std::numeric_limits<uint64_t>::max() : now + next;
+                timer.time = now + time;
+            }
+        }
+
+        if (!ok)
+            LOG_ERROR("Savestate: the SYN2 chunk is corrupt; rwlocks, message pipes and timers may not all be restored");
     }
 
     // --- restore the guest's file table ----------------------------------------------------
