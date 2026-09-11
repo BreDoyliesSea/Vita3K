@@ -20,6 +20,7 @@
 
 #include <kernel/state.h>
 #include <mem/ptr.h>
+#include <mem/state.h>
 #include <util/align.h>
 
 #include <util/log.h>
@@ -27,6 +28,7 @@
 #include <cassert>
 #include <cstring>
 #include <memory>
+#include <shared_mutex>
 #include <sstream>
 #include <utility>
 
@@ -271,6 +273,26 @@ void ThreadState::run_loop() {
                 dispatch_abort(*cpu);
 
             lock.lock();
+
+            // A savestate load took this thread out of the call that just returned, and left it
+            // the state's registers to continue from (continue_from_on_return). Wait for the load
+            // to finish -- it holds savestate_lock exclusively for its whole length -- and then
+            // carry on from those rather than from wherever the call left off.
+            if (context_on_return) {
+                const CPUContext ctx = *context_on_return;
+                context_on_return.reset();
+                lock.unlock();
+                held_for_load.store(true, std::memory_order_release);
+                {
+                    const std::shared_lock<std::shared_timed_mutex> wait_for_load(mem.savestate_lock);
+                }
+                held_for_load.store(false, std::memory_order_release);
+                load_context(*cpu, ctx);
+                clear_exclusive(*cpu);
+                lock.lock();
+                // The pause that armed this ended before the lock came free.
+                suspend_requested = false;
+            }
 
             if (do_step || suspend_requested || hit_breakpoint(*cpu)) {
                 suspend_requested = false;
@@ -566,6 +588,31 @@ void ThreadState::resume(bool step) {
         suspend_requested = false;
         update_status(ThreadStatus::running);
     }
+}
+
+void ThreadState::suspend_on_return() {
+    const std::lock_guard<std::mutex> lock(mutex);
+    suspend_requested = true;
+}
+
+bool ThreadState::resume_after_pause() {
+    const std::lock_guard<std::mutex> lock(mutex);
+    suspend_requested = false;
+    if (status != ThreadStatus::suspend)
+        return false;
+    update_status(ThreadStatus::run);
+    return true;
+}
+
+bool ThreadState::continue_from_on_return(uint32_t nid, const CPUContext &ctx) {
+    // run_loop checks for this under the same mutex after every call returns, and call_import
+    // puts the outer NID back before that. So a thread seen here as still inside `nid` has not yet
+    // been through the check, and will find the context when it gets there.
+    const std::lock_guard<std::mutex> lock(mutex);
+    if (status != ThreadStatus::wait || current_import_nid.load(std::memory_order_relaxed) != nid)
+        return false;
+    context_on_return = ctx;
+    return true;
 }
 
 std::string ThreadState::log_stack_traceback() const {

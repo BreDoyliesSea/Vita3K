@@ -571,6 +571,23 @@ void reconcile_waiters_after_load(KernelState &kernel) {
     LOG_INFO_IF(woken > 0, "Savestate: released {} thread(s) whose semaphore was restored above their wait", woken);
 }
 
+bool semaphore_release_for_savestate(KernelState &kernel, SceUID semaid, const ThreadStatePtr &thread) {
+    // Semaphore::cancel for one thread, and without telling it: the caller has armed the thread
+    // with the registers it continues from, so the call's result is never seen. Same lock order
+    // as Semaphore::signal.
+    const SemaphorePtr semaphore = kernel.objects.find<Semaphore>(semaid);
+    if (!semaphore)
+        return false;
+    const auto guard = semaphore->lock();
+    if (!guard)
+        return false;
+    auto *waiter = semaphore->waiters.find_if([&](auto &w) { return w.thread == thread; });
+    if (!waiter)
+        return false;
+    semaphore->waiters.wake(*waiter);
+    return true;
+}
+
 SceInt32 Semaphore::cancel(SceInt32 set_count, SceUInt32 *num_wait_threads) {
     const auto guard = lock();
     if (!guard)

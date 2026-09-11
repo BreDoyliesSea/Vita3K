@@ -266,3 +266,8 @@ typedef std::shared_ptr<MsgPipe> MsgPipePtr;
 // that signal maintains: on exit, every semaphore's queue is either empty or its front waiter
 // still needs more than the count can give.
 void reconcile_waiters_after_load(KernelState &kernel);
+
+// Savestate support. Take `thread` out of its wait on `semaid` without telling it it was cancelled:
+// remove it from the queue and wake it. For a load that has already armed the thread with the
+// registers it continues from (ThreadState::continue_from_on_return). False if it was not queued.
+bool semaphore_release_for_savestate(KernelState &kernel, SceUID semaid, const ThreadStatePtr &thread);

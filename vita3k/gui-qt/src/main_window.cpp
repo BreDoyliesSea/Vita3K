@@ -1561,25 +1561,16 @@ void MainWindow::on_quicksave_triggered() {
     // small and the boundary comes round every frame, so trying again lands almost immediately --
     // and this is cheap to retry because a refused save has written nothing.
     //
-    // Each attempt also samples which waits the guest's threads are held in, lets it run two
-    // frames, and has the save refuse unless it finds the same ones. A state saved while a thread
-    // was only passing through a wait can never be loaded; see the check at the top of
-    // savestate::save.
-    //
-    // 30 attempts, not 10: over 25 saves in battle most needed 0-3, but one needed 10. The display
-    // queue thread is in sceDisplayWaitVblankStart at some frame gaps and not others, so an attempt
-    // there is close to a coin flip. A refused attempt costs about two frames.
-    constexpr int max_attempts = 30;
+    // 60 attempts: a save also refuses a moment a load could not restart (see savestate::save).
+    // Measured over 30 saves in battle, about four attempts in five were refused -- mostly the
+    // display queue thread caught in sceDisplayWaitVblankStart -- and the slowest save took 15.
+    // At that rate 30 attempts would give up about once in a thousand saves, 60 about once in a
+    // million. A refused attempt costs a frame or two.
+    constexpr int max_attempts = 60;
     savestate::Result last = savestate::Result::fail("did not run");
     int attempts = 0;
     for (int attempt = 1; attempt <= max_attempts; attempt++) {
         attempts = attempt;
-        if (!wait_for_display_queue_gap(emuenv.gxm, 10000)) {
-            statusBar()->showMessage(tr("Quicksave: a frame is still in flight, try again"), 6000);
-            return;
-        }
-        const savestate::WaitSignature settled = savestate::wait_signature(emuenv);
-        std::this_thread::sleep_for(std::chrono::milliseconds(33));
         if (!wait_for_display_queue_gap(emuenv.gxm, 10000)) {
             statusBar()->showMessage(tr("Quicksave: a frame is still in flight, try again"), 6000);
             return;
@@ -1589,7 +1580,7 @@ void MainWindow::on_quicksave_triggered() {
         last = savestate::Result::retry("the guest could not be stopped");
         bool succeeded = false;
         run_with_guest_quiesced("Quicksave", [&] {
-            last = savestate::save(emuenv, savestate::slot_path(emuenv, 0), &settled);
+            last = savestate::save(emuenv, savestate::slot_path(emuenv, 0));
             succeeded = static_cast<bool>(last);
             return last;
         });
@@ -1598,7 +1589,10 @@ void MainWindow::on_quicksave_triggered() {
         if (!last.retryable)
             break;
 
-        LOG_INFO("Savestate: quicksave attempt {}/10 refused ({})", attempt, last.reason);
+        LOG_INFO("Savestate: quicksave attempt {}/{} refused ({})", attempt, max_attempts, last.reason);
+        // Let the guest move on a frame; with the queue already empty the next attempt would
+        // otherwise land in the same moment and be refused for the same reason.
+        std::this_thread::sleep_for(std::chrono::milliseconds(16));
     }
 
     LOG_ERROR("Quicksave gave up after {} attempt(s): {}", attempts, last.reason);
@@ -1606,23 +1600,16 @@ void MainWindow::on_quicksave_triggered() {
 }
 
 void MainWindow::on_quickload_triggered() {
-    // Loading restores guest memory and CPU registers, but not the kernel objects that
-    // threads are blocked on -- and around 87% of a game's threads are blocked inside an HLE
-    // call at any moment. They resume as if their wait had returned, and the guest typically
-    // destabilises within seconds. Say so plainly rather than letting it look like a bug in
-    // the game.
-    // Load at the same kind of moment the save was taken at. The snapshot is caught while the
-    // display queue is empty, which is a particular phase of the guest's frame loop; arriving here
-    // at some other phase means the guest's threads are in different waits than the state records,
-    // and the load is refused. Matching the phase is what makes the two comparable -- without it
-    // every attempt was rejected with "thread 8 is waiting now but was not when the state was
-    // taken".
-    // Retry, for the same reason quicksave does. The gate above compares the guest's thread
-    // topology against the one the state recorded, and a background worker that happens to be
-    // awake right now will be back in its idle wait a frame or two later. A refused load has
-    // changed nothing, so trying again costs only the wait for the next frame boundary. It does
-    // not paper over the gate: a thread that has genuinely moved on for good never matches, and
-    // the last refusal is what gets reported.
+    // Load at a frame boundary, the same kind of moment the save was taken at: with the display
+    // queue empty no display callback is part-way through (see savestate::load).
+    //
+    // The threads do not have to be parked the way the state had them. The load takes every
+    // thread that is waiting out of its call and puts every thread the state had parked back at
+    // the start of its own, so it makes the call again. What can still refuse, retryably, is what
+    // a restart cannot change -- a thread that has finished now but had not then, or is inside a
+    // callback -- and a thread in a call the load cannot interrupt. Those pass within a frame or
+    // two, and a refused load has changed nothing, so trying again costs only the wait for the
+    // next boundary. The last refusal is what gets reported.
     savestate::Result last = savestate::Result::fail("did not run");
     int attempts = 0;
     for (int attempt = 1; attempt <= 8; attempt++) {
@@ -1638,12 +1625,8 @@ void MainWindow::on_quickload_triggered() {
             succeeded = static_cast<bool>(last);
             return last;
         });
-        if (succeeded) {
-            statusBar()->showMessage(
-                tr("Quickload is experimental: thread wait state is not restored and the game may become unstable."),
-                10000);
-            return;
-        }
+        if (succeeded)
+            return; // run_with_guest_quiesced has already said so
 
         if (!last.retryable) {
             // Nothing about the guest will make this state loadable -- a different build, a

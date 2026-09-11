@@ -132,6 +132,32 @@ struct ThreadState {
     void resume(bool step = false);
     std::string log_stack_traceback() const;
 
+    // --- pausing and savestates -----------------------------------------------------------------
+    // Depth of run_loop frames: 1 for a thread at its top level, more inside a callback.
+    int nesting_level() const {
+        return call_level;
+    }
+
+    // Park in ThreadStatus::suspend the moment the HLE call this thread is waiting in returns,
+    // before it runs any more guest code. KernelState::pause_threads uses it for threads that are
+    // waiting rather than running, which suspend() cannot stop.
+    void suspend_on_return();
+
+    // End of a pause for a thread that was waiting when it began: resume it if its call returned
+    // and it parked, otherwise cancel the request. Returns true if it was resumed.
+    bool resume_after_pause();
+
+    // Savestate load. If the thread is still waiting inside the import `nid`, arrange that when the
+    // call returns it waits for the load to finish -- the load holds MemState::savestate_lock
+    // exclusively -- and then continues from `ctx` rather than from wherever the call left it.
+    // Returns false if it is no longer in that call.
+    bool continue_from_on_return(uint32_t nid, const CPUContext &ctx);
+
+    // True while the thread is waiting on the load after continue_from_on_return.
+    bool held_for_savestate() const {
+        return held_for_load.load(std::memory_order_acquire);
+    }
+
 private:
     // Whether the thread is exiting or being deleted. Called with mutex held.
     bool exiting() const { return exit_requested || delete_requested; }
@@ -148,6 +174,9 @@ private:
     bool delete_requested = false;
     // Set by suspend(), consumed in run_loop() to transition to ThreadStatus::suspended.
     bool suspend_requested = false;
+    // Set by continue_from_on_return(), consumed in run_loop() when the call returns.
+    std::optional<CPUContext> context_on_return;
+    std::atomic<bool> held_for_load{ false };
     // Single stepping mode.
     bool single_stepping = false;
 
