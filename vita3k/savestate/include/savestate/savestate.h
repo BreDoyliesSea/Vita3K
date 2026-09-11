@@ -19,7 +19,9 @@
 
 #include <util/fs.h>
 
+#include <cstdint>
 #include <string>
+#include <vector>
 
 struct EmuEnvState;
 
@@ -58,9 +60,27 @@ struct Result {
 // <pref-path>/savestates/<TITLEID>/slot<N>.vst
 fs::path slot_path(const EmuEnvState &emuenv, int slot);
 
+// One guest thread parked in a wait that only another thread can end -- the waits a load has to
+// find again exactly as recorded. Waits that end on their own (a delay, an audio buffer) are left
+// out, as the load leaves them out.
+struct HeldWait {
+    int32_t thread; // SceUID
+    uint32_t nid;
+    uint32_t args[3];
+
+    bool operator==(const HeldWait &) const = default;
+};
+using WaitSignature = std::vector<HeldWait>; // sorted by thread
+
+// Which threads are held in such a wait right now. Safe to call while the guest runs.
+WaitSignature wait_signature(EmuEnvState &emuenv);
+
 // Both expect the guest to already be quiesced by the caller (see AppSessionPauseReason).
 // Neither pauses or resumes on its own.
-Result save(EmuEnvState &emuenv, const fs::path &path);
+//
+// With `expected`, the save is refused (retryably) unless the guest is held in exactly those
+// waits: see the check at the top of save() for why a quicksave wants that.
+Result save(EmuEnvState &emuenv, const fs::path &path, const WaitSignature *expected = nullptr);
 Result load(EmuEnvState &emuenv, const fs::path &path);
 
 } // namespace savestate
