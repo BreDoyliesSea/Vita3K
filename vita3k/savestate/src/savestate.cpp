@@ -36,6 +36,7 @@
 #include <miniz.h>
 
 #include <algorithm>
+#include <optional>
 #include <tuple>
 #include <cstring>
 #include <ctime>
@@ -62,6 +63,8 @@ constexpr uint32_t TAG_FILE = 0x454C4946U; // "FILE" - read position of every op
 constexpr uint32_t TAG_STACK = 0x204B5453U;
 // "FTBL" - what file each open read-only descriptor refers to. Optional, so older states still load.
 constexpr uint32_t TAG_FTBL = 0x4C425446U;
+// "NGSL" - where each NGS system, rack and voice was. Optional, so older states still load.
+constexpr uint32_t TAG_NGSL = 0x4C53474EU;
 
 // NIDs the restore path understands. A parked thread can only be carried across a load if its
 // wait is one of these.
@@ -457,6 +460,25 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
         }
     }
 
+    // --- where the NGS objects are ------------------------------------------------------------
+    // See ngs::capture_layout. A load into a session whose heap put them elsewhere moves them.
+    std::vector<uint8_t> ngsl_raw;
+    {
+        const ngs::SavedLayout layout = ngs::capture_layout(emuenv.ngs, emuenv.mem);
+        put<uint32_t>(ngsl_raw, layout.definitions);
+        put<uint32_t>(ngsl_raw, static_cast<uint32_t>(layout.systems.size()));
+        for (const auto &system : layout.systems) {
+            put<uint32_t>(ngsl_raw, system.addr);
+            put<uint32_t>(ngsl_raw, static_cast<uint32_t>(system.racks.size()));
+            for (const auto &rack : system.racks) {
+                put<uint32_t>(ngsl_raw, rack.addr);
+                put<uint32_t>(ngsl_raw, static_cast<uint32_t>(rack.voices.size()));
+                for (const Address voice : rack.voices)
+                    put<uint32_t>(ngsl_raw, voice);
+            }
+        }
+    }
+
     // --- assemble ---------------------------------------------------------------------------
     std::vector<uint8_t> file;
     file.insert(file.end(), std::begin(MAGIC), std::end(MAGIC));
@@ -499,6 +521,11 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
     put<uint64_t>(file, ftbl_raw.size());
     put<uint64_t>(file, ftbl_raw.size());
     file.insert(file.end(), ftbl_raw.begin(), ftbl_raw.end());
+
+    put(file, TAG_NGSL);
+    put<uint64_t>(file, ngsl_raw.size());
+    put<uint64_t>(file, ngsl_raw.size());
+    file.insert(file.end(), ngsl_raw.begin(), ngsl_raw.end());
 
     // Write to a temporary and rename into place, so an interrupted save cannot destroy the
     // previous good state.
@@ -587,6 +614,8 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
     size_t stack_size = 0;
     const uint8_t *ftbl_data = nullptr;
     size_t ftbl_size = 0;
+    const uint8_t *ngsl_data = nullptr;
+    size_t ngsl_size = 0;
 
     while (r.need(sizeof(uint32_t) + sizeof(uint64_t) * 2)) {
         uint32_t tag = 0;
@@ -628,6 +657,10 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
         case TAG_FTBL:
             ftbl_data = payload;
             ftbl_size = static_cast<size_t>(stored);
+            break;
+        case TAG_NGSL:
+            ngsl_data = payload;
+            ngsl_size = static_cast<size_t>(stored);
             break;
         default:
             LOG_WARN("Savestate: ignoring unknown chunk 0x{:08X}", tag);
@@ -756,6 +789,42 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
         }
     }
 
+    // --- can the NGS objects be moved to where the state had them? ----------------------------
+    // Decided here, before anything is touched, so a refusal leaves the session as it was.
+    std::optional<ngs::SavedLayout> ngs_layout;
+    if (ngsl_data) {
+        Reader nr{ ngsl_data, ngsl_size, 0 };
+        ngs::SavedLayout layout;
+        uint32_t system_count = 0;
+        if (!nr.get(layout.definitions) || !nr.get(system_count))
+            return Result::fail("corrupt NGS layout chunk");
+        for (uint32_t i = 0; i < system_count; i++) {
+            ngs::SavedLayout::SystemEntry system;
+            uint32_t rack_count = 0;
+            if (!nr.get(system.addr) || !nr.get(rack_count))
+                return Result::fail("corrupt NGS layout chunk");
+            for (uint32_t j = 0; j < rack_count; j++) {
+                ngs::SavedLayout::RackEntry rack;
+                uint32_t voice_count = 0;
+                if (!nr.get(rack.addr) || !nr.get(voice_count))
+                    return Result::fail("corrupt NGS layout chunk");
+                rack.voices.resize(voice_count);
+                for (Address &voice : rack.voices) {
+                    if (!nr.get(voice))
+                        return Result::fail("corrupt NGS layout chunk");
+                }
+                system.racks.push_back(std::move(rack));
+            }
+            layout.systems.push_back(std::move(system));
+        }
+        if (ngs::scheduler_busy(emuenv.ngs))
+            return Result::retry("the NGS scheduler is busy");
+        const std::string why = ngs::check_relocatable(emuenv.ngs, emuenv.mem, layout);
+        if (!why.empty())
+            return Result::fail("the audio engine cannot be moved to where the state has it: " + why);
+        ngs_layout = std::move(layout);
+    }
+
     std::vector<uint8_t> mem_raw;
     if (!inflate_to(mem_packed, mem_packed_size, mem_raw, mem_raw_size))
         return Result::fail("guest memory chunk is corrupt");
@@ -809,7 +878,26 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
     // Collected before anything is overwritten, while the walk is still safe.
     std::vector<std::pair<Address, uint32_t>> host_owned_ranges;
     gxm::collect_host_owned_ranges(emuenv.gxm, emuenv.mem, host_owned_ranges);
-    ngs::collect_host_owned_ranges(emuenv.ngs, emuenv.mem, host_owned_ranges);
+
+    // NGS objects. With a recorded layout, copy the live objects aside now -- before anything is
+    // overwritten or reallocated -- and keep the restore off the addresses the state has them at,
+    // where they are placed afterwards. Without one (older states), keep them where they are.
+    std::optional<ngs::RelocationStash> ngs_stash;
+    if (ngs_layout) {
+        ngs_stash = ngs::stash_for_relocation(emuenv.ngs, emuenv.mem, *ngs_layout);
+        const size_t graphics_ranges = host_owned_ranges.size();
+        for (const auto &block : ngs_stash->blocks) {
+            const uint32_t size = static_cast<uint32_t>(block.bytes.size());
+            for (size_t i = 0; i < graphics_ranges; i++) {
+                const auto &[addr, length] = host_owned_ranges[i];
+                if (block.to < addr + length && addr < block.to + size)
+                    return Result::fail(fmt::format("the audio engine's saved location {} collides with a graphics object here", log_hex(block.to)));
+            }
+            host_owned_ranges.emplace_back(block.to, size);
+        }
+    } else {
+        ngs::collect_host_owned_ranges(emuenv.ngs, emuenv.mem, host_owned_ranges);
+    }
 
     // Before anything touches guest memory. The renderer holds read-only protections over the
     // textures and surfaces it has cached; hand them all back, and let their callbacks invalidate
@@ -930,6 +1018,11 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
 
     if (host_owned_ranges_skipped > 0)
         LOG_INFO("Savestate: stepped over {} host-owned range(s) inside restored regions", host_owned_ranges_skipped);
+
+    if (ngs_stash) {
+        const uint32_t moved = ngs::relocate_after_restore(emuenv.ngs, emuenv.mem, *ngs_stash);
+        LOG_INFO_IF(moved > 0, "Savestate: moved {} NGS pool(s) to where the state has them", moved);
+    }
 
     // --- point each thread at its stack -------------------------------------------------------
     // Must happen after the address space has been reconciled and before any thread runs again.

@@ -24,6 +24,12 @@
 #include <util/lock_and_find.h>
 
 #include <util/vector_utils.h>
+#include <util/log.h>
+#include <algorithm>
+#include <cstring>
+#include <queue>
+#include <string>
+#include <type_traits>
 
 namespace ngs {
 Rack::Rack(System *mama, const Ptr<void> memspace, const uint32_t memspace_size)
@@ -390,6 +396,216 @@ void collect_host_owned_ranges(State &ngs, const MemState &mem,
             }
         }
     }
+}
+
+// --- moving NGS objects to where a savestate had them ---------------------------------------------
+//
+// System, Rack and Voice are host objects constructed into memory the game handed over: a system
+// at the start of its own pool, each rack at the start of its pool, and a rack's voices, their
+// parameter buffers and their patches allocated inside the rack's pool in a fixed order. The
+// game's own heap decides where those pools are, and a session that took a different path can put
+// them somewhere else. After a load the guest holds the state's addresses, so the live objects
+// have to be there. When they were not, sceNgsSystemUpdate was handed a system nobody knew, the
+// mix was skipped, and the music became one buffer played over and over.
+//
+// A pool moves as a unit: everything inside keeps its offset and every guest pointer into it
+// shifts by the same amount. The objects themselves are carried as bytes. On this toolchain
+// (MSVC, release, no iterator debugging) std::vector, std::deque, an unlocked recursive_mutex and
+// a condition_variable_any with no waiters hold no pointers to themselves, so a byte copy is a
+// move. The scheduler must be idle (scheduler_busy), and a guest thread waiting on its condition
+// variable never reaches the pause barrier, so no load gets this far with one.
+
+SavedLayout capture_layout(State &ngs, const MemState &mem) {
+    SavedLayout layout;
+    layout.definitions = ngs.definitions.address();
+    for (System *system : ngs.systems) {
+        SavedLayout::SystemEntry entry;
+        if (system) {
+            entry.addr = Ptr<System>(system, mem).address();
+            for (Rack *rack : system->racks) {
+                SavedLayout::RackEntry rack_entry;
+                if (rack) {
+                    rack_entry.addr = Ptr<Rack>(rack, mem).address();
+                    for (const Ptr<Voice> &voice : rack->voices)
+                        rack_entry.voices.push_back(voice.address());
+                }
+                entry.racks.push_back(std::move(rack_entry));
+            }
+        }
+        layout.systems.push_back(std::move(entry));
+    }
+    return layout;
+}
+
+// The extent of a pool, from its allocator. At least `minimum`, so the object at its start is
+// always inside it.
+static uint32_t pool_extent(const MempoolObject &pool, uint32_t minimum) {
+    uint32_t end = minimum;
+    for (const auto &block : pool.allocator.blocks)
+        end = std::max(end, block.offset + block.size);
+    return end;
+}
+
+std::string check_relocatable(State &ngs, const MemState &mem, const SavedLayout &saved) {
+    if (saved.definitions != ngs.definitions.address())
+        return fmt::format("voice definitions are at {} here but {} in the state",
+            log_hex(ngs.definitions.address()), log_hex(saved.definitions));
+    if (saved.systems.size() != ngs.systems.size())
+        return fmt::format("{} system(s) here, {} in the state", ngs.systems.size(), saved.systems.size());
+
+    for (size_t i = 0; i < saved.systems.size(); i++) {
+        const System *system = ngs.systems[i];
+        const SavedLayout::SystemEntry &saved_system = saved.systems[i];
+        if (!system != !saved_system.addr)
+            return fmt::format("system {} exists in one session and not the other", i);
+        if (!system)
+            continue;
+        if (saved_system.racks.size() != system->racks.size())
+            return fmt::format("system {} has {} rack slot(s) here, {} in the state", i, system->racks.size(), saved_system.racks.size());
+
+        for (size_t j = 0; j < saved_system.racks.size(); j++) {
+            const Rack *rack = system->racks[j];
+            const SavedLayout::RackEntry &saved_rack = saved_system.racks[j];
+            if (!rack != !saved_rack.addr)
+                return fmt::format("rack {} of system {} exists in one session and not the other", j, i);
+            if (!rack)
+                continue;
+            if (saved_rack.voices.size() != rack->voices.size())
+                return fmt::format("rack {} has {} voice(s) here, {} in the state", j, rack->voices.size(), saved_rack.voices.size());
+
+            // A pool can only move as a unit if everything in it is where it was relative to the
+            // start. Allocation inside a rack is deterministic, so this should always hold; if it
+            // does not, moving would put voices where the guest does not expect them.
+            const Address live_rack = Ptr<Rack>(const_cast<Rack *>(rack), mem).address();
+            for (size_t k = 0; k < saved_rack.voices.size(); k++) {
+                if (saved_rack.voices[k] - saved_rack.addr != rack->voices[k].address() - live_rack)
+                    return fmt::format("voice {} of rack {} sits at a different place in its pool", k, j);
+            }
+        }
+    }
+    return {};
+}
+
+bool scheduler_busy(State &ngs) {
+    for (System *system : ngs.systems) {
+        if (!system)
+            continue;
+        std::unique_lock<std::recursive_mutex> lock(system->voice_scheduler.mutex, std::try_to_lock);
+        if (!lock.owns_lock() || system->voice_scheduler.is_updating)
+            return true;
+    }
+    return false;
+}
+
+RelocationStash stash_for_relocation(State &ngs, const MemState &mem, const SavedLayout &saved) {
+    RelocationStash stash;
+    const uint8_t *const base = mem.memory.get();
+    const auto carry = [&](Address from, Address to, uint32_t size) {
+        stash.blocks.push_back({ from, to, std::vector<uint8_t>(base + from, base + from + size) });
+    };
+
+    for (size_t i = 0; i < saved.systems.size(); i++) {
+        System *system = ngs.systems[i];
+        if (!system)
+            continue;
+        const SavedLayout::SystemEntry &saved_system = saved.systems[i];
+        const Address live_system = Ptr<System>(system, mem).address();
+        stash.moves.push_back({ live_system, pool_extent(*system, sizeof(System)), saved_system.addr });
+        carry(live_system, saved_system.addr, sizeof(System));
+
+        for (size_t j = 0; j < saved_system.racks.size(); j++) {
+            Rack *rack = system->racks[j];
+            if (!rack)
+                continue;
+            const SavedLayout::RackEntry &saved_rack = saved_system.racks[j];
+            const Address live_rack = Ptr<Rack>(rack, mem).address();
+            stash.moves.push_back({ live_rack, pool_extent(*rack, sizeof(Rack)), saved_rack.addr });
+            carry(live_rack, saved_rack.addr, sizeof(Rack));
+            for (size_t k = 0; k < rack->voices.size(); k++) {
+                if (rack->voices[k])
+                    carry(rack->voices[k].address(), saved_rack.voices[k], sizeof(Voice));
+            }
+        }
+    }
+    return stash;
+}
+
+uint32_t relocate_after_restore(State &ngs, MemState &mem, const RelocationStash &stash) {
+    uint8_t *const base = mem.memory.get();
+    for (const RelocationStash::Block &block : stash.blocks)
+        std::memcpy(base + block.to, block.bytes.data(), block.bytes.size());
+
+    // A guest address inside a pool that moved, moved with it. Anything else stays.
+    const auto map_guest = [&](Address addr) -> Address {
+        for (const RelocationStash::Move &move : stash.moves) {
+            if (addr >= move.from && addr < move.from + move.size)
+                return addr - move.from + move.to;
+        }
+        return addr;
+    };
+    const auto map_host = [&](auto *pointer) -> decltype(pointer) {
+        if (!pointer)
+            return pointer;
+        const Address addr = static_cast<Address>(reinterpret_cast<uint8_t *>(pointer) - base);
+        return reinterpret_cast<decltype(pointer)>(base + map_guest(addr));
+    };
+    const auto map_ptr = [&](auto &ptr) {
+        if (ptr)
+            ptr = std::remove_reference_t<decltype(ptr)>(map_guest(ptr.address()));
+    };
+
+    for (System *&system : ngs.systems) {
+        if (!system)
+            continue;
+        system = map_host(system);
+        map_ptr(system->memspace);
+        for (Rack *&rack : system->racks)
+            rack = map_host(rack);
+        for (Voice *&voice : system->voice_scheduler.queue)
+            voice = map_host(voice);
+
+        std::queue<OperationPending> pending;
+        while (!system->voice_scheduler.operations_pending.empty()) {
+            OperationPending op = system->voice_scheduler.operations_pending.front();
+            system->voice_scheduler.operations_pending.pop();
+            op.system = map_host(op.system);
+            if (op.type == PendingType::ReleaseRack)
+                op.release_data.rack = map_host(op.release_data.rack);
+            pending.push(op);
+        }
+        system->voice_scheduler.operations_pending = std::move(pending);
+
+        for (Rack *rack : system->racks) {
+            if (!rack)
+                continue;
+            map_ptr(rack->memspace);
+            rack->system = map_host(rack->system);
+            for (Ptr<Voice> &voice_ptr : rack->voices) {
+                map_ptr(voice_ptr);
+                Voice *voice = voice_ptr.get(mem);
+                if (!voice)
+                    continue;
+                voice->rack = map_host(voice->rack);
+                for (auto &port : voice->patches) {
+                    for (Ptr<Patch> &patch : port)
+                        map_ptr(patch);
+                }
+                map_ptr(voice->finished_callback);
+                map_ptr(voice->finished_callback_user_data);
+                // Filled afresh at the start of every update.
+                std::memset(voice->products, 0, sizeof(voice->products));
+                for (ModuleData &data : voice->datas) {
+                    data.parent = voice;
+                    map_ptr(data.info.data);
+                    map_ptr(data.callback);
+                    map_ptr(data.user_data);
+                }
+            }
+        }
+    }
+
+    return static_cast<uint32_t>(std::count_if(stash.moves.begin(), stash.moves.end(),
+        [](const RelocationStash::Move &move) { return move.from != move.to; }));
 }
 
 void on_savestate_loaded(State &ngs, const MemState &mem) {
