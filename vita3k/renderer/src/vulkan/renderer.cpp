@@ -1570,7 +1570,18 @@ uint64_t VKState::get_matching_device_address(const Address address) {
     auto mapped_memory = mapped_memories.lower_bound(address);
     if (mapped_memory == mapped_memories.end()
         || mapped_memory->first + mapped_memory->second.size < address) {
-        LOG_ERROR("Could not find matching mapped buffer for vertex stream");
+        // Say which address, and what is mapped near it. Without that this reads the same whether
+        // the guest handed over a stray pointer, the region was never mapped, or one that was
+        // mapped has gone -- and the next thing that happens is a fault in the driver.
+        std::string nearest = "nothing mapped at all";
+        if (!mapped_memories.empty()) {
+            const auto &after = *mapped_memories.begin();
+            nearest = fmt::format("{} mapped block(s), nearest at or below {:#010x}, highest [{:#010x}+{:#x})",
+                mapped_memories.size(),
+                mapped_memory != mapped_memories.end() ? mapped_memory->first : 0,
+                after.first, after.second.size);
+        }
+        LOG_ERROR("Could not find matching mapped buffer for vertex stream at {:#010x}: {}", address, nearest);
         return 0;
     }
 
