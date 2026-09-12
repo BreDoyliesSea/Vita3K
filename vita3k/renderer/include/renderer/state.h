@@ -186,9 +186,21 @@ struct State {
     bool park_render_thread(std::chrono::milliseconds timeout) {
         park_requested.store(true, std::memory_order_release);
         std::unique_lock<std::mutex> lock(park_mutex);
-        return park_cond.wait_for(lock, timeout, [this] {
+        const bool reached = park_cond.wait_for(lock, timeout, [this] {
             return parked || render_abort.load(std::memory_order_relaxed);
         });
+        if (!reached) {
+            // Withdraw the request. Only unpark_render_thread() clears it, and a caller told that
+            // the render thread did not stop has no reason to call that, so a request left
+            // standing would park the render thread at its next safe point and keep it there.
+            // A render thread that saw the request just too late is released as well: it stays
+            // parked only while the request stands, and the request is withdrawn under the mutex
+            // it waits on, followed by a notify.
+            park_requested.store(false, std::memory_order_release);
+            lock.unlock();
+            park_cond.notify_all();
+        }
+        return reached;
     }
 
     void unpark_render_thread() {
