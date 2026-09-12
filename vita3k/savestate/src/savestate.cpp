@@ -1055,6 +1055,7 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
     // --- are the GXM objects the state refers to still where it had them? ---------------------
     // They are not moved by a load, so if the game's heap put them elsewhere in this session the
     // restored guest would hand back addresses with no live object behind them. Refuse instead.
+    std::optional<gxm::HostObjectLayout> gxm_layout;
     if (gxml_data) {
         Reader gr{ gxml_data, gxml_size, 0 };
         gxm::HostObjectLayout layout;
@@ -1071,6 +1072,7 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
         const std::string why = gxm::check_layout(emuenv.gxm, emuenv.mem, layout);
         if (!why.empty())
             return Result::fail("the graphics objects are laid out differently in this session: " + why);
+        gxm_layout = std::move(layout);
     }
 
     // --- can the NGS objects be moved to where the state had them? ----------------------------
@@ -1202,6 +1204,21 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
     // like any other guest memory, but they contain this-process host pointers, so restoring a
     // state taken by a different process installs pointers into a heap that no longer exists.
     // Collected before anything is overwritten, while the walk is still safe.
+    // First, the objects the guest created after the state was taken. They are live here and the
+    // state has no bytes for them, but their guest memory is about to be put back to a moment when
+    // it was free, and the guest then hands it out again while the host still caches the object.
+    // See gxm::rollback_to_layout for the measurement. Done before the ranges are collected, so
+    // theirs are not stepped over: the restore writes what the guest had there. The one refusal
+    // this can raise happens before anything is touched.
+    if (gxm_layout) {
+        gxm::RollbackCounts rolled;
+        const std::string why = gxm::rollback_to_layout(emuenv.gxm, emuenv.mem, *gxm_layout, rolled);
+        if (!why.empty())
+            return Result::fail("the graphics objects cannot be put back to what the state had: " + why);
+        if (rolled.total() > 0)
+            LOG_INFO("Savestate: destroyed {} vertex program(s), {} fragment program(s), {} shader patcher(s) and {} sync object(s) the guest created after the save",
+                rolled.vertex_programs, rolled.fragment_programs, rolled.shader_patchers, rolled.sync_objects);
+    }
     std::vector<std::pair<Address, uint32_t>> host_owned_ranges;
     gxm::collect_host_owned_ranges(emuenv.gxm, emuenv.mem, host_owned_ranges);
 
