@@ -36,6 +36,8 @@
 #define XXH_INLINE_ALL
 #include <xxhash.h>
 
+#include <algorithm>
+
 namespace renderer::vulkan {
 
 // Size of the record containing what is needed for the pipeline construction (what is after is dynamic state)
@@ -455,6 +457,19 @@ static const vk::SpecializationInfo srgb_info_false = {
     .pData = &srgb_entry_false
 };
 
+// Whether the shader cache's manifest (hashs-vk.dat, read at startup) lists this shader. The
+// manifest carries the cache version and the GPU feature mask the shaders were built with, and it
+// is written at exit: a run that generates shaders and then crashes leaves .spv files with no
+// manifest, and a later run in another memory-mapping mode -- which translates differently --
+// would otherwise pick them up by file name alone. Only a listed shader may be loaded from disk;
+// anything else is regenerated, and the regenerated file overwrites the orphan.
+static bool manifest_lists(VKState &state, std::mutex &shaders_mutex, const Sha256Hash &hash) {
+    std::lock_guard<std::mutex> guard(shaders_mutex);
+    return std::any_of(state.shaders_cache_hashs.begin(), state.shaders_cache_hashs.end(), [&hash](const ShadersHash &entry) {
+        return entry.vert == hash || entry.frag == hash;
+    });
+}
+
 vk::PipelineShaderStageCreateInfo PipelineCache::retrieve_shader(const SceGxmProgram *program, const Sha256Hash &hash, bool is_vertex, bool maskupdate, MemState &mem, const shader::Hints &hints, bool is_srgb) {
     if (maskupdate)
         LOG_WARN_ONCE("Mask not implemented in the vulkan renderer!");
@@ -487,7 +502,11 @@ vk::PipelineShaderStageCreateInfo PipelineCache::retrieve_shader(const SceGxmPro
             *shader_module = shader_compiling;
     }
 
-    if (*shader_module == shader_compiling) {
+    // Only a shader the manifest lists may come from disk, here and in load_spirv_shader below
+    // (see manifest_lists). An unlisted file is regenerated and overwritten.
+    const bool listed = manifest_lists(state, shaders_mutex, hash);
+
+    if (*shader_module == shader_compiling && listed) {
         precompile_shader(hash, false);
     }
 
@@ -506,7 +525,7 @@ vk::PipelineShaderStageCreateInfo PipelineCache::retrieve_shader(const SceGxmPro
     LOG_INFO("Generating vulkan spv shader {}", hash_text);
     const std::string shader_version = fmt::format("vk{}", shader::CURRENT_VERSION);
 
-    shader::usse::SpirvCode source = load_spirv_shader(*program, state.features, true, hints, maskupdate, state.shaders_path, state.shaders_log_path, shader_version, true);
+    shader::usse::SpirvCode source = load_spirv_shader(*program, state.features, true, hints, maskupdate, state.shaders_path, state.shaders_log_path, shader_version, listed);
 
     vk::ShaderModuleCreateInfo shader_info{
         .codeSize = sizeof(uint32_t) * source.size(),
@@ -1023,6 +1042,9 @@ vk::ShaderModule PipelineCache::precompile_shader(const Sha256Hash &hash, bool s
     }
 
     if (!fs::exists(state.shaders_path) || fs::is_empty(state.shaders_path))
+        return nullptr;
+
+    if (!manifest_lists(state, shaders_mutex, hash))
         return nullptr;
 
     Sha256Hash shader_hash;
