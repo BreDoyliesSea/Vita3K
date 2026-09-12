@@ -2385,6 +2385,61 @@ EXPORT(int, sceGxmDisplayQueueAddEntry, Ptr<SceGxmSyncObject> oldBuffer, Ptr<Sce
     if (!oldBuffer || !newBuffer)
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
 
+    // A savestate holds the display queue empty while it stops the guest, because the empty moment
+    // is otherwise the same moment this call is released in: pop() notifies one condition variable,
+    // which wakes both the savestate waiting for the gap and the frame waiting for the slot, and
+    // when a game keeps its queue full the frame usually wins. Measured on Gravity Rush, where the
+    // queue is occupied nearly all the time: 289 of 289 quickload attempts found an entry again
+    // 24-38 ms after catching it empty, and 3 loads in 10 gave up after 60 attempts.
+    //
+    // The wait for a free slot belongs here, at the top, rather than inside push() further down.
+    // Past this point the call has allocated the callback data and moved both sync objects'
+    // timestamps on, and a load can only put a thread back at the *start* of the call it is parked
+    // in, which would move them a second time; stopped here it has done nothing yet. It is also the
+    // only placement a hold can act on - a thread already blocked in push() is past every gate, and
+    // is woken by the very pop() that hands the savestate its gap. Measured: gating the top alone,
+    // while push() still blocked, left 258 of 295 attempts finding an entry again, no better than
+    // the 289 before it. The pacing the guest sees is unchanged: it waits for the same slot, a few
+    // microseconds earlier in the same call.
+    {
+        const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
+        auto *const queue = &emuenv.gxm.display_queue;
+
+        // Frame pacing, as push() did it: block for a free slot, reporting nothing. This runs every
+        // frame, and a status change that runs every frame is a status change racing every pause.
+        {
+            const ScopedWait scoped_wait(*thread, { [queue] { queue->wake_holders(); } });
+            queue->wait_for_space([&]() { return thread->wait_abandoned(); });
+        }
+
+        // A hold is different: it is kept while the guest is stopped, so a thread waiting on one
+        // has to say it is waiting, or the quiesce waits out a thread that cannot move and gives
+        // up. Only from run, and only back from wait: update_status() assigns unconditionally, so
+        // writing 'wait' over the 'suspend' pause_threads has just recorded loses that suspend and
+        // the thread is never resumed again. Measured: doing this dance on every frame instead of
+        // only here left SceGxmDisplayQueue suspended in guest code in Disgaea 4, 0 saves in 7
+        // cycles, against 10 of 10 on the same build without it.
+        if (queue->is_held()) {
+            bool reported = false;
+            {
+                const std::lock_guard<std::mutex> thread_lock(thread->mutex);
+                if (thread->status == ThreadStatus::run) {
+                    thread->update_status(ThreadStatus::wait, ThreadStatus::run);
+                    reported = true;
+                }
+            }
+            {
+                const ScopedWait scoped_wait(*thread, { [queue] { queue->wake_holders(); } });
+                queue->wait_while_held([&]() { return thread->wait_abandoned(); });
+            }
+            if (reported) {
+                const std::lock_guard<std::mutex> thread_lock(thread->mutex);
+                if (thread->status == ThreadStatus::wait)
+                    thread->update_status(ThreadStatus::run, ThreadStatus::wait);
+            }
+        }
+    }
+
     const Address address = alloc(emuenv.mem, emuenv.gxm.params.displayQueueCallbackDataSize, __FUNCTION__);
     const Ptr<void> ptr(address);
     memcpy(ptr.get(emuenv.mem), callbackData.get(emuenv.mem), emuenv.gxm.params.displayQueueCallbackDataSize);

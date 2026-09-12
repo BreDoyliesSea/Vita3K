@@ -1541,15 +1541,36 @@ void MainWindow::on_thread_dump_requested() {
 // gap. It is notified on every pop, so this wakes inside a window that can be well under a
 // millisecond -- the window 1 ms polling kept missing. savestate::save re-checks under the pause,
 // because the guest can push the next frame between this returning and the guest being quiesced.
-bool wait_for_display_queue_gap(EmuEnvState &emuenv, int timeout_ms) {
+// Catching the queue empty and holding it are one step: see Queue::wait_empty_and_hold. The hold
+// must be released however the attempt ends, so it is owned by a guard rather than by the code
+// path -- one left in place would block the guest in sceGxmDisplayQueueAddEntry for good.
+struct DisplayQueueHold {
+    EmuEnvState *emuenv = nullptr;
+
+    // Explicit, because an attempt that is going to be retried has to let the guest render again
+    // before it asks for the next gap: the retry is only worth anything if the guest moves on.
+    void release() {
+        if (emuenv) {
+            emuenv->gxm.display_queue.release_hold();
+            emuenv = nullptr;
+        }
+    }
+
+    ~DisplayQueueHold() {
+        release();
+    }
+};
+
+bool wait_for_display_queue_gap(EmuEnvState &emuenv, int timeout_ms, DisplayQueueHold &hold) {
     GxmState &gxm = emuenv.gxm;
     const auto started = std::chrono::steady_clock::now();
-    const bool empty = gxm.display_queue.wait_empty_for(std::chrono::milliseconds(timeout_ms));
+    const bool empty = gxm.display_queue.wait_empty_and_hold(std::chrono::milliseconds(timeout_ms));
     const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - started);
 
     if (empty) {
-        LOG_INFO("Savestate: caught the display queue empty after {} ms", waited.count());
+        hold.emuenv = &emuenv;
+        LOG_INFO("Savestate: caught the display queue empty after {} ms and held it", waited.count());
         return true;
     }
 
@@ -1590,7 +1611,8 @@ void MainWindow::on_quicksave_triggered() {
     int attempts = 0;
     for (int attempt = 1; attempt <= max_attempts; attempt++) {
         attempts = attempt;
-        if (!wait_for_display_queue_gap(emuenv, 10000)) {
+        DisplayQueueHold hold;
+        if (!wait_for_display_queue_gap(emuenv, 10000, hold)) {
             statusBar()->showMessage(tr("Quicksave: a frame is still in flight, try again"), 6000);
             return;
         }
@@ -1603,6 +1625,7 @@ void MainWindow::on_quicksave_triggered() {
             succeeded = static_cast<bool>(last);
             return last;
         });
+        hold.release();
         if (succeeded)
             return;
         if (!last.retryable)
@@ -1638,7 +1661,8 @@ void MainWindow::on_quickload_triggered() {
     int attempts = 0;
     for (int attempt = 1; attempt <= max_attempts; attempt++) {
         attempts = attempt;
-        if (!wait_for_display_queue_gap(emuenv, 10000)) {
+        DisplayQueueHold hold;
+        if (!wait_for_display_queue_gap(emuenv, 10000, hold)) {
             statusBar()->showMessage(tr("Quickload: could not catch a frame boundary, try again"), 6000);
             return;
         }
@@ -1652,6 +1676,7 @@ void MainWindow::on_quickload_triggered() {
             succeeded = static_cast<bool>(last);
             return last;
         });
+        hold.release();
         if (succeeded)
             return; // run_with_guest_quiesced has already said so
 
