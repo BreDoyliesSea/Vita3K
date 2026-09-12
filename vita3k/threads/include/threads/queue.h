@@ -194,6 +194,13 @@ public:
         cond_.notify_all();
     }
 
+    // wait_empty(), but a savestate load can end it. Used by a double-buffered producer, which
+    // waits for the frame it has just queued to be taken.
+    void wait_empty_or_abandoned(const std::function<bool()> &abandoned) {
+        std::unique_lock<std::mutex> mlock(mutex_);
+        cond_.wait(mlock, [&]() { return aborted || queue_.empty() || (abandoned && abandoned()); });
+    }
+
     Queue() = default;
     Queue(const Queue &) = delete; // disable copying
     Queue &operator=(const Queue &) = delete; // disable assignment

@@ -21,6 +21,8 @@
 #include <cpu/functions.h>
 #include <emuenv/state.h>
 #include <gxm/state.h>
+#include <renderer/state.h>
+#include <rtc/rtc.h>
 #include <io/functions.h>
 #include <io/state.h>
 #include <kernel/state.h>
@@ -73,6 +75,10 @@ constexpr uint32_t TAG_GXML = 0x4C4D5847U;
 constexpr uint32_t TAG_THRD = 0x44524854U;
 // "SYN2" - rwlock owners, message pipe contents, timers. Optional, so older states still load.
 constexpr uint32_t TAG_SYN2 = 0x324E5953U;
+// "GXMM" - which GPU memory regions were mapped. Optional, so older states still load.
+constexpr uint32_t TAG_GXMM = 0x4D4D5847U;
+// "CLCK" - how far the guest's own clock had run. Optional, so older states still load.
+constexpr uint32_t TAG_CLCK = 0x4B434C43U;
 
 
 // Point a context saved inside an HLE call back at the call itself, so the thread makes it again
@@ -605,6 +611,35 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
         }
     }
 
+    // --- which GPU memory regions are mapped ----------------------------------------------------
+    // sceGxmMapMemory registrations are host state: the guest's registry, and with memory mapping
+    // on a host buffer per region as well. They are not part of guest memory, so a load restores a
+    // guest that expects the regions of the moment the state was taken into a session that has
+    // whichever ones it has now -- and a game that maps and unmaps as it streams does not keep the
+    // same set for long. A vertex stream inside a region that has since been unmapped then has no
+    // buffer behind it: "Could not find matching mapped buffer for vertex stream", measured on
+    // Oddworld: New 'n' Tasty right after a load, with the process going down seconds later.
+    std::vector<uint8_t> gxmm_raw;
+    {
+        put<uint32_t>(gxmm_raw, static_cast<uint32_t>(emuenv.gxm.memory_mapped_regions.size()));
+        for (const auto &[address, info] : emuenv.gxm.memory_mapped_regions) {
+            put<uint32_t>(gxmm_raw, address);
+            put<uint32_t>(gxmm_raw, info.size);
+            put<uint32_t>(gxmm_raw, info.perm);
+        }
+    }
+
+    // --- how far the guest's clock had run ------------------------------------------------------
+    // sceKernelGetProcessTimeWide and friends return rtc_get_ticks(base_tick) - start_tick, which
+    // is real time: the guest's clock keeps running while a state sits on disk. Nothing records it,
+    // so a load leaves the guest with its own last timestamps in memory and a clock that has moved
+    // on by however long ago the save was, and the game sees one enormous frame. Measured on
+    // Oddworld: loading 2 s after the save resumes at 30 fps, loading 12-20 s after it resumes at
+    // 14-16 fps and stays there, with the main thread burning a core in the engine's catch-up work
+    // while the render worker waits for frames that never come.
+    std::vector<uint8_t> clck_raw;
+    put<uint64_t>(clck_raw, rtc_get_ticks(emuenv.kernel.base_tick.tick) - emuenv.kernel.start_tick);
+
     // --- assemble ---------------------------------------------------------------------------
     std::vector<uint8_t> file;
     file.insert(file.end(), std::begin(MAGIC), std::end(MAGIC));
@@ -667,6 +702,16 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
     put<uint64_t>(file, syn2_raw.size());
     put<uint64_t>(file, syn2_raw.size());
     file.insert(file.end(), syn2_raw.begin(), syn2_raw.end());
+
+    put(file, TAG_GXMM);
+    put<uint64_t>(file, gxmm_raw.size());
+    put<uint64_t>(file, gxmm_raw.size());
+    file.insert(file.end(), gxmm_raw.begin(), gxmm_raw.end());
+
+    put(file, TAG_CLCK);
+    put<uint64_t>(file, clck_raw.size());
+    put<uint64_t>(file, clck_raw.size());
+    file.insert(file.end(), clck_raw.begin(), clck_raw.end());
 
     // Write to a temporary and rename into place, so an interrupted save cannot destroy the
     // previous good state.
@@ -764,6 +809,10 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
     size_t thrd_size = 0;
     const uint8_t *syn2_data = nullptr;
     size_t syn2_size = 0;
+    const uint8_t *gxmm_data = nullptr;
+    size_t gxmm_size = 0;
+    const uint8_t *clck_data = nullptr;
+    size_t clck_size = 0;
 
     while (r.need(sizeof(uint32_t) + sizeof(uint64_t) * 2)) {
         uint32_t tag = 0;
@@ -821,6 +870,14 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
         case TAG_SYN2:
             syn2_data = payload;
             syn2_size = static_cast<size_t>(stored);
+            break;
+        case TAG_GXMM:
+            gxmm_data = payload;
+            gxmm_size = static_cast<size_t>(stored);
+            break;
+        case TAG_CLCK:
+            clck_data = payload;
+            clck_size = static_cast<size_t>(stored);
             break;
         default:
             LOG_WARN("Savestate: ignoring unknown chunk 0x{:08X}", tag);
@@ -1056,6 +1113,48 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
     if (!inflate_to(mem_packed, mem_packed_size, mem_raw, mem_raw_size))
         return Result::fail("guest memory chunk is corrupt");
 
+    // --- put the GPU memory mappings back to what the state had -------------------------------
+    // In two halves, because unmapping and mapping have to sit on either side of the memory
+    // restore. With the page table in use, remove_external_mapping copies the host buffer back
+    // over the guest's own pages as it tears a mapping down, so a mapping dropped *after* the
+    // restore would write stale bytes over restored ones. Mapping has the mirror requirement: it
+    // copies the guest's pages into the new buffer, so it has to see the restored contents.
+    //
+    // Unmap first, then. Anything mapped now that the state did not have at the same address and
+    // size goes; the rest is left alone, because tearing a mapping down and building it again
+    // costs a buffer allocation and a copy of the whole region for nothing.
+    std::vector<MemoryMapInfo> state_mappings;
+    if (gxmm_data) {
+        Reader gr{ gxmm_data, gxmm_size, 0 };
+        uint32_t count = 0;
+        if (!gr.get(count))
+            return Result::fail("corrupt GPU memory mapping chunk");
+        state_mappings.resize(count);
+        for (MemoryMapInfo &info : state_mappings) {
+            if (!gr.get(info.offset) || !gr.get(info.size) || !gr.get(info.perm))
+                return Result::fail("corrupt GPU memory mapping chunk");
+        }
+    }
+
+    size_t mappings_dropped = 0;
+    size_t mappings_added = 0;
+    if (gxmm_data) {
+        const auto state_has = [&](Address address, uint32_t size) {
+            return std::any_of(state_mappings.begin(), state_mappings.end(),
+                [&](const MemoryMapInfo &info) { return info.offset == address && info.size == size; });
+        };
+        for (auto ite = emuenv.gxm.memory_mapped_regions.begin(); ite != emuenv.gxm.memory_mapped_regions.end();) {
+            if (state_has(ite->first, ite->second.size)) {
+                ++ite;
+                continue;
+            }
+            if (emuenv.renderer->features.enable_memory_mapping && ite->second.size > 0)
+                emuenv.renderer->unmap_memory(emuenv.mem, Ptr<void>(ite->first));
+            ite = emuenv.gxm.memory_mapped_regions.erase(ite);
+            mappings_dropped++;
+        }
+    }
+
     // --- reconcile the address space --------------------------------------------------------
     // Restoring page contents is only meaningful if the same pages are allocated. Allocations
     // made since the save must go, and allocations freed since must come back, or the guest
@@ -1277,6 +1376,22 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
         }
     }
 
+    // The second half: every region the state had that is not mapped now. After the restore, so
+    // that a mapping which copies the guest's pages into its buffer copies the restored ones.
+    // Called straight rather than through CommandOpcode::MemoryMap, because the render thread is
+    // parked for the whole load and would never pick the command up.
+    for (const MemoryMapInfo &info : state_mappings) {
+        if (emuenv.gxm.memory_mapped_regions.contains(info.offset))
+            continue;
+        emuenv.gxm.memory_mapped_regions.emplace(info.offset, info);
+        if (emuenv.renderer->features.enable_memory_mapping && info.size > 0)
+            emuenv.renderer->map_memory(emuenv.mem, Ptr<void>(info.offset), info.size);
+        mappings_added++;
+    }
+    if (mappings_dropped > 0 || mappings_added > 0)
+        LOG_INFO("Savestate: GPU memory mappings reconciled ({} dropped, {} restored, {} left alone)",
+            mappings_dropped, mappings_added, emuenv.gxm.memory_mapped_regions.size() - mappings_added);
+
     if (freed > 0 || reallocated > 0 || left_alone > 0)
         LOG_INFO("Savestate: address space reconciled ({} released, {} restored, {} left alone)",
             freed, reallocated, left_alone);
@@ -1438,6 +1553,25 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
 
         if (!ok)
             return Result::fail("corrupt sync chunk");
+    }
+
+    // --- put the guest's clock back where the state left it ---------------------------------------
+    // Without this the guest resumes with its own timestamps in memory and a clock that has run on
+    // by however long the state sat unused, so the first frame after a load is as long as that gap.
+    // start_tick is the origin sceKernelGetProcessTimeWide measures from, so moving it forward by
+    // the gap makes the guest's clock continue rather than jump. The wall clock is left alone:
+    // sceRtcGetCurrentTick really should say what time it is now.
+    if (clck_data) {
+        Reader cr{ clck_data, clck_size, 0 };
+        uint64_t guest_elapsed = 0;
+        if (!cr.get(guest_elapsed)) {
+            LOG_ERROR("Savestate: corrupt clock chunk; the guest's clock will jump");
+        } else {
+            const uint64_t now = rtc_get_ticks(emuenv.kernel.base_tick.tick);
+            const uint64_t was = now - emuenv.kernel.start_tick;
+            emuenv.kernel.start_tick = now - guest_elapsed;
+            LOG_INFO("Savestate: guest clock rewound {} us, to {} us", was - guest_elapsed, guest_elapsed);
+        }
     }
 
     // --- restore the rest of the sync primitives (SYN2) ------------------------------------------

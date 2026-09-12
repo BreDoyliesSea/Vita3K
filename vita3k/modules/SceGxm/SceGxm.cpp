@@ -2479,9 +2479,40 @@ EXPORT(int, sceGxmDisplayQueueAddEntry, Ptr<SceGxmSyncObject> oldBuffer, Ptr<Sce
 
     renderer::send_single_command(*emuenv.renderer, nullptr, renderer::CommandOpcode::NewFrame, false, frame, &emuenv.display, active_renderer_context);
 
-    if (emuenv.gxm.params.displayQueueMaxPendingCount == 1)
-        // double buffering, not handled by the queue configuration
-        emuenv.gxm.display_queue.wait_empty();
+    if (emuenv.gxm.params.displayQueueMaxPendingCount == 1) {
+        // Double buffering, not handled by the queue configuration: the guest waits here for the
+        // frame it has just queued to be taken. Say that it is waiting. A thread blocked here used
+        // to report that it was running, and that costs twice over. A savestate pause waits it out
+        // and gives up -- "8390B5B0 UnityGfxDeviceWorker would not stop", 97 times in one Oddworld
+        // session, every quicksave after the first load refused. And when a pause does land on it,
+        // it is suspended *inside* this host call, which a snapshot cannot describe: the load then
+        // restores its guest context underneath a live host frame, and the thread faulted reading
+        // 0x8FCD1940 a quarter of a second after the load, taking the process with it.
+        //
+        // Not restartable, unlike the wait at the top of this call. By here the entry is pushed and
+        // both sync objects' timestamps have moved on, so making the call again would move them a
+        // second time. A save refuses, retryably, while a thread sits here -- which is the point:
+        // this is a moment no state can describe, and refusing it costs a frame.
+        const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
+        auto *const queue = &emuenv.gxm.display_queue;
+        bool reported = false;
+        {
+            const std::lock_guard<std::mutex> thread_lock(thread->mutex);
+            if (thread->status == ThreadStatus::run) {
+                thread->update_status(ThreadStatus::wait, ThreadStatus::run);
+                reported = true;
+            }
+        }
+        {
+            const ScopedWait scoped_wait(*thread, { [queue] { queue->wake_holders(); }, false });
+            queue->wait_empty_or_abandoned([&]() { return thread->wait_abandoned(); });
+        }
+        if (reported) {
+            const std::lock_guard<std::mutex> thread_lock(thread->mutex);
+            if (thread->status == ThreadStatus::wait)
+                thread->update_status(ThreadStatus::run, ThreadStatus::wait);
+        }
+    }
 
     return 0;
 }
