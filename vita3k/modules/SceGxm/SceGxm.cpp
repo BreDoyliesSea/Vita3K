@@ -1537,6 +1537,91 @@ gxm::HostObjectLayout gxm::capture_layout(GxmState &gxm, const MemState &mem) {
     return layout;
 }
 
+std::string gxm::rollback_to_layout(GxmState &gxm, const MemState &mem, const HostObjectLayout &saved, RollbackCounts &out) {
+    const HostObjectLayout live = capture_layout(gxm, mem);
+    const auto extras = [](const std::vector<Address> &saved_list, const std::vector<Address> &live_list) {
+        std::vector<Address> result;
+        for (const Address address : live_list) {
+            if (!std::binary_search(saved_list.begin(), saved_list.end(), address))
+                result.push_back(address);
+        }
+        return result;
+    };
+
+    // Decided before anything is touched.
+    const std::vector<Address> extra_contexts = extras(saved.contexts, live.contexts);
+    const std::vector<Address> extra_render_targets = extras(saved.render_targets, live.render_targets);
+    if (!extra_contexts.empty() || !extra_render_targets.empty()) {
+        return fmt::format("{} context(s) and {} render target(s) were created after the state was taken, and those cannot be destroyed while the render thread is parked",
+            extra_contexts.size(), extra_render_targets.size());
+    }
+
+    const std::vector<Address> extra_vertex = extras(saved.vertex_programs, live.vertex_programs);
+    const std::vector<Address> extra_fragment = extras(saved.fragment_programs, live.fragment_programs);
+    const std::vector<Address> extra_patchers = extras(saved.shader_patchers, live.shader_patchers);
+    const std::vector<Address> extra_sync = extras(saved.sync_objects, live.sync_objects);
+
+    {
+        const std::lock_guard<std::mutex> lock(gxm.shader_patcher_mutex);
+        // Programs first, while the patcher that caches them is still whole. The same steps as
+        // sceGxmShaderPatcherRelease{Vertex,Fragment}Program minus the guest's free callback.
+        for (const Address address : extra_vertex) {
+            SceGxmVertexProgram *const vp = Ptr<SceGxmVertexProgram>(address).get(mem);
+            while (vp->compile_threads_on.load(std::memory_order_acquire) > 0)
+                std::this_thread::yield();
+            for (const Address patcher_address : gxm.shader_patchers) {
+                SceGxmShaderPatcher *const patcher = Ptr<SceGxmShaderPatcher>(patcher_address).get(mem);
+                if (!patcher)
+                    continue;
+                for (auto it = patcher->vertex_program_cache.begin(); it != patcher->vertex_program_cache.end(); ++it) {
+                    if (it->second.address() == address) {
+                        patcher->vertex_program_cache.erase(it);
+                        break;
+                    }
+                }
+            }
+            vp->~SceGxmVertexProgram();
+            out.vertex_programs++;
+        }
+        for (const Address address : extra_fragment) {
+            SceGxmFragmentProgram *const fp = Ptr<SceGxmFragmentProgram>(address).get(mem);
+            while (fp->compile_threads_on.load(std::memory_order_acquire) > 0)
+                std::this_thread::yield();
+            for (const Address patcher_address : gxm.shader_patchers) {
+                SceGxmShaderPatcher *const patcher = Ptr<SceGxmShaderPatcher>(patcher_address).get(mem);
+                if (!patcher)
+                    continue;
+                for (auto it = patcher->fragment_program_cache.begin(); it != patcher->fragment_program_cache.end(); ++it) {
+                    if (it->second.address() == address) {
+                        patcher->fragment_program_cache.erase(it);
+                        break;
+                    }
+                }
+            }
+            fp->~SceGxmFragmentProgram();
+            out.fragment_programs++;
+        }
+        for (const Address address : extra_patchers) {
+            SceGxmShaderPatcher *const patcher = Ptr<SceGxmShaderPatcher>(address).get(mem);
+            if (patcher)
+                patcher->~SceGxmShaderPatcher();
+            gxm.shader_patchers.erase(address);
+            out.shader_patchers++;
+        }
+    }
+    {
+        // The registry entry only. A sync object's host members are a mutex and a condition
+        // variable, which own nothing, and a guest thread still parked on one is released by the
+        // load's restart before the bytes are overwritten.
+        const std::lock_guard<std::mutex> lock(gxm.sync_objects_mutex);
+        for (const Address address : extra_sync) {
+            gxm.sync_objects.erase(Ptr<SceGxmSyncObject>(address).get(mem));
+            out.sync_objects++;
+        }
+    }
+    return {};
+}
+
 bool gxm::scene_in_progress(GxmState &gxm, const MemState &mem) {
     if (!gxm.immediate_context)
         return false;
