@@ -60,8 +60,35 @@ struct HostObjectLayout {
 HostObjectLayout capture_layout(GxmState &gxm, const MemState &mem);
 
 // Empty if every object in `saved` is a live object of the same kind at the same address here,
-// otherwise which one is not. Extra live objects are fine: the restored guest does not know them.
+// otherwise which one is not. Extra live objects are not fine -- see rollback_to_layout.
 std::string check_layout(GxmState &gxm, const MemState &mem, const HostObjectLayout &saved);
+
+// Destroy the host half of every object that is live here but not in `saved`: the ones the guest
+// created after the state was taken. Their guest memory came from the guest's own heap (shader
+// patchers, programs) or from the allocator a load reconciles (sync objects), and a load rewinds
+// both to a moment when that memory was free. Keeping the host half alive across that is what
+// made a quickload of Oddworld die a few seconds later: the rewound guest reused the bytes of a
+// vertex program it had made after the save, the patcher's cache still handed that program out on
+// the next key hit, and the draw read its renderer_data as guest data (measured: refcount
+// 2409865712, renderer_data 0x3f800000 -- the float 1.0 -- program 0x1; then a fault in
+// gxmSetUniformBuffers at 0x290000002C, or a hang). Programs are taken out of their patcher's
+// cache and destructed in place, patchers likewise, sync objects dropped from the registry; the
+// bytes are left for the restore to overwrite with what the guest had there. Nothing is handed
+// back to the guest heap: the load is about to put that heap back as it was.
+//
+// Render targets and contexts are destroyed through the render thread, which is parked for the
+// whole load, so a state that has extras of those kinds is refused (non-empty return, nothing
+// touched) rather than left half-handled. Counts of what was destroyed come back in `out`.
+struct RollbackCounts {
+    uint32_t vertex_programs = 0;
+    uint32_t fragment_programs = 0;
+    uint32_t shader_patchers = 0;
+    uint32_t sync_objects = 0;
+    uint32_t total() const {
+        return vertex_programs + fragment_programs + shader_patchers + sync_objects;
+    }
+};
+std::string rollback_to_layout(GxmState &gxm, const MemState &mem, const HostObjectLayout &saved, RollbackCounts &out);
 
 // Whether the guest is between sceGxmBeginScene and sceGxmEndScene on its immediate context. The
 // renderer mirrors this once it has run everything submitted, so a savestate taken or loaded at
