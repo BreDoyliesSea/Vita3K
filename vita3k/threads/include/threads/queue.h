@@ -21,6 +21,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <queue>
@@ -101,6 +102,12 @@ public:
 
     void abort() {
         aborted = true;
+        // A hold must not outlive the queue it holds: shutting down while one is in place would
+        // leave a guest thread waiting in push() for a release that is no longer coming.
+        {
+            std::lock_guard<std::mutex> mlock(mutex_);
+            held_ = false;
+        }
         condempty_.notify_all();
         cond_.notify_all();
     }
@@ -113,6 +120,7 @@ public:
         std::queue<T> empty;
         std::swap(queue_, empty);
         aborted = false;
+        held_ = false;
     }
 
     void wait_empty() {
@@ -128,6 +136,64 @@ public:
         return cond_.wait_for(mlock, timeout, [&]() { return aborted || queue_.empty(); });
     }
 
+    // The same, but the queue stays empty until release_hold(): push() waits, as it already does
+    // when the queue is full. A savestate needs the empty moment to last long enough to stop the
+    // guest, and merely observing it is not enough to get it. pop() notifies cond_, which wakes
+    // both this wait and the guest thread blocked in push() waiting for the slot that just freed,
+    // so whoever takes the mutex first decides; when a game keeps the queue full - every game
+    // measured here runs it at depth 1 - the pusher usually wins and the next entry is in before
+    // the guest can be stopped. Measured on Gravity Rush: 289 of 289 quickload attempts found one
+    // entry again 24-38 ms after catching the queue empty, and 3 of 10 loads gave up after 60
+    // attempts. Holding it closes that window instead of racing it. Taking the empty reading and
+    // the hold under one lock is the point of this being one call.
+    bool wait_empty_and_hold(const std::chrono::milliseconds timeout) {
+        std::unique_lock<std::mutex> mlock(mutex_);
+        if (!cond_.wait_for(mlock, timeout, [&]() { return aborted || queue_.empty(); }))
+            return false;
+        held_ = true;
+        return true;
+    }
+
+    void release_hold() {
+        {
+            std::lock_guard<std::mutex> mlock(mutex_);
+            held_ = false;
+        }
+        cond_.notify_all();
+    }
+
+    bool is_held() {
+        std::lock_guard<std::mutex> mlock(mutex_);
+        return held_;
+    }
+
+    // Where a producer waits for room, instead of inside push(). push() blocks on a full queue too,
+    // but by then the caller's own call has done its work, and a savestate load can only put a
+    // thread back at the *start* of the call it is parked in. Waiting here - before that work -
+    // keeps the producer restartable. It is also what makes a hold effective: a thread already
+    // blocked inside push() is past every gate, and is released by the same pop() that hands the
+    // savestate its gap. This is ordinary frame pacing, so it does not touch the thread's status.
+    void wait_for_space(const std::function<bool()> &abandoned) {
+        std::unique_lock<std::mutex> mlock(mutex_);
+        cond_.wait(mlock, [&]() {
+            return aborted || queue_.size() < maxPendingCount_ || (abandoned && abandoned());
+        });
+    }
+
+    // Waiting out a hold is not ordinary pacing: the hold is kept across the guest being stopped,
+    // so a thread waiting here has to report that it is waiting or the quiesce waits for a thread
+    // that cannot move. Kept separate from wait_for_space precisely so that reporting happens only
+    // at the few moments a savestate asks for, not on every frame.
+    void wait_while_held(const std::function<bool()> &abandoned) {
+        std::unique_lock<std::mutex> mlock(mutex_);
+        cond_.wait(mlock, [&]() { return aborted || !held_ || (abandoned && abandoned()); });
+    }
+
+    // For a waiter's WaitRelease: ends wait_while_held without releasing the hold itself.
+    void wake_holders() {
+        cond_.notify_all();
+    }
+
     Queue() = default;
     Queue(const Queue &) = delete; // disable copying
     Queue &operator=(const Queue &) = delete; // disable assignment
@@ -137,6 +203,7 @@ public:
     }
 
 private:
+    bool held_ = false;
     std::condition_variable cond_;
     std::condition_variable condempty_;
     std::queue<T> queue_;
