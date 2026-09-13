@@ -240,6 +240,12 @@ public:
         target = new_target;
     }
 
+    // A savestate load is destroying this render target (renderer::forget_render_target).
+    void forget_render_target(const VKRenderTarget *old_target) {
+        if (target == old_target)
+            target = nullptr;
+    }
+
     void clear_surfaces_changed() {
         cpu_surfaces_changed.clear();
     }

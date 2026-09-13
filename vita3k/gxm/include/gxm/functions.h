@@ -29,6 +29,10 @@
 struct EmuEnvState;
 struct GxmState;
 
+namespace renderer {
+struct State;
+}
+
 namespace gxm {
 // Guest byte ranges that hold host objects.
 //
@@ -61,7 +65,7 @@ HostObjectLayout capture_layout(GxmState &gxm, const MemState &mem);
 
 // Empty if every object in `saved` is a live object of the same kind at the same address here,
 // otherwise which one is not. Extra live objects are not fine -- see rollback_to_layout.
-std::string check_layout(GxmState &gxm, const MemState &mem, const HostObjectLayout &saved);
+std::string check_layout(GxmState &gxm, const MemState &mem, const HostObjectLayout &saved, bool render_targets_handled = false);
 
 // Destroy the host half of every object that is live here but not in `saved`: the ones the guest
 // created after the state was taken. Their guest memory came from the guest's own heap (shader
@@ -84,11 +88,30 @@ struct RollbackCounts {
     uint32_t fragment_programs = 0;
     uint32_t shader_patchers = 0;
     uint32_t sync_objects = 0;
+    uint32_t render_targets = 0;
     uint32_t total() const {
-        return vertex_programs + fragment_programs + shader_patchers + sync_objects;
+        return vertex_programs + fragment_programs + shader_patchers + sync_objects + render_targets;
     }
 };
-std::string rollback_to_layout(GxmState &gxm, const MemState &mem, const HostObjectLayout &saved, RollbackCounts &out);
+
+// How a render target was created: the SceGxmRenderTargetParams the guest gave, kept in the
+// wrapper. A savestate records these so a load can make again a render target the session has
+// since destroyed. Measured (Borderlands 2, 30 cycles): the game makes a 512x512 target 46 s
+// after boot and destroys it 63 s later for good, so every state taken in that minute names a
+// render target the session lacks once it is gone; the load 130 ms after the destroy was refused.
+struct RenderTargetIdentity {
+    Address address = 0;
+    SceGxmRenderTargetParams params{};
+};
+std::vector<RenderTargetIdentity> capture_render_target_identities(GxmState &gxm, const MemState &mem);
+
+// Recreate render targets the state has and the session lacks, at their addresses, after the
+// memory restore (their wrappers' bytes are back; the renderer pointer in them belongs to the
+// saved session and is not trusted). Backend objects are made on the backend directly, because
+// the render thread is parked for the whole load: see renderer::create_render_target_while_parked,
+// which refuses on OpenGL. Returns why on failure.
+std::string recreate_render_targets(GxmState &gxm, const MemState &mem, renderer::State &renderer, const std::vector<RenderTargetIdentity> &missing, uint32_t &recreated);
+std::string rollback_to_layout(GxmState &gxm, const MemState &mem, renderer::State &renderer, const HostObjectLayout &saved, RollbackCounts &out);
 
 // Whether the guest is between sceGxmBeginScene and sceGxmEndScene on its immediate context. The
 // renderer mirrors this once it has run everything submitted, so a savestate taken or loaded at

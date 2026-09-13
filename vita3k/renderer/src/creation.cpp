@@ -96,61 +96,110 @@ COMMAND(handle_destroy_context) {
     complete_command(renderer, helper, 0);
 }
 
-COMMAND(handle_create_render_target) {
-    TRACY_FUNC_COMMANDS(handle_create_render_target);
-    std::unique_ptr<RenderTarget> *render_target = helper.pop<std::unique_ptr<RenderTarget> *>();
-    SceGxmRenderTargetParams *params = helper.pop<SceGxmRenderTargetParams *>();
-
+// The body of CreateRenderTarget, shared with create_render_target_while_parked.
+static bool create_render_target_now(State &renderer, std::unique_ptr<RenderTarget> &render_target, const SceGxmRenderTargetParams &params, const FeatureState &features) {
     bool result = false;
 
     switch (renderer.current_backend) {
     case Backend::OpenGL:
-        result = gl::create(dynamic_cast<gl::GLState &>(renderer), *render_target, *params, features);
+        result = gl::create(dynamic_cast<gl::GLState &>(renderer), render_target, params, features);
         break;
 
     case Backend::Vulkan:
-        result = vulkan::create(dynamic_cast<vulkan::VKState &>(renderer), *render_target, *params, features);
+        result = vulkan::create(dynamic_cast<vulkan::VKState &>(renderer), render_target, params, features);
         break;
 
     default:
         REPORT_MISSING(renderer.current_backend);
         break;
     }
-    (*render_target)->multisample_mode = params->multisampleMode;
-    (*render_target)->has_macroblock_sync = (params->flags & SCE_GXM_RENDER_TARGET_MACROTILE_SYNC);
-    if ((*render_target)->has_macroblock_sync) {
+    if (!result || !render_target)
+        return false;
+    render_target->multisample_mode = params.multisampleMode;
+    render_target->has_macroblock_sync = (params.flags & SCE_GXM_RENDER_TARGET_MACROTILE_SYNC);
+    if (render_target->has_macroblock_sync) {
         // there are between 1 and 4 macroblocks in the x and y direction
-        uint16_t nb_macroblocks_x = (params->flags >> 8) & 0b111;
-        uint16_t nb_macroblocks_y = (params->flags >> 12) & 0b111;
+        uint16_t nb_macroblocks_x = (params.flags >> 8) & 0b111;
+        uint16_t nb_macroblocks_y = (params.flags >> 12) & 0b111;
 
         // the width and height should be multiple of 128
-        (*render_target)->macroblock_width = static_cast<uint16_t>((params->width / nb_macroblocks_x) * renderer.res_multiplier);
-        (*render_target)->macroblock_height = static_cast<uint16_t>((params->height / nb_macroblocks_y) * renderer.res_multiplier);
+        render_target->macroblock_width = static_cast<uint16_t>((params.width / nb_macroblocks_x) * renderer.res_multiplier);
+        render_target->macroblock_height = static_cast<uint16_t>((params.height / nb_macroblocks_y) * renderer.res_multiplier);
+    }
+    return true;
+}
+
+COMMAND(handle_create_render_target) {
+    TRACY_FUNC_COMMANDS(handle_create_render_target);
+    std::unique_ptr<RenderTarget> *render_target = helper.pop<std::unique_ptr<RenderTarget> *>();
+    SceGxmRenderTargetParams *params = helper.pop<SceGxmRenderTargetParams *>();
+
+    const bool result = create_render_target_now(renderer, *render_target, *params, features);
+    complete_command(renderer, helper, result);
+}
+
+// The body of DestroyRenderTarget, shared with destroy_render_target_while_parked.
+static void destroy_render_target_now(State &renderer, std::unique_ptr<RenderTarget> &render_target) {
+    switch (renderer.current_backend) {
+    case Backend::OpenGL:
+        break;
+
+    case Backend::Vulkan:
+        vulkan::destroy(dynamic_cast<vulkan::VKState &>(renderer), render_target);
+        break;
+
+    default:
+        REPORT_MISSING(renderer.current_backend);
+        break;
     }
 
-    complete_command(renderer, helper, result);
+    render_target.reset();
 }
 
 COMMAND(handle_destroy_render_target) {
     TRACY_FUNC_COMMANDS(handle_destroy_render_target);
     std::unique_ptr<RenderTarget> *render_target = helper.pop<std::unique_ptr<RenderTarget> *>();
 
-    switch (renderer.current_backend) {
-    case Backend::OpenGL:
-        break;
-
-    case Backend::Vulkan:
-        vulkan::destroy(dynamic_cast<vulkan::VKState &>(renderer), *render_target);
-        break;
-
-    default:
-        REPORT_MISSING(renderer.current_backend);
-        break;
-    }
-
-    render_target->reset();
+    destroy_render_target_now(renderer, *render_target);
 
     complete_command(renderer, helper, 0);
+}
+
+bool create_render_target_while_parked(State &state, std::unique_ptr<RenderTarget> &rt, const SceGxmRenderTargetParams *params) {
+    // OpenGL's context is current on the render thread, which is parked.
+    if (state.current_backend != Backend::Vulkan)
+        return false;
+    return create_render_target_now(state, rt, *params, state.features);
+}
+
+void destroy_render_target_while_parked(State &state, std::unique_ptr<RenderTarget> &rt) {
+    if (!rt)
+        return;
+    destroy_render_target_now(state, rt);
+}
+
+void forget_render_target(State &state, Context &context, const RenderTarget *rt) {
+    if (!rt)
+        return;
+    if (context.current_render_target == rt)
+        context.current_render_target = nullptr;
+    switch (state.current_backend) {
+    case Backend::OpenGL: {
+        gl::GLContext &gl_context = static_cast<gl::GLContext &>(context);
+        if (gl_context.render_target == rt)
+            gl_context.render_target = nullptr;
+        break;
+    }
+    case Backend::Vulkan: {
+        vulkan::VKContext &vk_context = static_cast<vulkan::VKContext &>(context);
+        if (vk_context.render_target == rt)
+            vk_context.render_target = nullptr;
+        dynamic_cast<vulkan::VKState &>(state).surface_cache.forget_render_target(static_cast<const vulkan::VKRenderTarget *>(rt));
+        break;
+    }
+    default:
+        break;
+    }
 }
 
 COMMAND(handle_memory_map) {

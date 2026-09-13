@@ -73,6 +73,10 @@ constexpr uint32_t TAG_FTBL = 0x4C425446U;
 constexpr uint32_t TAG_NGSL = 0x4C53474EU;
 // "GXML" - where every GXM host object was. Optional, so older states still load.
 constexpr uint32_t TAG_GXML = 0x4C4D5847U;
+// "GXRT" - how every render target was made (its SceGxmRenderTargetParams), so a load can make one
+// the session has since destroyed. Optional: a state without it still loads, into a session that
+// still has every render target it names.
+constexpr uint32_t TAG_GXRT = 0x54525847U;
 // "THRD" - each thread's status and callback depth. A load needs it to restart waits.
 constexpr uint32_t TAG_THRD = 0x44524854U;
 // "THRI" - what each thread is made of (name, entry, priority, affinity, stack, TLS, initial
@@ -633,6 +637,26 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
         }
     }
 
+    // --- how each render target was made -------------------------------------------------------
+    // See gxm::recreate_render_targets: a game that destroys a render target in the seconds after
+    // a save leaves the state naming one the session lacks, and this is what it takes to make it
+    // again.
+    std::vector<uint8_t> gxrt_raw;
+    {
+        const std::vector<gxm::RenderTargetIdentity> identities = gxm::capture_render_target_identities(emuenv.gxm, emuenv.mem);
+        put<uint32_t>(gxrt_raw, static_cast<uint32_t>(identities.size()));
+        for (const gxm::RenderTargetIdentity &identity : identities) {
+            put<uint32_t>(gxrt_raw, identity.address);
+            put<uint32_t>(gxrt_raw, identity.params.flags);
+            put<uint16_t>(gxrt_raw, identity.params.width);
+            put<uint16_t>(gxrt_raw, identity.params.height);
+            put<uint16_t>(gxrt_raw, identity.params.scenesPerFrame);
+            put<uint32_t>(gxrt_raw, static_cast<uint32_t>(identity.params.multisampleMode));
+            put<uint32_t>(gxrt_raw, identity.params.multisampleLocations);
+            put<int32_t>(gxrt_raw, identity.params.driverMemBlock);
+        }
+    }
+
     // --- which GPU memory regions are mapped ----------------------------------------------------
     // sceGxmMapMemory registrations are host state: the guest's registry, and with memory mapping
     // on a host buffer per region as well. They are not part of guest memory, so a load restores a
@@ -719,6 +743,11 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
     put<uint64_t>(file, gxml_raw.size());
     put<uint64_t>(file, gxml_raw.size());
     file.insert(file.end(), gxml_raw.begin(), gxml_raw.end());
+
+    put(file, TAG_GXRT);
+    put<uint64_t>(file, gxrt_raw.size());
+    put<uint64_t>(file, gxrt_raw.size());
+    file.insert(file.end(), gxrt_raw.begin(), gxrt_raw.end());
 
     // --- THRI: what each thread is made of -----------------------------------------------------
     // Enough to recreate one the session has since deleted: see savestate::load. Its TLS block is
@@ -941,6 +970,8 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
     size_t ngsl_size = 0;
     const uint8_t *gxml_data = nullptr;
     size_t gxml_size = 0;
+    const uint8_t *gxrt_data = nullptr;
+    size_t gxrt_size = 0;
     const uint8_t *thrd_data = nullptr;
     size_t thrd_size = 0;
     const uint8_t *thri_data = nullptr;
@@ -1006,6 +1037,10 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
         case TAG_GXML:
             gxml_data = payload;
             gxml_size = static_cast<size_t>(stored);
+            break;
+        case TAG_GXRT:
+            gxrt_data = payload;
+            gxrt_size = static_cast<size_t>(stored);
             break;
         case TAG_THRD:
             thrd_data = payload;
@@ -1270,6 +1305,14 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
     // They are not moved by a load, so if the game's heap put them elsewhere in this session the
     // restored guest would hand back addresses with no live object behind them. Refuse instead.
     std::optional<gxm::HostObjectLayout> gxm_layout;
+    // Render targets the state has and the session lacks: the guest destroyed them since the save.
+    // Measured on Borderlands 2 (30 cycles, logs/rt-diag-30-20260913-123611.log): the game makes a
+    // 512x512 target 46 s after boot and destroys it 63 s later for good, so a state taken in that
+    // minute names one the session lacks once it is gone, and the load 130 ms after the destroy
+    // was refused. With GXRT they are made again after the restore (gxm::recreate_render_targets);
+    // decided here, before anything is touched, so a state without GXRT gets the old refusal and
+    // OpenGL, where a parked render thread cannot make one, refuses too.
+    std::vector<gxm::RenderTargetIdentity> render_targets_to_recreate;
     if (gxml_data) {
         Reader gr{ gxml_data, gxml_size, 0 };
         gxm::HostObjectLayout layout;
@@ -1283,7 +1326,37 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
                     return Result::fail("corrupt GXM layout chunk");
             }
         }
-        const std::string why = gxm::check_layout(emuenv.gxm, emuenv.mem, layout);
+        std::map<Address, SceGxmRenderTargetParams> made;
+        if (gxrt_data) {
+            Reader rr{ gxrt_data, gxrt_size, 0 };
+            uint32_t count = 0;
+            if (!rr.get(count))
+                return Result::fail("corrupt render target chunk");
+            for (uint32_t i = 0; i < count; i++) {
+                Address address = 0;
+                SceGxmRenderTargetParams params{};
+                uint32_t multisample_mode = 0;
+                if (!rr.get(address) || !rr.get(params.flags) || !rr.get(params.width) || !rr.get(params.height) || !rr.get(params.scenesPerFrame)
+                    || !rr.get(multisample_mode) || !rr.get(params.multisampleLocations) || !rr.get(params.driverMemBlock))
+                    return Result::fail("corrupt render target chunk");
+                params.multisampleMode = static_cast<SceGxmMultisampleMode>(multisample_mode);
+                made[address] = params;
+            }
+        }
+        {
+            const gxm::HostObjectLayout live = gxm::capture_layout(emuenv.gxm, emuenv.mem);
+            for (const Address address : layout.render_targets) {
+                if (std::binary_search(live.render_targets.begin(), live.render_targets.end(), address))
+                    continue;
+                const auto it = made.find(address);
+                if (it == made.end())
+                    return Result::fail(fmt::format("the graphics objects are laid out differently in this session: the state has a render target at {}, this session has none there, and the state does not say how it was made", log_hex(address)));
+                if (emuenv.renderer->current_backend != renderer::Backend::Vulkan)
+                    return Result::fail(fmt::format("the graphics objects are laid out differently in this session: the state has a render target at {} that this session lacks, and only Vulkan can make one while the render thread is parked", log_hex(address)));
+                render_targets_to_recreate.push_back({ address, it->second });
+            }
+        }
+        const std::string why = gxm::check_layout(emuenv.gxm, emuenv.mem, layout, true);
         if (!why.empty())
             return Result::fail("the graphics objects are laid out differently in this session: " + why);
         gxm_layout = std::move(layout);
@@ -1426,12 +1499,12 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
     // this can raise happens before anything is touched.
     if (gxm_layout) {
         gxm::RollbackCounts rolled;
-        const std::string why = gxm::rollback_to_layout(emuenv.gxm, emuenv.mem, *gxm_layout, rolled);
+        const std::string why = gxm::rollback_to_layout(emuenv.gxm, emuenv.mem, *emuenv.renderer, *gxm_layout, rolled);
         if (!why.empty())
             return Result::fail("the graphics objects cannot be put back to what the state had: " + why);
         if (rolled.total() > 0)
-            LOG_INFO("Savestate: destroyed {} vertex program(s), {} fragment program(s), {} shader patcher(s) and {} sync object(s) the guest created after the save",
-                rolled.vertex_programs, rolled.fragment_programs, rolled.shader_patchers, rolled.sync_objects);
+            LOG_INFO("Savestate: destroyed {} vertex program(s), {} fragment program(s), {} shader patcher(s), {} sync object(s) and {} render target(s) the guest created after the save",
+                rolled.vertex_programs, rolled.fragment_programs, rolled.shader_patchers, rolled.sync_objects, rolled.render_targets);
     }
     std::vector<std::pair<Address, uint32_t>> host_owned_ranges;
     gxm::collect_host_owned_ranges(emuenv.gxm, emuenv.mem, host_owned_ranges);
@@ -1644,6 +1717,20 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
     // Must happen after the address space has been reconciled and before any thread runs again.
     // Optional: states written before this chunk existed simply do not carry it, and are loaded
     // as they were.
+    // --- recreate the render targets the guest destroyed since the save --------------------------
+    // Memory is back, so each wrapper holds the state's bytes -- among them a renderer pointer the
+    // saved session owned, which is not trusted: a fresh wrapper is built over them and the backend
+    // object made on the backend directly, the render thread being parked. Decided above, where a
+    // state that cannot say how a target was made, or a backend that cannot make one here, refused.
+    if (!render_targets_to_recreate.empty()) {
+        uint32_t recreated_targets = 0;
+        const std::string why = gxm::recreate_render_targets(emuenv.gxm, emuenv.mem, *emuenv.renderer, render_targets_to_recreate, recreated_targets);
+        if (recreated_targets > 0)
+            LOG_INFO("Savestate: recreated {} render target(s) the guest had destroyed since the save", recreated_targets);
+        if (!why.empty())
+            LOG_ERROR("Savestate: {}", why);
+    }
+
     // --- recreate the threads the guest deleted since the save --------------------------------
     // Memory is back, so their stacks and TLS blocks exist again with the state's bytes; the
     // reconciliation above allocated them like every other region. Each comes up under its saved
