@@ -21,6 +21,7 @@
 #include <config/version.h>
 #include <cpu/functions.h>
 #include <emuenv/state.h>
+#include <audio/state.h>
 #include <gxm/state.h>
 #include <renderer/state.h>
 #include <rtc/rtc.h>
@@ -78,6 +79,11 @@ constexpr uint32_t TAG_THRD = 0x44524854U;
 // registers), so a thread the session no longer has can be recreated under its ID. Optional, so
 // older states still load -- into a session that still has every thread they need.
 constexpr uint32_t TAG_THRI = 0x49524854U;
+// "SYNI" - what each kernel sync object was made of (kind, name, attr, initial values), so one the
+// session has deleted can be put back under its UID. Optional, so older states still load.
+constexpr uint32_t TAG_SYNI = 0x494E5953U;
+// "AUDP" - each audio out port's configuration, likewise. Optional.
+constexpr uint32_t TAG_AUDP = 0x50445541U;
 // "SYN2" - rwlock owners, message pipe contents, timers. Optional, so older states still load.
 constexpr uint32_t TAG_SYN2 = 0x324E5953U;
 // "GXMM" - which GPU memory regions were mapped. Optional, so older states still load.
@@ -745,10 +751,83 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
     put<uint64_t>(file, thrd_raw.size());
     file.insert(file.end(), thrd_raw.begin(), thrd_raw.end());
 
+    // --- SYNI: what each sync object is made of -------------------------------------------------
+    // For the ones the session deletes between a save and a load: a worker thread's mutex goes
+    // with the worker. See savestate::load.
+    std::vector<uint8_t> syni_raw;
+    {
+        const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
+        put<uint32_t>(syni_raw, static_cast<uint32_t>(emuenv.kernel.semaphores.size()));
+        for (const auto &[uid, sema] : emuenv.kernel.semaphores) {
+            put(syni_raw, uid);
+            put_string(syni_raw, sema ? std::string(sema->name) : std::string());
+            put<uint32_t>(syni_raw, sema ? sema->attr : 0);
+            put<int32_t>(syni_raw, sema ? sema->init_val : 0);
+            put<int32_t>(syni_raw, sema ? sema->max : 0);
+        }
+        put<uint32_t>(syni_raw, static_cast<uint32_t>(emuenv.kernel.eventflags.size()));
+        for (const auto &[uid, ef] : emuenv.kernel.eventflags) {
+            put(syni_raw, uid);
+            put_string(syni_raw, ef ? std::string(ef->name) : std::string());
+            put<uint32_t>(syni_raw, ef ? ef->attr : 0);
+            put<uint32_t>(syni_raw, ef ? static_cast<uint32_t>(ef->flags) : 0);
+        }
+        const auto put_mutexes = [&syni_raw](const MutexPtrs &mutexes) {
+            put<uint32_t>(syni_raw, static_cast<uint32_t>(mutexes.size()));
+            for (const auto &[uid, mutex] : mutexes) {
+                put(syni_raw, uid);
+                put_string(syni_raw, mutex ? std::string(mutex->name) : std::string());
+                put<uint32_t>(syni_raw, mutex ? mutex->attr : 0);
+                put<int32_t>(syni_raw, mutex ? mutex->init_count : 0);
+                put<uint32_t>(syni_raw, mutex ? mutex->workarea.address() : 0);
+            }
+        };
+        put_mutexes(emuenv.kernel.mutexes);
+        put_mutexes(emuenv.kernel.lwmutexes);
+        const auto put_condvars = [&syni_raw](const CondvarPtrs &condvars) {
+            put<uint32_t>(syni_raw, static_cast<uint32_t>(condvars.size()));
+            for (const auto &[uid, cv] : condvars) {
+                put(syni_raw, uid);
+                put_string(syni_raw, cv ? std::string(cv->name) : std::string());
+                put<uint32_t>(syni_raw, cv ? cv->attr : 0);
+                put<SceUID>(syni_raw, (cv && cv->associated_mutex) ? cv->associated_mutex->uid : 0);
+            }
+        };
+        put_condvars(emuenv.kernel.condvars);
+        put_condvars(emuenv.kernel.lwcondvars);
+    }
+
+    // --- AUDP: each audio out port's configuration ---------------------------------------------
+    std::vector<uint8_t> audp_raw;
+    {
+        const std::lock_guard<std::mutex> lock(emuenv.audio.mutex);
+        put<uint32_t>(audp_raw, static_cast<uint32_t>(emuenv.audio.out_ports.size()));
+        for (const auto &[id, port] : emuenv.audio.out_ports) {
+            put<int32_t>(audp_raw, id);
+            put<int32_t>(audp_raw, port ? port->type : 0);
+            put<int32_t>(audp_raw, port ? port->len : 0);
+            put<int32_t>(audp_raw, port ? port->freq : 0);
+            put<int32_t>(audp_raw, port ? port->mode : 0);
+            put<int32_t>(audp_raw, port ? port->left_channel_volume : 0);
+            put<int32_t>(audp_raw, port ? port->right_channel_volume : 0);
+            put<float>(audp_raw, port ? port->volume : 1.0f);
+        }
+    }
+
     put(file, TAG_THRI);
     put<uint64_t>(file, thri_raw.size());
     put<uint64_t>(file, thri_raw.size());
     file.insert(file.end(), thri_raw.begin(), thri_raw.end());
+
+    put(file, TAG_SYNI);
+    put<uint64_t>(file, syni_raw.size());
+    put<uint64_t>(file, syni_raw.size());
+    file.insert(file.end(), syni_raw.begin(), syni_raw.end());
+
+    put(file, TAG_AUDP);
+    put<uint64_t>(file, audp_raw.size());
+    put<uint64_t>(file, audp_raw.size());
+    file.insert(file.end(), audp_raw.begin(), audp_raw.end());
 
     put(file, TAG_SYN2);
     put<uint64_t>(file, syn2_raw.size());
@@ -866,6 +945,10 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
     size_t thrd_size = 0;
     const uint8_t *thri_data = nullptr;
     size_t thri_size = 0;
+    const uint8_t *syni_data = nullptr;
+    size_t syni_size = 0;
+    const uint8_t *audp_data = nullptr;
+    size_t audp_size = 0;
     const uint8_t *syn2_data = nullptr;
     size_t syn2_size = 0;
     const uint8_t *gxmm_data = nullptr;
@@ -931,6 +1014,14 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
         case TAG_THRI:
             thri_data = payload;
             thri_size = static_cast<size_t>(stored);
+            break;
+        case TAG_SYNI:
+            syni_data = payload;
+            syni_size = static_cast<size_t>(stored);
+            break;
+        case TAG_AUDP:
+            audp_data = payload;
+            audp_size = static_cast<size_t>(stored);
             break;
         case TAG_SYN2:
             syn2_data = payload;
@@ -1574,6 +1665,225 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
     if (recreated > 0)
         LOG_INFO("Savestate: recreated {} thread(s) the guest had deleted since the save", recreated);
 
+    // --- put back the kernel objects and audio ports the guest deleted since the save ------------
+    // The same defect as the threads, one level down: a worker's mutex and audio port are made and
+    // deleted with it (Borderlands 2: one "RADSS Mutex" and one 704-sample stereo port per RADSS
+    // Thread, both by RenderingThread), so a state's worker comes back holding IDs the session has
+    // reused or dropped -- measured as UNKNOWN_MUTEX_ID and INVALID_PORT on its first calls after
+    // the load. Objects the state has and the session lacks are recreated under their IDs (counts
+    // and owners are set by the sync-primitive pass below); objects the session has and the state
+    // lacks are deleted. Both from SYNI/AUDP; a state without them loads as before.
+    uint32_t objects_recreated = 0, objects_deleted = 0, ports_recreated = 0, ports_closed = 0;
+    if (syni_data) {
+        Reader nr{ syni_data, syni_size, 0 };
+        bool ok = true;
+        const auto read_count = [&](uint32_t &count) { return ok && (ok = nr.get(count)); };
+        // Semaphores.
+        {
+            uint32_t count = 0;
+            std::set<SceUID> in_state;
+            if (read_count(count)) {
+                for (uint32_t i = 0; i < count && ok; i++) {
+                    SceUID uid = 0;
+                    std::string name;
+                    uint32_t attr = 0;
+                    int32_t init_val = 0, max_val = 0;
+                    ok = nr.get(uid) && nr.get_string(name) && nr.get(attr) && nr.get(init_val) && nr.get(max_val);
+                    if (!ok)
+                        break;
+                    in_state.insert(uid);
+                    bool present;
+                    {
+                        const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
+                        present = emuenv.kernel.semaphores.contains(uid);
+                    }
+                    if (!present) {
+                        semaphore_recreate(emuenv.kernel, uid, name.c_str(), attr, init_val, max_val);
+                        objects_recreated++;
+                    }
+                }
+                std::vector<SceUID> extra;
+                {
+                    const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
+                    for (const auto &[uid, _] : emuenv.kernel.semaphores)
+                        if (!in_state.contains(uid))
+                            extra.push_back(uid);
+                }
+                for (const SceUID uid : extra)
+                    if (semaphore_delete(emuenv.kernel, "savestate", 0, uid) == SCE_KERNEL_OK)
+                        objects_deleted++;
+            }
+        }
+        // Event flags.
+        {
+            uint32_t count = 0;
+            std::set<SceUID> in_state;
+            if (read_count(count)) {
+                for (uint32_t i = 0; i < count && ok; i++) {
+                    SceUID uid = 0;
+                    std::string name;
+                    uint32_t attr = 0, flags = 0;
+                    ok = nr.get(uid) && nr.get_string(name) && nr.get(attr) && nr.get(flags);
+                    if (!ok)
+                        break;
+                    in_state.insert(uid);
+                    bool present;
+                    {
+                        const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
+                        present = emuenv.kernel.eventflags.contains(uid);
+                    }
+                    if (!present) {
+                        eventflag_recreate(emuenv.kernel, uid, name.c_str(), attr, flags);
+                        objects_recreated++;
+                    }
+                }
+                std::vector<SceUID> extra;
+                {
+                    const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
+                    for (const auto &[uid, _] : emuenv.kernel.eventflags)
+                        if (!in_state.contains(uid))
+                            extra.push_back(uid);
+                }
+                for (const SceUID uid : extra)
+                    if (eventflag_delete(emuenv.kernel, "savestate", 0, uid) == SCE_KERNEL_OK)
+                        objects_deleted++;
+            }
+        }
+        // Mutexes, heavy then light.
+        for (const SyncWeight weight : { SyncWeight::Heavy, SyncWeight::Light }) {
+            uint32_t count = 0;
+            std::set<SceUID> in_state;
+            if (!read_count(count))
+                break;
+            const MutexPtrs &table = weight == SyncWeight::Heavy ? emuenv.kernel.mutexes : emuenv.kernel.lwmutexes;
+            for (uint32_t i = 0; i < count && ok; i++) {
+                SceUID uid = 0;
+                std::string name;
+                uint32_t attr = 0, workarea = 0;
+                int32_t init_count = 0;
+                ok = nr.get(uid) && nr.get_string(name) && nr.get(attr) && nr.get(init_count) && nr.get(workarea);
+                if (!ok)
+                    break;
+                in_state.insert(uid);
+                bool present;
+                {
+                    const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
+                    present = table.contains(uid);
+                }
+                if (!present) {
+                    mutex_recreate(emuenv.kernel, uid, name.c_str(), attr, init_count, Ptr<SceKernelLwMutexWork>(workarea), weight);
+                    objects_recreated++;
+                }
+            }
+            std::vector<SceUID> extra;
+            {
+                const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
+                for (const auto &[uid, _] : table)
+                    if (!in_state.contains(uid))
+                        extra.push_back(uid);
+            }
+            for (const SceUID uid : extra)
+                if (mutex_delete(emuenv.kernel, "savestate", 0, uid, weight) == SCE_KERNEL_OK)
+                    objects_deleted++;
+        }
+        // Condvars, heavy then light; their mutexes exist by now.
+        for (const SyncWeight weight : { SyncWeight::Heavy, SyncWeight::Light }) {
+            uint32_t count = 0;
+            std::set<SceUID> in_state;
+            if (!read_count(count))
+                break;
+            const CondvarPtrs &table = weight == SyncWeight::Heavy ? emuenv.kernel.condvars : emuenv.kernel.lwcondvars;
+            for (uint32_t i = 0; i < count && ok; i++) {
+                SceUID uid = 0, assoc = 0;
+                std::string name;
+                uint32_t attr = 0;
+                ok = nr.get(uid) && nr.get_string(name) && nr.get(attr) && nr.get(assoc);
+                if (!ok)
+                    break;
+                in_state.insert(uid);
+                bool present;
+                {
+                    const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
+                    present = table.contains(uid);
+                }
+                if (!present) {
+                    if (condvar_recreate(emuenv.kernel, uid, name.c_str(), attr, assoc, weight))
+                        objects_recreated++;
+                    else
+                        LOG_ERROR("Savestate: condvar {} \"{}\" could not be recreated: its mutex {} is missing", uid, name, assoc);
+                }
+            }
+            std::vector<SceUID> extra;
+            {
+                const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
+                for (const auto &[uid, _] : table)
+                    if (!in_state.contains(uid))
+                        extra.push_back(uid);
+            }
+            for (const SceUID uid : extra)
+                if (condvar_delete(emuenv.kernel, "savestate", 0, uid, weight) == SCE_KERNEL_OK)
+                    objects_deleted++;
+        }
+        if (!ok)
+            LOG_ERROR("Savestate: the sync object chunk is corrupt; objects the guest deleted since the save were not all put back");
+    }
+    if (audp_data) {
+        Reader ar{ audp_data, audp_size, 0 };
+        uint32_t count = 0;
+        bool ok = ar.get(count);
+        std::set<int> in_state;
+        int highest = 0;
+        for (uint32_t i = 0; i < count && ok; i++) {
+            int32_t id = 0, type = 0, len = 0, freq = 0, mode = 0, left = 0, right = 0;
+            float volume = 1.0f;
+            ok = ar.get(id) && ar.get(type) && ar.get(len) && ar.get(freq) && ar.get(mode) && ar.get(left) && ar.get(right) && ar.get(volume);
+            if (!ok)
+                break;
+            in_state.insert(id);
+            highest = std::max(highest, id);
+            bool present;
+            {
+                const std::lock_guard<std::mutex> lock(emuenv.audio.mutex);
+                present = emuenv.audio.out_ports.contains(id);
+            }
+            if (present)
+                continue;
+            const int channels = (mode == 0) ? 1 : 2; // SCE_AUDIO_OUT_MODE_MONO is 0, STEREO 1 (SceAudio.h)
+            AudioOutPortPtr port = emuenv.audio.open_port(channels, freq, len);
+            if (!port) {
+                LOG_ERROR("Savestate: audio port {} could not be reopened", id);
+                continue;
+            }
+            port->type = type;
+            port->len = len;
+            port->freq = freq;
+            port->mode = mode;
+            port->left_channel_volume = left;
+            port->right_channel_volume = right;
+            emuenv.audio.set_volume(*port, volume);
+            const std::lock_guard<std::mutex> lock(emuenv.audio.mutex);
+            emuenv.audio.out_ports.emplace(id, port);
+            ports_recreated++;
+        }
+        if (ok) {
+            const std::lock_guard<std::mutex> lock(emuenv.audio.mutex);
+            for (auto it = emuenv.audio.out_ports.begin(); it != emuenv.audio.out_ports.end();) {
+                if (in_state.contains(it->first)) {
+                    ++it;
+                } else {
+                    it = emuenv.audio.out_ports.erase(it);
+                    ports_closed++;
+                }
+            }
+            emuenv.audio.next_port_id = std::max(emuenv.audio.next_port_id, highest + 1);
+        } else {
+            LOG_ERROR("Savestate: the audio port chunk is corrupt; ports the guest closed since the save were not all reopened");
+        }
+    }
+    if (objects_recreated + objects_deleted + ports_recreated + ports_closed > 0)
+        LOG_INFO("Savestate: {} sync object(s) put back and {} deleted, {} audio port(s) reopened and {} closed, to match the state",
+            objects_recreated, objects_deleted, ports_recreated, ports_closed);
+
     if (stack_data) {
         Reader sk{ stack_data, stack_size, 0 };
         uint32_t count = 0;
@@ -1635,10 +1945,9 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
 
     // --- restore sync primitive scalars --------------------------------------------------------
     // The guest's own bookkeeping is in the snapshot; these host-side counters are what it expects
-    // to agree with. Objects that no longer exist are skipped rather than created: the gate above
-    // has already established that the threads which matter are parked exactly as they were, and
-    // creating kernel objects here would be reconstructing state this design deliberately does not
-    // own.
+    // to agree with. Objects the session had deleted were put back above (from SYNI) and get their
+    // counts here like the rest; one a state written without SYNI refers to is skipped, and is
+    // counted as "gone" in the summary line.
     uint32_t sync_restored = 0, sync_skipped = 0;
     {
         Reader sr{ sync_data, sync_size, 0 };
