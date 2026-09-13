@@ -200,9 +200,17 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
     // WaitRelease) -- and only at a thread's top level: inside a callback, the host frames around
     // the call are gone. A state with a thread anywhere else would be refused by every load, so do
     // not write one. Retryable, because such moments pass.
+    //
+    // That holds for a thread merely *running* inside a callback too: the load wants every thread
+    // exactly as deep as the state had it, and a session is stopped inside the same callback again
+    // next to never. Measured on Project DIVA f (run 33): a state with NGS's update thread one
+    // callback deep, and 59 loads of it refused before the quickload gave up.
     {
         const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
         for (const auto &[uid, thread] : emuenv.kernel.threads) {
+            if (thread && thread->nesting_level() > 1 && thread->status != ThreadStatus::wait)
+                return Result::retry(fmt::format("thread {} \"{}\" is running inside a callback, which a load would have to catch again",
+                    uid, thread->name));
             if (!thread || thread->status != ThreadStatus::wait)
                 continue;
             const std::optional<ThreadState::WaitRelease> wait = thread->current_wait();
