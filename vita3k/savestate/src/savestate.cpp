@@ -74,6 +74,10 @@ constexpr uint32_t TAG_NGSL = 0x4C53474EU;
 constexpr uint32_t TAG_GXML = 0x4C4D5847U;
 // "THRD" - each thread's status and callback depth. A load needs it to restart waits.
 constexpr uint32_t TAG_THRD = 0x44524854U;
+// "THRI" - what each thread is made of (name, entry, priority, affinity, stack, TLS, initial
+// registers), so a thread the session no longer has can be recreated under its ID. Optional, so
+// older states still load -- into a session that still has every thread they need.
+constexpr uint32_t TAG_THRI = 0x49524854U;
 // "SYN2" - rwlock owners, message pipe contents, timers. Optional, so older states still load.
 constexpr uint32_t TAG_SYN2 = 0x324E5953U;
 // "GXMM" - which GPU memory regions were mapped. Optional, so older states still load.
@@ -710,10 +714,41 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
     put<uint64_t>(file, gxml_raw.size());
     file.insert(file.end(), gxml_raw.begin(), gxml_raw.end());
 
+    // --- THRI: what each thread is made of -----------------------------------------------------
+    // Enough to recreate one the session has since deleted: see savestate::load. Its TLS block is
+    // KERNEL_TLS_SIZE plus the module's TLS, both guest memory that comes back with the restore.
+    std::vector<uint8_t> thri_raw;
+    {
+        const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
+        uint32_t count = 0;
+        for (const auto &[uid, thread] : emuenv.kernel.threads)
+            if (thread && thread->cpu)
+                count++;
+        put<uint32_t>(thri_raw, count);
+        for (const auto &[uid, thread] : emuenv.kernel.threads) {
+            if (!thread || !thread->cpu)
+                continue;
+            put(thri_raw, uid);
+            put_string(thri_raw, thread->name);
+            put<uint32_t>(thri_raw, thread->entry_point);
+            put<int32_t>(thri_raw, thread->priority);
+            put<int32_t>(thri_raw, thread->affinity_mask);
+            put<uint32_t>(thri_raw, thread->stack.get());
+            put<int32_t>(thri_raw, thread->stack_size);
+            put<uint32_t>(thri_raw, thread->tls.get());
+            put(thri_raw, thread->initial_context());
+        }
+    }
+
     put(file, TAG_THRD);
     put<uint64_t>(file, thrd_raw.size());
     put<uint64_t>(file, thrd_raw.size());
     file.insert(file.end(), thrd_raw.begin(), thrd_raw.end());
+
+    put(file, TAG_THRI);
+    put<uint64_t>(file, thri_raw.size());
+    put<uint64_t>(file, thri_raw.size());
+    file.insert(file.end(), thri_raw.begin(), thri_raw.end());
 
     put(file, TAG_SYN2);
     put<uint64_t>(file, syn2_raw.size());
@@ -829,6 +864,8 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
     size_t gxml_size = 0;
     const uint8_t *thrd_data = nullptr;
     size_t thrd_size = 0;
+    const uint8_t *thri_data = nullptr;
+    size_t thri_size = 0;
     const uint8_t *syn2_data = nullptr;
     size_t syn2_size = 0;
     const uint8_t *gxmm_data = nullptr;
@@ -890,6 +927,10 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
         case TAG_THRD:
             thrd_data = payload;
             thrd_size = static_cast<size_t>(stored);
+            break;
+        case TAG_THRI:
+            thri_data = payload;
+            thri_size = static_cast<size_t>(stored);
             break;
         case TAG_SYN2:
             syn2_data = payload;
@@ -994,6 +1035,33 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
         }
     }
 
+    // What each thread was made of, for the ones the session has since deleted.
+    struct SavedIdentity {
+        std::string name;
+        Address entry_point;
+        int32_t priority;
+        int32_t affinity_mask;
+        Address stack;
+        int32_t stack_size;
+        Address tls;
+        CPUContext init_ctx;
+    };
+    std::map<SceUID, SavedIdentity> identities;
+    if (thri_data) {
+        Reader ir{ thri_data, thri_size, 0 };
+        uint32_t count = 0;
+        if (!ir.get(count))
+            return Result::fail("corrupt thread identity chunk");
+        for (uint32_t i = 0; i < count; i++) {
+            SceUID id = 0;
+            SavedIdentity identity;
+            if (!ir.get(id) || !ir.get_string(identity.name) || !ir.get(identity.entry_point) || !ir.get(identity.priority) || !ir.get(identity.affinity_mask)
+                || !ir.get(identity.stack) || !ir.get(identity.stack_size) || !ir.get(identity.tls) || !ir.get(identity.init_ctx))
+                return Result::fail("corrupt thread identity chunk");
+            identities[id] = std::move(identity);
+        }
+    }
+
     std::map<SceUID, CPUContext> contexts;
     {
         Reader cr{ cpu_data, cpu_size, 0 };
@@ -1018,16 +1086,43 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
     std::vector<Release> releases;
     uint32_t restarts = 0;
     uint32_t differed = 0;
+    // Threads the state has and the session does not: deleted by the guest since the save (a game
+    // that starts and ends workers does this every few seconds -- Borderlands 2's "RADSS Thread"
+    // pair lives about 18 s and is deleted by the rendering thread the moment it finishes). They
+    // are recreated under their IDs once memory is back, from THRI. Threads the session has and
+    // the state does not are the guest's newer ones; they are ended at the end of the load.
+    std::vector<std::pair<SceUID, ThreadStatus>> to_recreate;
+    std::vector<ThreadStatePtr> session_only;
     {
         const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
+        for (const auto &[id, thread] : emuenv.kernel.threads) {
+            if (thread && thread->cpu && !contexts.contains(id))
+                session_only.push_back(thread);
+        }
         for (auto &[id, ctx] : contexts) {
-            const auto it = emuenv.kernel.threads.find(id);
-            if (it == emuenv.kernel.threads.end() || !it->second || !it->second->cpu)
-                return Result::fail(fmt::format("thread {} from the state no longer exists", id));
-            const ThreadStatePtr &thread = it->second;
             const auto saved = saved_threads.find(id);
             if (saved == saved_threads.end())
                 return Result::fail(fmt::format("the state has registers for thread {} but no status", id));
+            const auto it = emuenv.kernel.threads.find(id);
+            if (it == emuenv.kernel.threads.end() || !it->second || !it->second->cpu) {
+                if (!identities.contains(id))
+                    return Result::fail(fmt::format("thread {} from the state no longer exists, and the state does not say what it was", id));
+                if (saved->second.level != 1)
+                    return Result::fail(fmt::format("thread {} from the state no longer exists and was inside a callback", id));
+                // Parked in a call at the save: it goes back to the start of it, like a live one.
+                const auto p = parked.find(id);
+                if (p != parked.end()) {
+                    if (p->second.nid == 0)
+                        return Result::fail(fmt::format("thread {} was parked outside any call", id));
+                    const std::string why = rewind_to_call(emuenv.mem, ctx);
+                    if (!why.empty())
+                        return Result::fail(fmt::format("thread {} cannot be restarted: {}", id, why));
+                    restarts++;
+                }
+                to_recreate.emplace_back(id, saved->second.status);
+                continue;
+            }
+            const ThreadStatePtr &thread = it->second;
 
             // What a restart cannot change has to agree already. Retryable: a thread that has just
             // finished, or is in a callback, is usually back where it was a frame or two later.
@@ -1458,6 +1553,27 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
     // Must happen after the address space has been reconciled and before any thread runs again.
     // Optional: states written before this chunk existed simply do not carry it, and are loaded
     // as they were.
+    // --- recreate the threads the guest deleted since the save --------------------------------
+    // Memory is back, so their stacks and TLS blocks exist again with the state's bytes; the
+    // reconciliation above allocated them like every other region. Each comes up under its saved
+    // ID, gets its registers with everyone else below, and is held like a thread stopped while
+    // running, so resume_threads lets it go. One that had already finished stays dormant with its
+    // initial registers, for the start the guest may still give it.
+    uint32_t recreated = 0;
+    for (const auto &[id, status] : to_recreate) {
+        const SavedIdentity &identity = identities.at(id);
+        const bool was_running = status != ThreadStatus::dormant;
+        const ThreadStatePtr thread = emuenv.kernel.create_thread_for_savestate(emuenv.mem, id, identity.name, identity.entry_point, identity.priority, identity.affinity_mask,
+            identity.stack, identity.stack_size, identity.tls, identity.init_ctx, was_running);
+        if (!thread) {
+            LOG_ERROR("Savestate: thread {} \"{}\" could not be recreated", id, identity.name);
+            continue;
+        }
+        recreated++;
+    }
+    if (recreated > 0)
+        LOG_INFO("Savestate: recreated {} thread(s) the guest had deleted since the save", recreated);
+
     if (stack_data) {
         Reader sk{ stack_data, stack_size, 0 };
         uint32_t count = 0;
@@ -1774,6 +1890,20 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
     // only thing that ever wakes one -- which presents as the guest hanging with a correct-looking
     // frame on screen. Put the invariant back.
     reconcile_waiters_after_load(emuenv.kernel);
+
+    // --- end the threads the state does not have --------------------------------------------
+    // The guest made them after the save; the restored guest never did. Their stacks and TLS are
+    // either regions the reconciliation released or regions a recreated thread now owns, so they
+    // give those up first; then each is told to delete itself, which it does as soon as it is
+    // resumed (a waiting one is woken out of its wait for it). No end callback: as far as the
+    // restored guest is concerned these threads never ran.
+    for (const ThreadStatePtr &thread : session_only) {
+        thread->stack.release_for_savestate();
+        thread->tls.release_for_savestate();
+        thread->exit_delete(false);
+    }
+    if (!session_only.empty())
+        LOG_INFO("Savestate: {} thread(s) the guest created after the save are being ended", session_only.size());
 
     // Host-side audio decoders hold a position inside the stream they were decoding. Guest memory
     // has just been rewound underneath them, so that position is now wrong and the next frame

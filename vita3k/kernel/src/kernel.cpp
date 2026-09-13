@@ -182,26 +182,51 @@ ThreadStatePtr KernelState::create_thread(MemState &mem, const char *name, Ptr<c
     return create_thread(mem, name, entry_point, SCE_KERNEL_DEFAULT_PRIORITY, SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT, SCE_KERNEL_STACK_SIZE_USER_MAIN, nullptr);
 }
 
-ThreadStatePtr KernelState::create_thread(MemState &mem, const char *name, Ptr<const void> entry_point, int init_priority, SceInt32 affinity_mask, int stack_size, const SceKernelThreadOptParam *option) {
-    ThreadStatePtr thread = std::make_shared<ThreadState>(get_next_uid(), *this, mem);
-    if (thread->init(name, entry_point, init_priority, affinity_mask, stack_size, option) < 0)
-        return nullptr;
-
+// Register the thread and give it its host thread, which parks in run_loop until start().
+static void spawn_host_thread(KernelState &kernel, const ThreadStatePtr &thread) {
     {
-        const std::lock_guard<std::mutex> lock(mutex);
-        threads.emplace(thread->id, thread);
+        const std::lock_guard<std::mutex> lock(kernel.mutex);
+        kernel.threads.emplace(thread->id, thread);
     }
 
     ThreadParams params;
-    params.kernel = this;
+    params.kernel = &kernel;
     params.thid = thread->id;
 
     params.host_may_destroy_params = SDL_CreateSemaphore(0);
     SDL_DetachThread(SDL_CreateThread(&thread_function, thread->name.c_str(), &params));
     SDL_WaitSemaphore(params.host_may_destroy_params);
     SDL_DestroySemaphore(params.host_may_destroy_params);
+}
 
+ThreadStatePtr KernelState::create_thread(MemState &mem, const char *name, Ptr<const void> entry_point, int init_priority, SceInt32 affinity_mask, int stack_size, const SceKernelThreadOptParam *option) {
+    ThreadStatePtr thread = std::make_shared<ThreadState>(get_next_uid(), *this, mem);
+    if (thread->init(name, entry_point, init_priority, affinity_mask, stack_size, option) < 0)
+        return nullptr;
+
+    spawn_host_thread(*this, thread);
     return thread;
+}
+
+ThreadStatePtr KernelState::create_thread_for_savestate(MemState &mem, SceUID id, const std::string &name, Address entry_point, int priority, SceInt32 affinity_mask, Address stack, int stack_size, Address tls, const CPUContext &init_ctx, bool resume_after_load) {
+    ensure_next_uid_above(id);
+    ThreadStatePtr thread = std::make_shared<ThreadState>(id, *this, mem);
+    if (thread->adopt_for_savestate(name, entry_point, priority, affinity_mask, stack, stack_size, tls, init_ctx) < 0)
+        return nullptr;
+
+    spawn_host_thread(*this, thread);
+    if (resume_after_load) {
+        thread->hold_for_savestate_resume();
+        const std::lock_guard<std::mutex> lock(mutex);
+        paused_threads_status[id] = ThreadStatus::run;
+    }
+    return thread;
+}
+
+void KernelState::ensure_next_uid_above(SceUID id) {
+    SceUID current = next_uid.load();
+    while (current <= id && !next_uid.compare_exchange_weak(current, id + 1)) {
+    }
 }
 
 Ptr<Ptr<void>> KernelState::get_thread_tls_addr(MemState &mem, SceUID thread_id, int key) {

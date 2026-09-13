@@ -88,6 +88,18 @@ struct ThreadState {
     explicit ThreadState(SceUID id, KernelState &kernel, MemState &mem);
 
     int init(const char *name, Ptr<const void> entry_point, int init_priority, SceInt32 affinity_mask, int stack_size, const SceKernelThreadOptParam *option);
+    // init() for a thread recreated by a savestate load: the same set-up, but the stack and TLS are
+    // blocks the address-space reconciliation has already put back, holding the state's bytes, so
+    // they are adopted rather than allocated and cleared. `priority` is the internal one init()
+    // computed, as saved.
+    int adopt_for_savestate(const std::string &name, Address entry_point, int priority, SceInt32 affinity_mask, Address stack_addr, int stack_size, Address tls_addr, const CPUContext &init_ctx);
+    // Park a freshly created (dormant) thread as if pause_threads had stopped it running, so that
+    // resume_threads lets it go with the others once the load has loaded its registers.
+    void hold_for_savestate_resume();
+    // The registers start() would begin from, for a savestate to record.
+    const CPUContext &initial_context() const {
+        return init_cpu_ctx;
+    }
     int start(SceSize arglen, const Ptr<void> argp, bool run_entry_callback = false);
     void exit(SceInt32 status);
     void exit_delete(bool exit = true);
