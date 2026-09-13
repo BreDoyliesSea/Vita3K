@@ -7,4 +7,4 @@ add_library(
 
 target_include_directories(savestate PUBLIC include)
 target_link_libraries(savestate PUBLIC emuenv mem)
-target_link_libraries(savestate PRIVATE config cpu gxm io kernel miniz ngs nids renderer rtc util)
+target_link_libraries(savestate PRIVATE codec config cpu gxm io kernel miniz ngs nids renderer rtc util)
