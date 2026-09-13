@@ -19,6 +19,7 @@
 
 #include <modules/module_parent.h>
 
+#include <new>
 #include <span>
 #include <stack>
 #if defined(__x86_64__) && !defined(__APPLE__)
@@ -1362,6 +1363,9 @@ struct SceGxmRenderTarget {
     std::uint16_t height;
     std::uint16_t scenesPerFrame;
     SceUID driverMemBlock;
+    // Everything sceGxmCreateRenderTarget was given, so a savestate can record how this one was
+    // made and a load can make it again in a session that has since destroyed it.
+    SceGxmRenderTargetParams params;
 };
 
 
@@ -1552,7 +1556,7 @@ gxm::HostObjectLayout gxm::capture_layout(GxmState &gxm, const MemState &mem) {
     return layout;
 }
 
-std::string gxm::rollback_to_layout(GxmState &gxm, const MemState &mem, const HostObjectLayout &saved, RollbackCounts &out) {
+std::string gxm::rollback_to_layout(GxmState &gxm, const MemState &mem, renderer::State &renderer, const HostObjectLayout &saved, RollbackCounts &out) {
     const HostObjectLayout live = capture_layout(gxm, mem);
     const auto extras = [](const std::vector<Address> &saved_list, const std::vector<Address> &live_list) {
         std::vector<Address> result;
@@ -1565,11 +1569,11 @@ std::string gxm::rollback_to_layout(GxmState &gxm, const MemState &mem, const Ho
 
     // Decided before anything is touched.
     const std::vector<Address> extra_contexts = extras(saved.contexts, live.contexts);
-    const std::vector<Address> extra_render_targets = extras(saved.render_targets, live.render_targets);
-    if (!extra_contexts.empty() || !extra_render_targets.empty()) {
-        return fmt::format("{} context(s) and {} render target(s) were created after the state was taken, and those cannot be destroyed while the render thread is parked",
-            extra_contexts.size(), extra_render_targets.size());
+    if (!extra_contexts.empty()) {
+        return fmt::format("{} context(s) were created after the state was taken, and those cannot be destroyed while the render thread is parked",
+            extra_contexts.size());
     }
+    const std::vector<Address> extra_render_targets = extras(saved.render_targets, live.render_targets);
 
     const std::vector<Address> extra_vertex = extras(saved.vertex_programs, live.vertex_programs);
     const std::vector<Address> extra_fragment = extras(saved.fragment_programs, live.fragment_programs);
@@ -1634,6 +1638,56 @@ std::string gxm::rollback_to_layout(GxmState &gxm, const MemState &mem, const Ho
             out.sync_objects++;
         }
     }
+    // Render targets. The backend object goes the way sceGxmDestroyRenderTarget sends it, but on
+    // the backend directly, since the render thread is parked (Vulkan queues its images and
+    // fences for a deferred destroy; the thread that would drain that queue is the parked one,
+    // and picks it up when it resumes). Every context that still points at it forgets it first,
+    // so nothing dangles until the guest's next sceGxmBeginScene sets a target again. The
+    // wrapper leaves the registry; its guest memory is left to the restore, like the programs.
+    for (const Address address : extra_render_targets) {
+        SceGxmRenderTarget *const rt = Ptr<SceGxmRenderTarget>(address).get(mem);
+        if (!rt)
+            continue;
+        for (const Address context_address : live.contexts) {
+            SceGxmContext *const context = Ptr<SceGxmContext>(context_address).get(mem);
+            if (context && context->renderer)
+                renderer::forget_render_target(renderer, *context->renderer, rt->renderer.get());
+        }
+        renderer::destroy_render_target_while_parked(renderer, rt->renderer);
+        gxm.render_targets.erase(rt);
+        out.render_targets++;
+    }
+    return {};
+}
+
+std::vector<gxm::RenderTargetIdentity> gxm::capture_render_target_identities(GxmState &gxm, const MemState &mem) {
+    std::vector<RenderTargetIdentity> out;
+    for (const auto &[rt, address] : gxm.render_targets) {
+        if (rt)
+            out.push_back({ address, rt->params });
+    }
+    std::sort(out.begin(), out.end(), [](const RenderTargetIdentity &a, const RenderTargetIdentity &b) { return a.address < b.address; });
+    return out;
+}
+
+std::string gxm::recreate_render_targets(GxmState &gxm, const MemState &mem, renderer::State &renderer, const std::vector<RenderTargetIdentity> &missing, uint32_t &recreated) {
+    for (const RenderTargetIdentity &identity : missing) {
+        SceGxmRenderTarget *const rt = Ptr<SceGxmRenderTarget>(identity.address).get(mem);
+        if (!rt)
+            return fmt::format("render target {} is not in mapped memory", log_hex(identity.address));
+        // The restore put the saved session's bytes here, a renderer pointer that session owned
+        // among them. A fresh wrapper over them, then the same steps as sceGxmCreateRenderTarget.
+        new (rt) SceGxmRenderTarget{};
+        if (!renderer::create_render_target_while_parked(renderer, rt->renderer, &identity.params))
+            return fmt::format("render target {} ({}x{}) cannot be made while the render thread is parked on this backend", log_hex(identity.address), identity.params.width, identity.params.height);
+        rt->width = identity.params.width;
+        rt->height = identity.params.height;
+        rt->scenesPerFrame = identity.params.scenesPerFrame;
+        rt->driverMemBlock = identity.params.driverMemBlock;
+        rt->params = identity.params;
+        gxm.render_targets.emplace(rt, identity.address);
+        recreated++;
+    }
     return {};
 }
 
@@ -1644,7 +1698,7 @@ bool gxm::scene_in_progress(GxmState &gxm, const MemState &mem) {
     return context && context->state.active;
 }
 
-std::string gxm::check_layout(GxmState &gxm, const MemState &mem, const HostObjectLayout &saved) {
+std::string gxm::check_layout(GxmState &gxm, const MemState &mem, const HostObjectLayout &saved, const bool render_targets_handled) {
     const HostObjectLayout live = capture_layout(gxm, mem);
     const auto check = [](const char *kind, const std::vector<Address> &saved_list, const std::vector<Address> &live_list) -> std::string {
         for (const Address address : saved_list) {
@@ -1662,6 +1716,9 @@ std::string gxm::check_layout(GxmState &gxm, const MemState &mem, const HostObje
              std::tuple{ "shader patcher", &saved.shader_patchers, &live.shader_patchers },
              std::tuple{ "vertex program", &saved.vertex_programs, &live.vertex_programs },
              std::tuple{ "fragment program", &saved.fragment_programs, &live.fragment_programs } }) {
+        // Missing render targets are the caller's, when it has what it takes to make them again.
+        if (render_targets_handled && saved_list == &saved.render_targets)
+            continue;
         std::string why = check(kind, *saved_list, *live_list);
         if (!why.empty())
             return why;
@@ -2323,6 +2380,7 @@ EXPORT(int, sceGxmCreateRenderTarget, const SceGxmRenderTargetParams *params, Pt
     rt->height = params->height;
     rt->scenesPerFrame = params->scenesPerFrame;
     rt->driverMemBlock = params->driverMemBlock;
+    rt->params = *params;
     emuenv.gxm.render_targets.emplace(rt, renderTarget->address());
 
     return 0;
