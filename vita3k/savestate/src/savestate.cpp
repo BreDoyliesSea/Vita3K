@@ -17,6 +17,7 @@
 
 #include <savestate/savestate.h>
 
+#include <codec/state.h>
 #include <config/version.h>
 #include <cpu/functions.h>
 #include <emuenv/state.h>
@@ -79,6 +80,9 @@ constexpr uint32_t TAG_SYN2 = 0x324E5953U;
 constexpr uint32_t TAG_GXMM = 0x4D4D5847U;
 // "CLCK" - how far the guest's own clock had run. Optional, so older states still load.
 constexpr uint32_t TAG_CLCK = 0x4B434C43U;
+// "ADEC" - where each ATRAC9 sceAudiodec decoder was inside its stream. Optional, so older states
+// still load.
+constexpr uint32_t TAG_ADEC = 0x43454441U;
 
 
 // Point a context saved inside an HLE call back at the call itself, so the thread makes it again
@@ -648,6 +652,11 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
     std::vector<uint8_t> clck_raw;
     put<uint64_t>(clck_raw, rtc_get_ticks(emuenv.kernel.base_tick.tick) - emuenv.kernel.start_tick);
 
+    // --- where the guest's ATRAC9 decoders were ----------------------------------------------
+    // Host state, like the clock: a decoder's place inside a superframe. See
+    // audiodec_save_positions for what a load did without it.
+    const std::vector<uint8_t> adec_raw = audiodec_save_positions(emuenv);
+
     // --- assemble ---------------------------------------------------------------------------
     std::vector<uint8_t> file;
     file.insert(file.end(), std::begin(MAGIC), std::end(MAGIC));
@@ -720,6 +729,11 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
     put<uint64_t>(file, clck_raw.size());
     put<uint64_t>(file, clck_raw.size());
     file.insert(file.end(), clck_raw.begin(), clck_raw.end());
+
+    put(file, TAG_ADEC);
+    put<uint64_t>(file, adec_raw.size());
+    put<uint64_t>(file, adec_raw.size());
+    file.insert(file.end(), adec_raw.begin(), adec_raw.end());
 
     // Write to a temporary and rename into place, so an interrupted save cannot destroy the
     // previous good state.
@@ -821,6 +835,8 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
     size_t gxmm_size = 0;
     const uint8_t *clck_data = nullptr;
     size_t clck_size = 0;
+    const uint8_t *adec_data = nullptr;
+    size_t adec_size = 0;
 
     while (r.need(sizeof(uint32_t) + sizeof(uint64_t) * 2)) {
         uint32_t tag = 0;
@@ -886,6 +902,10 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
         case TAG_CLCK:
             clck_data = payload;
             clck_size = static_cast<size_t>(stored);
+            break;
+        case TAG_ADEC:
+            adec_data = payload;
+            adec_size = static_cast<size_t>(stored);
             break;
         default:
             LOG_WARN("Savestate: ignoring unknown chunk 0x{:08X}", tag);
@@ -1760,6 +1780,13 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
     // unpacks nonsense -- observed as a storm of Atrac9 decode failures ending in a fault. Tell
     // them to resynchronise.
     ngs::on_savestate_loaded(emuenv.ngs, emuenv.mem);
+    // And the decoders the guest opens itself through sceAudiodec: all flushed, then the ATRAC9
+    // ones put back where the state had them inside their superframes. Without that, Gravity Rush's
+    // music stopped after the first load of every session.
+    const size_t audio_decoders = audiodec_flush_after_savestate_load(emuenv);
+    LOG_INFO_IF(audio_decoders > 0, "Savestate: flushed {} sceAudiodec decoder(s)", audio_decoders);
+    const size_t audio_positions = audiodec_restore_positions(emuenv, adec_data, adec_size);
+    LOG_INFO_IF(audio_positions > 0, "Savestate: put {} ATRAC9 decoder(s) back where the state had them", audio_positions);
 
     LOG_INFO("Savestate loaded: {} ({} regions, {}/{} threads, {} sync object(s), {} file position(s), {} reopened; {} sync and {} file gone)",
         path.string(), region_count, restored, thread_count, sync_restored, files_restored, files_reopened,
