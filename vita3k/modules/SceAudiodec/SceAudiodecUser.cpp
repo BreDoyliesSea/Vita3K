@@ -23,6 +23,8 @@
 #include <util/lock_and_find.h>
 #include <util/tracy.h>
 
+#include <cstring>
+
 TRACY_MODULE_NAME(SceAudiodecUser);
 
 enum {
@@ -121,6 +123,88 @@ constexpr uint32_t SCE_AUDIODEC_MP3_V2_MAX_PCM_SIZE = 1152;
 
 LIBRARY_INIT(SceAudiodec) {
     emuenv.kernel.obj_store.create<AudiodecState>();
+}
+
+// Declared in codec/state.h. A load rewinds guest memory, and with it every stream the guest feeds
+// these decoders from, while each decoder keeps its place in the stream it was decoding. Flush
+// them all to a clean start; audiodec_restore_positions then puts the ATRAC9 ones back where the
+// state had them, which a clean start is not (see there).
+size_t audiodec_flush_after_savestate_load(EmuEnvState &emuenv) {
+    // Always present while a game runs: LIBRARY_INIT creates it for every title at startup, and
+    // only the kernel's deinit at exit clears it.
+    const auto state = emuenv.kernel.obj_store.get<AudiodecState>();
+    const std::lock_guard<std::mutex> lock(state->mutex);
+    for (const auto &[_, decoder] : state->decoders) {
+        if (decoder)
+            decoder->flush();
+    }
+    return state->decoders.size();
+}
+
+// Declared in codec/state.h. A flush is not enough for ATRAC9: the decoder counts the frames of the
+// current superframe and carries data from each frame to the next, and the restored guest is
+// usually part-way through a superframe. Flushed, the decoder took the guest's next frame for the
+// first of a superframe and refused the one after it, which builds on its predecessor -- measured
+// on Gravity Rush (run 41): the guest resumed at exactly the right byte, the second frame after the
+// load failed with ERR_UNPACK_SCALE_FACTOR_MODE_INVALID, and the music never came back. Without
+// the flush the live decoder's later position was just as wrong. So a save records each ATRAC9
+// decoder's position by handle.
+std::vector<uint8_t> audiodec_save_positions(EmuEnvState &emuenv) {
+    const auto state = emuenv.kernel.obj_store.get<AudiodecState>();
+    const std::lock_guard<std::mutex> lock(state->mutex);
+    std::vector<uint8_t> out(sizeof(uint32_t));
+    const auto append = [&out](const void *data, size_t size) {
+        const auto *const bytes = static_cast<const uint8_t *>(data);
+        out.insert(out.end(), bytes, bytes + size);
+    };
+    uint32_t count = 0;
+    for (const auto &[handle, decoder] : state->decoders) {
+        const auto *const at9 = dynamic_cast<const Atrac9DecoderState *>(decoder.get());
+        if (!at9)
+            continue;
+        const std::vector<uint8_t> position = at9->save_position();
+        const auto length = static_cast<uint32_t>(position.size());
+        append(&handle, sizeof(handle));
+        append(&length, sizeof(length));
+        append(position.data(), position.size());
+        count++;
+    }
+    std::memcpy(out.data(), &count, sizeof(count));
+    return out;
+}
+
+// Declared in codec/state.h. Runs after audiodec_flush_after_savestate_load. A decoder the state has
+// no position for, or one opened with a different configuration, stays flushed.
+size_t audiodec_restore_positions(EmuEnvState &emuenv, const uint8_t *data, size_t size) {
+    if (!data)
+        return 0;
+    const auto state = emuenv.kernel.obj_store.get<AudiodecState>();
+    const std::lock_guard<std::mutex> lock(state->mutex);
+    size_t at = 0;
+    const auto read = [&](void *dest, size_t length) {
+        if (size - at < length)
+            return false;
+        std::memcpy(dest, data + at, length);
+        at += length;
+        return true;
+    };
+    uint32_t count = 0;
+    if (!read(&count, sizeof(count)))
+        return 0;
+    size_t restored = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        SceUID handle = 0;
+        uint32_t length = 0;
+        if (!read(&handle, sizeof(handle)) || !read(&length, sizeof(length)) || size - at < length)
+            break;
+        const std::vector<uint8_t> position(data + at, data + at + length);
+        at += length;
+        const auto it = state->decoders.find(handle);
+        auto *const at9 = it != state->decoders.end() ? dynamic_cast<Atrac9DecoderState *>(it->second.get()) : nullptr;
+        if (at9 && at9->restore_position(position))
+            restored++;
+    }
+    return restored;
 }
 
 EXPORT(int, sceAudiodecClearContext, SceAudiodecCtrl *ctrl) {

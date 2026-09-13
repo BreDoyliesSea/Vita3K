@@ -21,6 +21,7 @@
 #include <mutex>
 #include <queue>
 #include <string>
+#include <vector>
 
 struct AVFrame;
 struct AVPacket;
@@ -82,6 +83,18 @@ struct DecoderState {
 
     virtual ~DecoderState();
 };
+
+struct EmuEnvState;
+
+// Savestate support, defined in modules/SceAudiodec: flush every decoder the guest opened through
+// sceAudiodec, because a load has just rewound the streams they were decoding. Returns how many.
+size_t audiodec_flush_after_savestate_load(EmuEnvState &emuenv);
+
+// Savestate support, defined in modules/SceAudiodec: the position of every ATRAC9 decoder the guest
+// opened through sceAudiodec, and putting those back after a load (after the flush above). Restore
+// returns how many it put back; data may be null for a state that has none.
+std::vector<uint8_t> audiodec_save_positions(EmuEnvState &emuenv);
+size_t audiodec_restore_positions(EmuEnvState &emuenv, const uint8_t *data, size_t size);
 
 struct H264DecoderOptions {
     uint32_t pts_upper;
@@ -173,6 +186,14 @@ struct Atrac9DecoderState : public DecoderState {
 
     void export_state(Atrac9DecoderSavedState *dest);
     void load_state(const Atrac9DecoderSavedState *src);
+
+    // Savestate support: where this decoder is inside the current superframe and everything
+    // LibAtrac9 carries from one frame to the next, as a blob only this build can read back. None
+    // of it is in guest memory, so a load that rewinds the guest's stream has to put it back too.
+    std::vector<uint8_t> save_position() const;
+    // False, with the decoder untouched, unless the blob came from a decoder with this
+    // configuration in this build.
+    bool restore_position(const std::vector<uint8_t> &saved);
 
     explicit Atrac9DecoderState(uint32_t config_data);
     ~Atrac9DecoderState() override;
