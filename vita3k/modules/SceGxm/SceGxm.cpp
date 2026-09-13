@@ -1470,6 +1470,21 @@ void gxm::collect_host_owned_ranges(GxmState &gxm, const MemState &mem,
     for (const auto &[_, address] : gxm.deferred_contexts)
         preserve_context_tail(address);
 
+    // The immediate context's commands live in guest memory as well: allocate_new_command
+    // constructs each renderer::Command inside the VDM ring buffer the guest gave
+    // sceGxmCreateContext. A command is all host state -- an opcode, a next pointer, pointers to
+    // payloads the host allocated -- and the allocator's positions are host members in the context
+    // tail kept above. Restoring the slots while keeping the positions puts commands from the moment
+    // of the save back under a live command list. On Project DIVA f that was a batch starting with
+    // a Draw that no scene had begun ("already recording" after about a third of loads) and heap
+    // corruption in cmd_handle_set_context, which frees a SetContext's payload.
+    if (gxm.immediate_context) {
+        const SceGxmContext *const context = Ptr<SceGxmContext>(gxm.immediate_context).get(mem);
+        if (context && context->alloc_space && context->command_allocator_size > 0)
+            out.emplace_back(context->alloc_space.address(),
+                static_cast<uint32_t>(context->command_allocator_size * sizeof(renderer::Command)));
+    }
+
     // A render target is host-owned all the way through: a unique_ptr and four values the guest
     // gave us once at creation and never revisits.
     for (const auto &[_, address] : gxm.render_targets)
