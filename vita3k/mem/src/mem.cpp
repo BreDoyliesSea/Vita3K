@@ -357,6 +357,7 @@ bool handle_access_violation(MemState &state, uint8_t *addr, bool write) noexcep
     if (!is_valid_addr(state, vaddr)) {
         return false;
     }
+
     if (LOG_PROTECT) {
         fmt::print("Access: {}\n", log_hex(vaddr));
     }
@@ -388,8 +389,18 @@ bool handle_access_violation(MemState &state, uint8_t *addr, bool write) noexcep
     // MEM_COMMIT + PAGE_READWRITE. Disgaea 3 produced thousands per session.
     {
         const std::lock_guard<std::mutex> pages_lock(state.protected_pages_mutex);
-        if (!state.protected_pages.contains(align_down(vaddr, state.host_page_size)))
-            return true;
+        if (!state.protected_pages.contains(align_down(vaddr, state.host_page_size))) {
+            // Except on the null page. init() allocates the first host page so nothing else is
+            // ever handed address 0, and leaves it PAGE_NOACCESS; a fault there that no
+            // protection explains is the guest dereferencing a null pointer, and it must reach
+            // the JIT's slow path, which logs "Invalid read" and reads 0 (MemoryRead treats
+            // every address under host_page_size that way). Returning true resumed the
+            // faulting instruction into the same fault, for ever, with nothing logged:
+            // Borderlands 2's AK::EventManager spun that way inside an NGS callback after a
+            // quickload, the frame rate went to 0, and the next quicksave found the thread
+            // "would not stop" (live minidump, 2026-09-13).
+            return vaddr >= state.host_page_size;
+        }
     }
 
     static std::atomic<uint64_t> unhandled_protect_count{ 0 };
