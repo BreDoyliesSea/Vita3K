@@ -173,6 +173,12 @@ struct KernelState {
     void load_process_param(MemState &mem, Ptr<uint32_t> ptr);
     ThreadStatePtr create_thread(MemState &mem, const char *name, Ptr<const void> entry_point = Ptr<const void>(0));
     ThreadStatePtr create_thread(MemState &mem, const char *name, Ptr<const void> entry_point, int init_priority, SceInt32 affinity_mask, int stack_size, const SceKernelThreadOptParam *option);
+    // A thread recreated by a savestate load under the ID the state gave it, on the stack and TLS
+    // the state had for it. Comes up dormant; with `resume_after_load` it is held as if paused
+    // while running, so resume_threads releases it. See savestate::load.
+    ThreadStatePtr create_thread_for_savestate(MemState &mem, SceUID id, const std::string &name, Address entry_point, int priority, SceInt32 affinity_mask, Address stack, int stack_size, Address tls, const CPUContext &init_ctx, bool resume_after_load);
+    // Never hand out an ID at or below `id` again: IDs the state wrote into guest memory.
+    void ensure_next_uid_above(SceUID id);
 
     ThreadStatePtr get_thread(SceUID thread_id);
 

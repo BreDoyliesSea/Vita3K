@@ -110,6 +110,46 @@ int ThreadState::init(const char *name, Ptr<const void> entry_point, int init_pr
     return 0;
 }
 
+int ThreadState::adopt_for_savestate(const std::string &name, Address entry_point, int priority, SceInt32 affinity_mask, Address stack_addr, int stack_size, Address tls_addr, const CPUContext &init_ctx) {
+    constexpr size_t KERNEL_TLS_SIZE = 0x800;
+
+    this->name = name;
+    this->entry_point = entry_point;
+    this->priority = priority;
+    this->affinity_mask = affinity_mask;
+    this->stack_size = stack_size;
+    start_tick = rtc_get_ticks(kernel.base_tick.tick);
+    last_vblank_waited = 0;
+
+    int core_num = kernel.corenum_allocator.new_corenum();
+    if (core_num < 0) {
+        LOG_ERROR("Out of core number to allocate, use 0");
+        core_num = 0;
+    }
+    cpu = init_cpu(kernel.cpu_opt, id, static_cast<std::size_t>(core_num), mem);
+    if (!cpu)
+        return SCE_KERNEL_ERROR_ERROR;
+    if (kernel.debugger.watch_code)
+        set_log_code(*cpu, true);
+    if (kernel.debugger.watch_memory)
+        set_log_mem(*cpu, true);
+
+    // The blocks are owned like init()'s: freed when the thread is deleted. Their contents --
+    // the TLS words init() writes, the stack -- are the state's, restored with the rest of memory.
+    stack = Block(stack_addr, [this](Address address) { free(mem, address); });
+    tls = Block(tls_addr, [this](Address address) { free(mem, address); });
+    write_tpidruro(*cpu, tls_addr + KERNEL_TLS_SIZE);
+
+    init_cpu_ctx = init_ctx;
+    return 0;
+}
+
+void ThreadState::hold_for_savestate_resume() {
+    const std::lock_guard<std::mutex> lock(mutex);
+    if (status == ThreadStatus::dormant)
+        status = ThreadStatus::suspended;
+}
+
 int ThreadState::start(SceSize arglen, const Ptr<void> argp, bool run_entry_callback) {
     std::unique_lock<std::mutex> thread_lock(mutex);
     if (status != ThreadStatus::dormant)

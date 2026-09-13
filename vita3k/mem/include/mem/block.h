@@ -80,6 +80,14 @@ public:
         addr = new_addr;
     }
 
+    // Give up ownership without freeing. For savestate loading only: a thread the state does not
+    // have is being ended, and its stack and TLS are either regions the reconciliation has already
+    // released or regions a thread recreated from the state now owns. Either way the deleter must
+    // not run.
+    void release_for_savestate() {
+        deleter = nullptr;
+    }
+
     template <class T>
     Ptr<T> get_ptr() const {
         return Ptr<T>(addr);
