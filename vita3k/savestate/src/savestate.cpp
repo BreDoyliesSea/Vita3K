@@ -99,6 +99,8 @@ constexpr uint32_t TAG_CLCK = 0x4B434C43U;
 // "ADEC" - where each ATRAC9 sceAudiodec decoder was inside its stream. Optional, so older states
 // still load.
 constexpr uint32_t TAG_ADEC = 0x43454441U;
+// "ADCI" - which sceAudiodec decoders existed and how each was made. Optional.
+constexpr uint32_t TAG_ADCI = 0x49434441U;
 
 
 // Point a context saved inside an HLE call back at the call itself, so the thread makes it again
@@ -744,6 +746,7 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
     // Host state, like the clock: a decoder's place inside a superframe. See
     // audiodec_save_positions for what a load did without it.
     const std::vector<uint8_t> adec_raw = audiodec_save_positions(emuenv);
+    const std::vector<uint8_t> adci_raw = audiodec_save_identities(emuenv);
 
     // --- assemble ---------------------------------------------------------------------------
     std::vector<uint8_t> file;
@@ -937,6 +940,11 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
     put<uint64_t>(file, adec_raw.size());
     file.insert(file.end(), adec_raw.begin(), adec_raw.end());
 
+    put(file, TAG_ADCI);
+    put<uint64_t>(file, adci_raw.size());
+    put<uint64_t>(file, adci_raw.size());
+    file.insert(file.end(), adci_raw.begin(), adci_raw.end());
+
     // Write to a temporary and rename into place, so an interrupted save cannot destroy the
     // previous good state.
     boost::system::error_code err;
@@ -1049,6 +1057,8 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
     size_t clck_size = 0;
     const uint8_t *adec_data = nullptr;
     size_t adec_size = 0;
+    const uint8_t *adci_data = nullptr;
+    size_t adci_size = 0;
 
     while (r.need(sizeof(uint32_t) + sizeof(uint64_t) * 2)) {
         uint32_t tag = 0;
@@ -1138,6 +1148,10 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
         case TAG_ADEC:
             adec_data = payload;
             adec_size = static_cast<size_t>(stored);
+            break;
+        case TAG_ADCI:
+            adci_data = payload;
+            adci_size = static_cast<size_t>(stored);
             break;
         default:
             LOG_WARN("Savestate: ignoring unknown chunk 0x{:08X}", tag);
@@ -2475,6 +2489,10 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
     // And the decoders the guest opens itself through sceAudiodec: all flushed, then the ATRAC9
     // ones put back where the state had them inside their superframes. Without that, Gravity Rush's
     // music stopped after the first load of every session.
+    // Decoders this session never opened, because the state is from further into the game: created
+    // first, so the flush and the position restore below reach them too.
+    const size_t audio_recreated = audiodec_recreate_missing(emuenv, adci_data, adci_size);
+    LOG_INFO_IF(audio_recreated > 0, "Savestate: opened {} sceAudiodec decoder(s) this session did not have", audio_recreated);
     const size_t audio_decoders = audiodec_flush_after_savestate_load(emuenv);
     LOG_INFO_IF(audio_decoders > 0, "Savestate: flushed {} sceAudiodec decoder(s)", audio_decoders);
     const size_t audio_positions = audiodec_restore_positions(emuenv, adec_data, adec_size);

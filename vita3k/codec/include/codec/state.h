@@ -96,6 +96,13 @@ size_t audiodec_flush_after_savestate_load(EmuEnvState &emuenv);
 std::vector<uint8_t> audiodec_save_positions(EmuEnvState &emuenv);
 size_t audiodec_restore_positions(EmuEnvState &emuenv, const uint8_t *data, size_t size);
 
+// Which decoders existed and how each was created, by handle. A load into a session that never
+// opened them -- any load of a state from later in the game than the session has reached -- has to
+// create them, or the first sceAudiodecDecode on a handle this session does not know dereferences a
+// null decoder and takes the emulator down with it (measured on Gravity Rush, notes/19).
+std::vector<uint8_t> audiodec_save_identities(EmuEnvState &emuenv);
+size_t audiodec_recreate_missing(EmuEnvState &emuenv, const uint8_t *data, size_t size);
+
 struct H264DecoderOptions {
     uint32_t pts_upper;
     uint32_t pts_lower;
@@ -255,6 +262,10 @@ struct AacDecoderState : public DecoderState {
     SwrContext *swr = nullptr;
     AVFrame *frame;
     uint32_t es_size_used;
+    // What it was created with, so a savestate load can create it again (see
+    // audiodec_recreate_missing).
+    uint32_t sample_rate = 0;
+    uint32_t channels = 0;
     uint32_t get(DecoderQuery query) override;
 
     bool send(const uint8_t *data, uint32_t size) override;
