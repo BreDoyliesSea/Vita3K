@@ -30,7 +30,9 @@ extern "C" {
 
 #include <util/log.h>
 
-AacDecoderState::AacDecoderState(uint32_t sample_rate, uint32_t channels) {
+AacDecoderState::AacDecoderState(uint32_t sample_rate, uint32_t channels)
+    : sample_rate(sample_rate)
+    , channels(channels) {
     codec = avcodec_find_decoder(AV_CODEC_ID_AAC);
     assert(codec);
 
