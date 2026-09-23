@@ -104,7 +104,9 @@ constexpr uint32_t TAG_ADEC = 0x43454441U;
 // inside the call has its PC just past the svc (run_loop reads the NID at pc + 4). Its argument
 // registers are untouched until the call returns, so they are still the ones it was made with.
 // Checked rather than assumed; empty on success, otherwise why not.
-std::string rewind_to_call(MemState &mem, CPUContext &ctx) {
+// Why such a context cannot be pointed back at its call; empty when it can. The save asks this
+// too, so that it never writes a state whose threads no load could restart.
+std::string why_not_at_a_call(const MemState &mem, const CPUContext &ctx) {
     const uint32_t pc = ctx.get_pc();
     if (ctx.cpsr & 0x20)
         return fmt::format("its PC {} is in Thumb code, not an import stub", log_hex(pc));
@@ -112,9 +114,19 @@ std::string rewind_to_call(MemState &mem, CPUContext &ctx) {
         return fmt::format("its PC {} is not in mapped memory", log_hex(pc));
     constexpr uint32_t SVC_0 = 0xEF000000U;
     constexpr uint32_t MOV_PC_LR = 0xE1A0F00EU;
-    if (*Ptr<uint32_t>(pc - 4).get(mem) != SVC_0 || *Ptr<uint32_t>(pc).get(mem) != MOV_PC_LR)
-        return fmt::format("its PC {} is not just past an import stub's svc", log_hex(pc));
-    ctx.cpu_registers[15] = pc - 4;
+    const uint32_t before = *Ptr<uint32_t>(pc - 4).get(mem);
+    const uint32_t at = *Ptr<uint32_t>(pc).get(mem);
+    if (before != SVC_0 || at != MOV_PC_LR)
+        return fmt::format("its PC {} is not just past an import stub's svc ({} at PC-4, {} at PC)",
+            log_hex(pc), log_hex(before), log_hex(at));
+    return {};
+}
+
+std::string rewind_to_call(MemState &mem, CPUContext &ctx) {
+    const std::string why = why_not_at_a_call(mem, ctx);
+    if (!why.empty())
+        return why;
+    ctx.cpu_registers[15] = ctx.get_pc() - 4;
     return {};
 }
 
@@ -241,6 +253,21 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
             if (thread->nesting_level() > 1)
                 return Result::retry(fmt::format("thread {} \"{}\" is waiting inside a callback, where a load could not restart it",
                     uid, thread->name));
+            // And it has to be restartable from where it actually stands: a load points the saved
+            // context back at the svc that made the call, which only works if the context is just
+            // past one. Asking at the save is what keeps an unloadable state off the disk --
+            // Oddworld wrote three whose "AK::IOThread" was parked with its PC elsewhere, and no
+            // load, in any session, could take them (notes/19, gap C).
+            if (thread->cpu) {
+                const CPUContext ctx = save_context(*thread->cpu);
+                const std::string why = why_not_at_a_call(emuenv.mem, ctx);
+                if (!why.empty()) {
+                    const uint32_t nid = thread->current_import_nid.load(std::memory_order_relaxed);
+                    const char *const call = nid ? import_name(nid) : nullptr;
+                    return Result::retry(fmt::format("thread {} \"{}\" is parked in {} but {}, so no load could restart it",
+                        uid, thread->name, call ? call : fmt::format("{}", log_hex(nid)), why));
+                }
+            }
         }
     }
 
