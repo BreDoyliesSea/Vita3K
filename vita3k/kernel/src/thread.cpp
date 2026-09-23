@@ -215,6 +215,18 @@ void ThreadState::remove() {
     wait_cv.notify_all();
 }
 
+void ThreadState::end_for_savestate() {
+    const std::lock_guard<std::mutex> lock(mutex);
+    end_quietly = true;
+    request_ending(Ending::exit);
+    // The same wake-ups as remove(): whichever way this thread is stopped, it has to reach the top
+    // of run_loop to end. There it parks dormant, as an exit does.
+    if (status == ThreadStatus::running)
+        stop(*cpu);
+    status_cond.notify_all();
+    wait_cv.notify_all();
+}
+
 void ThreadState::run_loop(bool top_level) {
     logging::name_this_thread(fmt::format("guest {} {}", id, name));
     bool guest_returned = false;
@@ -294,7 +306,7 @@ void ThreadState::run_loop(bool top_level) {
             // The top level ends a thread that ran. An exit leaves it dormant, while a delete makes
             // it gone for guest calls before its end waiters wake.
             if (status != ThreadStatus::dormant && status != ThreadStatus::deleted) {
-                if (ending != Ending::remove)
+                if (ending != Ending::remove && !std::exchange(end_quietly, false))
                     run_thread_end_callback();
                 release_locks();
                 delete_callbacks();

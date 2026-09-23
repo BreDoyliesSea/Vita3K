@@ -1246,6 +1246,11 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
     // the state does not are the guest's newer ones; they are ended at the end of the load.
     std::vector<std::pair<SceUID, ThreadStatus>> to_recreate;
     std::vector<ThreadStatePtr> session_only;
+    // Threads both sides have, that the state has already finished and this session is still
+    // running. Ended at the end of the load, like the session-only ones, except that these park
+    // dormant instead of being deleted: the state has them, dormant, and the guest can still wait
+    // on or delete the ID.
+    std::vector<ThreadStatePtr> to_end;
     {
         const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
         for (const auto &[id, thread] : emuenv.kernel.threads) {
@@ -1281,6 +1286,15 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
             // finished, or is in a callback, is usually back where it was a frame or two later.
             const bool finished_now = thread->status == ThreadStatus::dormant;
             const bool finished_then = saved->second.status == ThreadStatus::dormant;
+            // Still running what the state had already finished: end it rather than wait for it to
+            // finish by itself. The retry was written for a thread that is a frame or two from
+            // ending; a load into a fresh boot is not that -- Borderlands 2's "NxThread" is doing
+            // boot work that the state, taken 25 minutes in, had long since seen the end of, and
+            // all 60 attempts were refused over it (notes/19, gap B).
+            if (finished_then && !finished_now) {
+                to_end.push_back(thread);
+                continue;
+            }
             if (finished_now != finished_then)
                 return Result::retry(fmt::format("thread {} \"{}\" {} now but {} when the state was taken", id, thread->name,
                     finished_now ? "has finished" : "is running", finished_then ? "had finished" : "was running"));
@@ -2332,6 +2346,13 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
     }
     if (!session_only.empty())
         LOG_INFO("Savestate: {} thread(s) the guest created after the save are being ended", session_only.size());
+
+    // And the ones the state has, finished, that this session is still running: the same ending,
+    // except they keep their stack and TLS (the state's own) and park dormant rather than go.
+    for (const ThreadStatePtr &thread : to_end)
+        thread->end_for_savestate();
+    if (!to_end.empty())
+        LOG_INFO("Savestate: {} thread(s) still running here had finished in the state; each is being ended", to_end.size());
 
     // Host-side audio decoders hold a position inside the stream they were decoding. Guest memory
     // has just been rewound underneath them, so that position is now wrong and the next frame

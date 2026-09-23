@@ -123,6 +123,11 @@ struct ThreadState {
     void exit_delete(SceInt32 status);
     // Deletes a dormant thread, or one being torn down, without running its end handler
     void remove();
+    // A savestate load whose state has this thread finished, while this session still runs it: end
+    // it where it stands and let it park dormant, which is what the state describes. No end
+    // callback -- as far as the restored guest is concerned this run never happened. The thread
+    // object stays, so the ID the state has is still there to be waited on or deleted.
+    void end_for_savestate();
 
     void update_status(ThreadStatus status, std::optional<ThreadStatus> expected = std::nullopt);
     // Whether the thread is deleted, so guest calls can't find it
@@ -302,6 +307,8 @@ private:
     // under whatever locks it already holds.
     mutable std::mutex wait_release_mutex;
     std::optional<WaitRelease> wait_release;
+    // Set by end_for_savestate: the ending skips the end handler
+    bool end_quietly = false;
     // Set while wait_while_held keeps the thread at its gate
     bool parked = false;
     // Number of active run_loop levels: 1 at the top level, one more for each nested callback.
