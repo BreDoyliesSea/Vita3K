@@ -178,6 +178,12 @@ void destroy_render_target_while_parked(State &state, std::unique_ptr<RenderTarg
     destroy_render_target_now(state, rt);
 }
 
+void reset_surface_sync_after_savestate(State &state, MemState &mem) {
+    if (state.current_backend != Backend::Vulkan)
+        return;
+    dynamic_cast<vulkan::VKState &>(state).surface_cache.reset_sync_state_after_savestate(mem);
+}
+
 void forget_render_target(State &state, Context &context, const RenderTarget *rt) {
     if (!rt)
         return;
