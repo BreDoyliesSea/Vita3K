@@ -2154,7 +2154,12 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
             const uint64_t now = rtc_get_ticks(emuenv.kernel.base_tick.tick);
             const uint64_t was = now - emuenv.kernel.start_tick;
             emuenv.kernel.start_tick = now - guest_elapsed;
-            LOG_INFO("Savestate: guest clock rewound {} us, to {} us", was - guest_elapsed, guest_elapsed);
+            // Unsigned: a state taken later in its session than this one has run moves the clock
+            // forward, which is every load into a fresh boot.
+            if (guest_elapsed <= was)
+                LOG_INFO("Savestate: guest clock rewound {} us, to {} us", was - guest_elapsed, guest_elapsed);
+            else
+                LOG_INFO("Savestate: guest clock moved forward {} us, to {} us", guest_elapsed - was, guest_elapsed);
         }
     }
 
