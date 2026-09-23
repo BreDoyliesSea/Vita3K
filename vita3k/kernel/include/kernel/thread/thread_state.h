@@ -103,6 +103,11 @@ struct ThreadState {
     int start(SceSize arglen, const Ptr<void> argp, bool run_entry_callback = false);
     void exit(SceInt32 status);
     void exit_delete(bool exit = true);
+    // A savestate load whose state has this thread finished, while this session still runs it: end
+    // it where it stands and let it park dormant, which is what the state describes. No end
+    // callback -- as far as the restored guest is concerned this run never happened. The thread
+    // object stays, so the ID the state has is still there to be waited on or deleted.
+    void end_for_savestate();
 
     void update_status(ThreadStatus status, std::optional<ThreadStatus> expected = std::nullopt);
     Address stack_top() const;

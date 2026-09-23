@@ -205,6 +205,26 @@ void ThreadState::exit_delete(bool exit) {
     wait_cv.notify_all();
 }
 
+void ThreadState::end_for_savestate() {
+    std::lock_guard<std::mutex> lock(mutex);
+
+    run_end_callback = false;
+    exit_requested = true;
+
+    // The same wake-ups as exit_delete, for the same reason: whichever way this thread is stopped,
+    // it has to reach the top of run_loop to see exit_requested. There it parks dormant instead of
+    // being erased, because delete_requested is not set.
+    if (status == ThreadStatus::run) {
+        stop(*cpu);
+    } else if (status == ThreadStatus::wait) {
+        update_status(ThreadStatus::run);
+    } else {
+        status_cond.notify_all();
+    }
+
+    signal.send();
+}
+
 void ThreadState::run_loop() {
     logging::name_this_thread(fmt::format("guest {} {}", id, name));
     bool guest_returned = false;
