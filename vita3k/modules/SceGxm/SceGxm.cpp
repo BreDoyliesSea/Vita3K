@@ -1469,12 +1469,12 @@ void gxm::collect_host_owned_ranges(GxmState &gxm, const MemState &mem,
         out.emplace_back(address + host_offset, static_cast<uint32_t>(sizeof(SceGxmContext)) - host_offset);
     };
 
-    if (gxm.immediate_context)
-        preserve_context_tail(gxm.immediate_context);
+    for (const auto &[_, address] : gxm.immediate_contexts)
+        preserve_context_tail(address);
     for (const auto &[_, address] : gxm.deferred_contexts)
         preserve_context_tail(address);
 
-    // The immediate context's commands live in guest memory as well: allocate_new_command
+    // An immediate context's commands live in guest memory as well: allocate_new_command
     // constructs each renderer::Command inside the VDM ring buffer the guest gave
     // sceGxmCreateContext. A command is all host state -- an opcode, a next pointer, pointers to
     // payloads the host allocated -- and the allocator's positions are host members in the context
@@ -1482,8 +1482,8 @@ void gxm::collect_host_owned_ranges(GxmState &gxm, const MemState &mem,
     // of the save back under a live command list. On Project DIVA f that was a batch starting with
     // a Draw that no scene had begun ("already recording" after about a third of loads) and heap
     // corruption in cmd_handle_set_context, which frees a SetContext's payload.
-    if (gxm.immediate_context) {
-        const SceGxmContext *const context = Ptr<SceGxmContext>(gxm.immediate_context).get(mem);
+    for (const auto &[_, address] : gxm.immediate_contexts) {
+        const SceGxmContext *const context = Ptr<SceGxmContext>(address).get(mem);
         if (context && context->alloc_space && context->command_allocator_size > 0)
             out.emplace_back(context->alloc_space.address(),
                 static_cast<uint32_t>(context->command_allocator_size * sizeof(renderer::Command)));
@@ -1520,8 +1520,8 @@ void gxm::collect_host_owned_ranges(GxmState &gxm, const MemState &mem,
 
 gxm::HostObjectLayout gxm::capture_layout(GxmState &gxm, const MemState &mem) {
     HostObjectLayout layout;
-    if (gxm.immediate_context)
-        layout.contexts.push_back(gxm.immediate_context);
+    for (const auto &[_, address] : gxm.immediate_contexts)
+        layout.contexts.push_back(address);
     for (const auto &[_, address] : gxm.deferred_contexts)
         layout.contexts.push_back(address);
     for (const auto &[_, address] : gxm.render_targets)
@@ -1692,10 +1692,14 @@ std::string gxm::recreate_render_targets(GxmState &gxm, const MemState &mem, ren
 }
 
 bool gxm::scene_in_progress(GxmState &gxm, const MemState &mem) {
-    if (!gxm.immediate_context)
-        return false;
-    const SceGxmContext *const context = Ptr<const SceGxmContext>(gxm.immediate_context).get(mem);
-    return context && context->state.active;
+    // Any of them: a scene on one immediate context is as much a reason to wait as a scene on
+    // another (a game can hold several since upstream's multiple immediate contexts).
+    for (const auto &[_, address] : gxm.immediate_contexts) {
+        const SceGxmContext *const context = Ptr<const SceGxmContext>(address).get(mem);
+        if (context && context->state.active)
+            return true;
+    }
+    return false;
 }
 
 std::string gxm::check_layout(GxmState &gxm, const MemState &mem, const HostObjectLayout &saved, const bool render_targets_handled) {
