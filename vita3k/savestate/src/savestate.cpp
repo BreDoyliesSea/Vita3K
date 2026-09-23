@@ -101,6 +101,8 @@ constexpr uint32_t TAG_CLCK = 0x4B434C43U;
 constexpr uint32_t TAG_ADEC = 0x43454441U;
 // "ADCI" - which sceAudiodec decoders existed and how each was made. Optional.
 constexpr uint32_t TAG_ADCI = 0x49434441U;
+// "MBLK" - the kernel memory block registry: uid, name, where and how big. Optional.
+constexpr uint32_t TAG_MBLK = 0x4B4C424DU;
 
 
 // Point a context saved inside an HLE call back at the call itself, so the thread makes it again
@@ -747,6 +749,7 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
     // audiodec_save_positions for what a load did without it.
     const std::vector<uint8_t> adec_raw = audiodec_save_positions(emuenv);
     const std::vector<uint8_t> adci_raw = audiodec_save_identities(emuenv);
+    const std::vector<uint8_t> mblk_raw = sysmem_save_blocks(emuenv);
 
     // --- assemble ---------------------------------------------------------------------------
     std::vector<uint8_t> file;
@@ -945,6 +948,11 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
     put<uint64_t>(file, adci_raw.size());
     file.insert(file.end(), adci_raw.begin(), adci_raw.end());
 
+    put(file, TAG_MBLK);
+    put<uint64_t>(file, mblk_raw.size());
+    put<uint64_t>(file, mblk_raw.size());
+    file.insert(file.end(), mblk_raw.begin(), mblk_raw.end());
+
     // Write to a temporary and rename into place, so an interrupted save cannot destroy the
     // previous good state.
     boost::system::error_code err;
@@ -1059,6 +1067,8 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
     size_t adec_size = 0;
     const uint8_t *adci_data = nullptr;
     size_t adci_size = 0;
+    const uint8_t *mblk_data = nullptr;
+    size_t mblk_size = 0;
 
     while (r.need(sizeof(uint32_t) + sizeof(uint64_t) * 2)) {
         uint32_t tag = 0;
@@ -1152,6 +1162,10 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
         case TAG_ADCI:
             adci_data = payload;
             adci_size = static_cast<size_t>(stored);
+            break;
+        case TAG_MBLK:
+            mblk_data = payload;
+            mblk_size = static_cast<size_t>(stored);
             break;
         default:
             LOG_WARN("Savestate: ignoring unknown chunk 0x{:08X}", tag);
@@ -2489,6 +2503,12 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
     // And the decoders the guest opens itself through sceAudiodec: all flushed, then the ATRAC9
     // ones put back where the state had them inside their superframes. Without that, Gravity Rush's
     // music stopped after the first load of every session.
+    // The memory block registry, now that the pages behind it are back: without this the restored
+    // guest holds uids the kernel does not know, and freeing one gets ILLEGAL_BLOCK_ID -- which
+    // Spelunky answered by calling its abort handler and closing the game.
+    const size_t blocks_recreated = sysmem_recreate_missing_blocks(emuenv, mblk_data, mblk_size);
+    LOG_INFO_IF(blocks_recreated > 0, "Savestate: put back {} memory block(s) this session did not have", blocks_recreated);
+
     // Decoders this session never opened, because the state is from further into the game: created
     // first, so the flush and the position restore below reach them too.
     const size_t audio_recreated = audiodec_recreate_missing(emuenv, adci_data, adci_size);
