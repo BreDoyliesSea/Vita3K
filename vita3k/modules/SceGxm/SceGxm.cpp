@@ -1702,7 +1702,7 @@ bool gxm::scene_in_progress(GxmState &gxm, const MemState &mem) {
     return false;
 }
 
-std::string gxm::check_layout(GxmState &gxm, const MemState &mem, const HostObjectLayout &saved, const bool render_targets_handled) {
+std::string gxm::check_layout(GxmState &gxm, const MemState &mem, const HostObjectLayout &saved, const bool render_targets_handled, const bool programs_handled) {
     const HostObjectLayout live = capture_layout(gxm, mem);
     const auto check = [](const char *kind, const std::vector<Address> &saved_list, const std::vector<Address> &live_list) -> std::string {
         for (const Address address : saved_list) {
@@ -1722,6 +1722,9 @@ std::string gxm::check_layout(GxmState &gxm, const MemState &mem, const HostObje
              std::tuple{ "fragment program", &saved.fragment_programs, &live.fragment_programs } }) {
         // Missing render targets are the caller's, when it has what it takes to make them again.
         if (render_targets_handled && saved_list == &saved.render_targets)
+            continue;
+        // And the same for programs, from GXPG.
+        if (programs_handled && (saved_list == &saved.vertex_programs || saved_list == &saved.fragment_programs))
             continue;
         std::string why = check(kind, *saved_list, *live_list);
         if (!why.empty())
@@ -1784,6 +1787,103 @@ static bool operator<(const FragmentProgramCacheKey &a, const FragmentProgramCac
         return false;
     }
     return b.blend_info < a.blend_info;
+}
+
+// See the declarations in gxm/functions.h. Here because SceGxmShaderPatcher and the cache keys are
+// only complete in this translation unit.
+static const SceGxmBlendInfo savestate_default_blend_info = {
+    SCE_GXM_COLOR_MASK_ALL,
+    SCE_GXM_BLEND_FUNC_NONE,
+    SCE_GXM_BLEND_FUNC_NONE,
+    SCE_GXM_BLEND_FACTOR_ONE,
+    SCE_GXM_BLEND_FACTOR_ZERO,
+    SCE_GXM_BLEND_FACTOR_ONE,
+    SCE_GXM_BLEND_FACTOR_ZERO
+};
+
+std::vector<gxm::ProgramIdentity> gxm::capture_program_identities(GxmState &gxm, const MemState &mem) {
+    std::vector<ProgramIdentity> out;
+    const std::lock_guard<std::mutex> lock(gxm.shader_patcher_mutex);
+    for (const Address patcher_address : gxm.shader_patchers) {
+        const SceGxmShaderPatcher *const patcher = Ptr<SceGxmShaderPatcher>(patcher_address).get(mem);
+        if (!patcher)
+            continue;
+        for (const auto &[key, program] : patcher->vertex_program_cache) {
+            const SceGxmVertexProgram *const vp = program.get(mem);
+            if (!vp)
+                continue;
+            ProgramIdentity identity;
+            identity.address = program.address();
+            identity.patcher = patcher_address;
+            identity.program = key.vertex_program.program.address();
+            identity.reference_count = vp->reference_count.load(std::memory_order_relaxed);
+            identity.key_hash = key.hash;
+            identity.streams = vp->streams;
+            identity.attributes = vp->attributes;
+            out.push_back(std::move(identity));
+        }
+        for (const auto &[key, program] : patcher->fragment_program_cache) {
+            const SceGxmFragmentProgram *const fp = program.get(mem);
+            if (!fp)
+                continue;
+            ProgramIdentity identity;
+            identity.address = program.address();
+            identity.patcher = patcher_address;
+            identity.program = key.fragment_program.program.address();
+            identity.fragment = true;
+            identity.reference_count = fp->reference_count.load(std::memory_order_relaxed);
+            identity.has_blend_info = memcmp(&key.blend_info, &savestate_default_blend_info, sizeof(SceGxmBlendInfo)) != 0;
+            identity.blend_info = key.blend_info;
+            out.push_back(std::move(identity));
+        }
+    }
+    return out;
+}
+
+std::string gxm::recreate_programs(GxmState &gxm, const MemState &mem, renderer::State &renderer, const std::vector<ProgramIdentity> &missing, uint32_t &recreated) {
+    const std::lock_guard<std::mutex> lock(gxm.shader_patcher_mutex);
+    for (const ProgramIdentity &identity : missing) {
+        SceGxmShaderPatcher *const patcher = Ptr<SceGxmShaderPatcher>(identity.patcher).get(mem);
+        if (!patcher)
+            return fmt::format("the shader patcher {} that made program {} is not in mapped memory", log_hex(identity.patcher), log_hex(identity.address));
+        const SceGxmProgram *const program = Ptr<const SceGxmProgram>(identity.program).get(mem);
+        if (!program)
+            return fmt::format("the shader program {} behind {} is not in mapped memory", log_hex(identity.program), log_hex(identity.address));
+
+        if (identity.fragment) {
+            SceGxmFragmentProgram *const fp = Ptr<SceGxmFragmentProgram>(identity.address).get(mem);
+            if (!fp)
+                return fmt::format("fragment program {} is not in mapped memory", log_hex(identity.address));
+            // A fresh wrapper over the restored bytes, then the same steps as
+            // sceGxmShaderPatcherCreateFragmentProgram.
+            new (fp) SceGxmFragmentProgram{};
+            fp->is_maskupdate = false;
+            fp->program = Ptr<const SceGxmProgram>(identity.program);
+            if (!renderer::create(fp->renderer_data, renderer, *program, identity.has_blend_info ? &identity.blend_info : nullptr, renderer.gxp_ptr_map))
+                return fmt::format("fragment program {} cannot be made again", log_hex(identity.address));
+            fp->reference_count = identity.reference_count;
+            patcher->fragment_program_cache.emplace(
+                FragmentProgramCacheKey{ SceGxmRegisteredProgram{ Ptr<const SceGxmProgram>(identity.program) }, identity.blend_info },
+                Ptr<SceGxmFragmentProgram>(identity.address));
+        } else {
+            SceGxmVertexProgram *const vp = Ptr<SceGxmVertexProgram>(identity.address).get(mem);
+            if (!vp)
+                return fmt::format("vertex program {} is not in mapped memory", log_hex(identity.address));
+            new (vp) SceGxmVertexProgram{};
+            vp->program = Ptr<const SceGxmProgram>(identity.program);
+            vp->key_hash = identity.key_hash;
+            vp->streams = identity.streams;
+            vp->attributes = identity.attributes;
+            if (!renderer::create(vp->renderer_data, renderer, *program, renderer.gxp_ptr_map, vp->attributes))
+                return fmt::format("vertex program {} cannot be made again", log_hex(identity.address));
+            vp->reference_count = identity.reference_count;
+            patcher->vertex_program_cache.emplace(
+                VertexProgramCacheKey{ SceGxmRegisteredProgram{ Ptr<const SceGxmProgram>(identity.program) }, static_cast<VertexCacheHash>(identity.key_hash) },
+                Ptr<SceGxmVertexProgram>(identity.address));
+        }
+        recreated++;
+    }
+    return {};
 }
 
 static int init_texture_base(const char *export_name, SceGxmTexture *texture, Ptr<const void> data, SceGxmTextureFormat tex_format, uint32_t width, uint32_t height, uint32_t mipCount,
