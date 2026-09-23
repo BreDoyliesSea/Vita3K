@@ -77,6 +77,8 @@ constexpr uint32_t TAG_GXML = 0x4C4D5847U;
 // the session has since destroyed. Optional: a state without it still loads, into a session that
 // still has every render target it names.
 constexpr uint32_t TAG_GXRT = 0x54525847U;
+// "GXPG" - how each shader-patcher program was made. Optional, so older states still load.
+constexpr uint32_t TAG_GXPG = 0x47505847U;
 // "THRD" - each thread's status and callback depth. A load needs it to restart waits.
 constexpr uint32_t TAG_THRD = 0x44524854U;
 // "THRI" - what each thread is made of (name, entry, priority, affinity, stack, TLS, initial
@@ -684,6 +686,31 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
         }
     }
 
+    // --- how each shader-patcher program was made -----------------------------------------------
+    // See gxm::recreate_programs: a state taken in gameplay names every program the game has
+    // compiled, and a session still booting has almost none of them.
+    std::vector<uint8_t> gxpg_raw;
+    {
+        const std::vector<gxm::ProgramIdentity> identities = gxm::capture_program_identities(emuenv.gxm, emuenv.mem);
+        put<uint32_t>(gxpg_raw, static_cast<uint32_t>(identities.size()));
+        for (const gxm::ProgramIdentity &identity : identities) {
+            put<uint32_t>(gxpg_raw, identity.address);
+            put<uint32_t>(gxpg_raw, identity.patcher);
+            put<uint32_t>(gxpg_raw, identity.program);
+            put<uint8_t>(gxpg_raw, identity.fragment ? 1 : 0);
+            put<uint32_t>(gxpg_raw, identity.reference_count);
+            put<uint32_t>(gxpg_raw, identity.key_hash);
+            put<uint32_t>(gxpg_raw, static_cast<uint32_t>(identity.streams.size()));
+            for (const SceGxmVertexStream &stream : identity.streams)
+                put(gxpg_raw, stream);
+            put<uint32_t>(gxpg_raw, static_cast<uint32_t>(identity.attributes.size()));
+            for (const SceGxmVertexAttribute &attribute : identity.attributes)
+                put(gxpg_raw, attribute);
+            put<uint8_t>(gxpg_raw, identity.has_blend_info ? 1 : 0);
+            put(gxpg_raw, identity.blend_info);
+        }
+    }
+
     // --- which GPU memory regions are mapped ----------------------------------------------------
     // sceGxmMapMemory registrations are host state: the guest's registry, and with memory mapping
     // on a host buffer per region as well. They are not part of guest memory, so a load restores a
@@ -775,6 +802,11 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
     put<uint64_t>(file, gxrt_raw.size());
     put<uint64_t>(file, gxrt_raw.size());
     file.insert(file.end(), gxrt_raw.begin(), gxrt_raw.end());
+
+    put(file, TAG_GXPG);
+    put<uint64_t>(file, gxpg_raw.size());
+    put<uint64_t>(file, gxpg_raw.size());
+    file.insert(file.end(), gxpg_raw.begin(), gxpg_raw.end());
 
     // --- THRI: what each thread is made of -----------------------------------------------------
     // Enough to recreate one the session has since deleted: see savestate::load. Its TLS block is
@@ -999,6 +1031,8 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
     size_t gxml_size = 0;
     const uint8_t *gxrt_data = nullptr;
     size_t gxrt_size = 0;
+    const uint8_t *gxpg_data = nullptr;
+    size_t gxpg_size = 0;
     const uint8_t *thrd_data = nullptr;
     size_t thrd_size = 0;
     const uint8_t *thri_data = nullptr;
@@ -1068,6 +1102,10 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
         case TAG_GXRT:
             gxrt_data = payload;
             gxrt_size = static_cast<size_t>(stored);
+            break;
+        case TAG_GXPG:
+            gxpg_data = payload;
+            gxpg_size = static_cast<size_t>(stored);
             break;
         case TAG_THRD:
             thrd_data = payload;
@@ -1354,6 +1392,10 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
     // decided here, before anything is touched, so a state without GXRT gets the old refusal and
     // OpenGL, where a parked render thread cannot make one, refuses too.
     std::vector<gxm::RenderTargetIdentity> render_targets_to_recreate;
+    // The same for the shader-patcher programs, from GXPG: a state taken in gameplay names every
+    // program the game has compiled so far, and a session still on its title screen has almost none
+    // of them (notes/19, gap A).
+    std::vector<gxm::ProgramIdentity> programs_to_recreate;
     if (gxml_data) {
         Reader gr{ gxml_data, gxml_size, 0 };
         gxm::HostObjectLayout layout;
@@ -1397,7 +1439,64 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
                 render_targets_to_recreate.push_back({ address, it->second });
             }
         }
-        const std::string why = gxm::check_layout(emuenv.gxm, emuenv.mem, layout, true);
+        // Programs the state has and the session lacks, the same way.
+        bool programs_handled = false;
+        if (gxpg_data) {
+            std::map<Address, gxm::ProgramIdentity> described;
+            Reader pr{ gxpg_data, gxpg_size, 0 };
+            uint32_t count = 0;
+            if (!pr.get(count))
+                return Result::fail("corrupt program chunk");
+            for (uint32_t i = 0; i < count; i++) {
+                gxm::ProgramIdentity identity;
+                uint8_t fragment = 0, has_blend = 0;
+                uint32_t streams = 0, attributes = 0;
+                if (!pr.get(identity.address) || !pr.get(identity.patcher) || !pr.get(identity.program) || !pr.get(fragment)
+                    || !pr.get(identity.reference_count) || !pr.get(identity.key_hash) || !pr.get(streams))
+                    return Result::fail("corrupt program chunk");
+                identity.fragment = fragment != 0;
+                identity.streams.resize(streams);
+                for (SceGxmVertexStream &stream : identity.streams) {
+                    if (!pr.get(stream))
+                        return Result::fail("corrupt program chunk");
+                }
+                if (!pr.get(attributes))
+                    return Result::fail("corrupt program chunk");
+                identity.attributes.resize(attributes);
+                for (SceGxmVertexAttribute &attribute : identity.attributes) {
+                    if (!pr.get(attribute))
+                        return Result::fail("corrupt program chunk");
+                }
+                if (!pr.get(has_blend) || !pr.get(identity.blend_info))
+                    return Result::fail("corrupt program chunk");
+                identity.has_blend_info = has_blend != 0;
+                described[identity.address] = std::move(identity);
+            }
+
+            const gxm::HostObjectLayout live = gxm::capture_layout(emuenv.gxm, emuenv.mem);
+            programs_handled = true;
+            for (const auto &[kind, saved_list, live_list] : {
+                     std::tuple{ "vertex program", &layout.vertex_programs, &live.vertex_programs },
+                     std::tuple{ "fragment program", &layout.fragment_programs, &live.fragment_programs } }) {
+                for (const Address address : *saved_list) {
+                    if (std::binary_search(live_list->begin(), live_list->end(), address))
+                        continue;
+                    const auto it = described.find(address);
+                    if (it == described.end()) {
+                        programs_handled = false;
+                        programs_to_recreate.clear();
+                        break;
+                    }
+                    if (emuenv.renderer->current_backend != renderer::Backend::Vulkan)
+                        return Result::fail(fmt::format("the graphics objects are laid out differently in this session: the state has a {} at {} that this session lacks, and only Vulkan can make one while the render thread is parked", kind, log_hex(address)));
+                    programs_to_recreate.push_back(it->second);
+                }
+                if (!programs_handled)
+                    break;
+            }
+        }
+
+        const std::string why = gxm::check_layout(emuenv.gxm, emuenv.mem, layout, true, programs_handled);
         if (!why.empty())
             return Result::fail("the graphics objects are laid out differently in this session: " + why);
         gxm_layout = std::move(layout);
@@ -1768,6 +1867,20 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
         const std::string why = gxm::recreate_render_targets(emuenv.gxm, emuenv.mem, *emuenv.renderer, render_targets_to_recreate, recreated_targets);
         if (recreated_targets > 0)
             LOG_INFO("Savestate: recreated {} render target(s) the guest had destroyed since the save", recreated_targets);
+        if (!why.empty())
+            LOG_ERROR("Savestate: {}", why);
+    }
+
+    // --- recreate the programs the session has not compiled yet ---------------------------------
+    // Same shape as the render targets above: the bytes are back, the host members in them are the
+    // saved session's, so each is rebuilt from GXPG and put back in its patcher's cache. Gravity
+    // Rush's states name 56 vertex and 51 fragment programs that a session on its title screen has
+    // never made.
+    if (!programs_to_recreate.empty()) {
+        uint32_t recreated_programs = 0;
+        const std::string why = gxm::recreate_programs(emuenv.gxm, emuenv.mem, *emuenv.renderer, programs_to_recreate, recreated_programs);
+        if (recreated_programs > 0)
+            LOG_INFO("Savestate: made again {} shader program(s) this session had not compiled", recreated_programs);
         if (!why.empty())
             LOG_ERROR("Savestate: {}", why);
     }

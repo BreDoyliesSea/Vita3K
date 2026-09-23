@@ -65,7 +65,39 @@ HostObjectLayout capture_layout(GxmState &gxm, const MemState &mem);
 
 // Empty if every object in `saved` is a live object of the same kind at the same address here,
 // otherwise which one is not. Extra live objects are not fine -- see rollback_to_layout.
-std::string check_layout(GxmState &gxm, const MemState &mem, const HostObjectLayout &saved, bool render_targets_handled = false);
+std::string check_layout(GxmState &gxm, const MemState &mem, const HostObjectLayout &saved, bool render_targets_handled = false, bool programs_handled = false);
+
+// How one of a shader patcher's programs was made: which patcher cached it, which SceGxmProgram it
+// compiles, and the rest of what sceGxmShaderPatcherCreate{Vertex,Fragment}Program was given. A
+// savestate records these so a load can make again the programs a session has not created yet -- a
+// state taken in gameplay names every program the game has compiled so far, and a session still on
+// its title screen has almost none of them (Gravity Rush: 56 vertex and 51 fragment programs in the
+// state, 5 and 5 in the session; every load of such a state was refused).
+//
+// Mask-update fragment programs are not here: sceGxmShaderPatcherCreateMaskUpdateFragmentProgram
+// never puts one in the cache, so neither the layout nor this sees them.
+struct ProgramIdentity {
+    Address address = 0;
+    Address patcher = 0;
+    Address program = 0; // the SceGxmProgram the registered program pointed at
+    bool fragment = false;
+    uint32_t reference_count = 1;
+    // Vertex programs only.
+    uint32_t key_hash = 0;
+    std::vector<SceGxmVertexStream> streams;
+    std::vector<SceGxmVertexAttribute> attributes;
+    // Fragment programs only. has_blend_info is false when the cache key holds the default, which
+    // is what the patcher stores for a guest that passed none; the renderer is given none again.
+    bool has_blend_info = false;
+    SceGxmBlendInfo blend_info{};
+};
+std::vector<ProgramIdentity> capture_program_identities(GxmState &gxm, const MemState &mem);
+
+// Make again the programs the state has and the session lacks, at their addresses, after the memory
+// restore. Like the render targets: the bytes are back but the host members in them (the renderer
+// program, and the attribute and stream vectors) belong to the saved session, so each is rebuilt
+// from its identity and put back in its patcher's cache. Vulkan only, for the same reason.
+std::string recreate_programs(GxmState &gxm, const MemState &mem, renderer::State &renderer, const std::vector<ProgramIdentity> &missing, uint32_t &recreated);
 
 // Destroy the host half of every object that is live here but not in `saved`: the ones the guest
 // created after the state was taken. Their guest memory came from the guest's own heap (shader
