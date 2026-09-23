@@ -89,6 +89,16 @@ static void protect_surface(MemState &mem, ColorSurfaceCacheInfo &info) {
         });
 }
 
+void VKSurfaceCache::reset_sync_state_after_savestate(MemState &mem) {
+    for (auto &[address, info] : color_address_lookup) {
+        if (!info)
+            continue;
+        if (info->need_surface_sync)
+            *info->need_surface_sync = false;
+        protect_surface(mem, *info);
+    }
+}
+
 ColorSurfaceCacheInfo::~ColorSurfaceCacheInfo() {
     sws_freeContext(sws_context);
 }

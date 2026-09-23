@@ -117,6 +117,10 @@ void destroy_render_target_during_shutdown(State &state, std::unique_ptr<RenderT
 // current on the render thread only. forget_render_target drops a context's pointers to a render
 // target about to be destroyed (its current target, and the surface cache's on Vulkan).
 bool create_render_target_while_parked(State &state, std::unique_ptr<RenderTarget> &rt, const SceGxmRenderTargetParams *params);
+
+// Also for a savestate, at both ends: see VKSurfaceCache::reset_sync_state_after_savestate. Nothing
+// to do on OpenGL, which does not trap surfaces.
+void reset_surface_sync_after_savestate(State &state, MemState &mem);
 void destroy_render_target_while_parked(State &state, std::unique_ptr<RenderTarget> &rt);
 void forget_render_target(State &state, Context &context, const RenderTarget *rt);
 

@@ -202,6 +202,14 @@ public:
     explicit VKSurfaceCache(VKState &state);
     void cleanup();
 
+    // For a savestate. Both ends of one touch guest memory the way the guest would: a save reads
+    // every region, and a load's drop_all_protections calls each protected range's callback before
+    // unprotecting it. For a surface that callback means "the CPU has been at this surface", which
+    // leaves need_surface_sync set, and a set flag is a full GPU-to-guest copy of that surface every
+    // frame from then on - measured as 61 fps -> 1-8 on Spelunky with surface sync on, permanently.
+    // Neither touch was the guest's, so clear the flags and put the page traps back.
+    void reset_sync_state_after_savestate(MemState &mem);
+
     SurfaceRetrieveResult retrieve_color_surface_for_framebuffer(MemState &mem, SceGxmColorSurface *color);
     std::optional<TextureLookupResult> retrieve_color_surface_as_texture(const SceGxmTexture &texture, const SceGxmColorBaseFormat base_format, TextureViewport *texture_viewport);
 

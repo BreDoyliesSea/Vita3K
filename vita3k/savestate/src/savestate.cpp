@@ -23,6 +23,7 @@
 #include <emuenv/state.h>
 #include <audio/state.h>
 #include <gxm/state.h>
+#include <renderer/functions.h>
 #include <renderer/state.h>
 #include <rtc/rtc.h>
 #include <io/functions.h>
@@ -971,6 +972,11 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
     if (err)
         return Result::fail("could not move state into place: " + err.message());
 
+    // Reading every region above trod on the surface traps, which told the renderer the CPU wants
+    // those surfaces copied back. It does not: that was us. Clear it, or every frame after a
+    // quicksave copies them (61 fps -> 1-8 on Spelunky, measured with surface sync on).
+    renderer::reset_surface_sync_after_savestate(*emuenv.renderer, emuenv.mem);
+
     LOG_INFO("Savestate written: {} ({} regions, {} threads, {:.1f} MiB raw -> {:.1f} MiB on disk)",
         path.string(), region_count, thread_count,
         static_cast<double>(mem_raw.size()) / (1024.0 * 1024.0),
@@ -1880,6 +1886,11 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
         const uint32_t moved = ngs::relocate_after_restore(emuenv.ngs, emuenv.mem, *ngs_stash);
         LOG_INFO_IF(moved > 0, "Savestate: moved {} NGS pool(s) to where the state has them", moved);
     }
+
+    // The restore dropped every protection, and dropping one runs its callback first - which for a
+    // surface says the CPU touched it. Guest memory is the state's now, so nothing needs copying
+    // back; clear the flags and put the traps back.
+    renderer::reset_surface_sync_after_savestate(*emuenv.renderer, emuenv.mem);
 
     // --- point each thread at its stack -------------------------------------------------------
     // Must happen after the address space has been reconciled and before any thread runs again.
