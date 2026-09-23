@@ -18,9 +18,12 @@
 #include "SceSysmem.h"
 #include "SceSysmemForDriver.h"
 
+#include <emuenv/state.h>
 #include <kernel/state.h>
 #include <kernel/types.h>
 #include <modules/sysmem_state.h>
+
+#include <cstring>
 
 #include <packages/sfo.h>
 
@@ -61,6 +64,102 @@ struct SceKernelFreeMemorySizeInfo {
 
 LIBRARY_INIT(SceSysmem) {
     emuenv.kernel.obj_store.create<SysmemState>();
+}
+
+// Declared in modules/sysmem_state.h. The registry only: uid, name, where the block is and how big,
+// plus which of them the VM variants own and what the running totals were.
+std::vector<uint8_t> sysmem_save_blocks(EmuEnvState &emuenv) {
+    const auto state = emuenv.kernel.obj_store.get<SysmemState>();
+    const std::lock_guard<std::mutex> lock(state->mutex);
+    std::vector<uint8_t> out;
+    const auto append = [&out](const void *data, size_t size) {
+        const auto *const bytes = static_cast<const uint8_t *>(data);
+        out.insert(out.end(), bytes, bytes + size);
+    };
+    const auto append32 = [&append](uint32_t value) { append(&value, sizeof(value)); };
+
+    append32(static_cast<uint32_t>(state->blocks.size()));
+    for (const auto &[uid, block] : state->blocks) {
+        if (!block)
+            continue;
+        append(&uid, sizeof(uid));
+        const auto name_length = static_cast<uint32_t>(std::strlen(block->name));
+        append32(name_length);
+        append(block->name, name_length);
+        append32(block->size);
+        append32(block->mappedBase.address());
+        append32(block->mappedSize);
+        append32(static_cast<uint32_t>(block->memoryType));
+        append32(block->access);
+        append32(static_cast<uint32_t>(block->type));
+        append32(state->vm_blocks.contains(uid) ? 1 : 0);
+    }
+    append32(static_cast<uint32_t>(state->next_uid));
+    append32(state->allocated_user);
+    append32(state->allocated_cdram);
+    append32(state->allocated_phycont);
+    return out;
+}
+
+// Declared in modules/sysmem_state.h. Runs after the memory pass, which has already put the pages
+// back; this only makes the kernel own up to them again. Blocks this session has that the state does
+// not are left alone, like the allocations behind them: the restored guest cannot see them, and
+// freeing one would pull the ground out from under something host-side still pointing at it.
+size_t sysmem_recreate_missing_blocks(EmuEnvState &emuenv, const uint8_t *data, size_t size) {
+    if (!data)
+        return 0;
+    const auto state = emuenv.kernel.obj_store.get<SysmemState>();
+    const std::lock_guard<std::mutex> lock(state->mutex);
+    size_t at = 0;
+    const auto read = [&](void *dest, size_t length) {
+        if (size - at < length)
+            return false;
+        std::memcpy(dest, data + at, length);
+        at += length;
+        return true;
+    };
+    const auto read32 = [&](uint32_t &value) { return read(&value, sizeof(value)); };
+
+    uint32_t count = 0;
+    if (!read32(count))
+        return 0;
+    size_t recreated = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        SceUID uid = 0;
+        uint32_t name_length = 0;
+        if (!read(&uid, sizeof(uid)) || !read32(name_length) || size - at < name_length)
+            return recreated;
+        const std::string name(reinterpret_cast<const char *>(data + at), name_length);
+        at += name_length;
+        uint32_t info_size = 0, mapped_base = 0, mapped_size = 0, memory_type = 0, access = 0, type = 0, is_vm = 0;
+        if (!read32(info_size) || !read32(mapped_base) || !read32(mapped_size) || !read32(memory_type)
+            || !read32(access) || !read32(type) || !read32(is_vm))
+            return recreated;
+        if (state->blocks.contains(uid))
+            continue;
+        const KernelMemBlockPtr block = std::make_shared<KernelMemBlock>();
+        block->size = info_size;
+        block->mappedBase = Ptr<void>(mapped_base);
+        block->mappedSize = mapped_size;
+        block->memoryType = static_cast<int>(memory_type);
+        block->access = access;
+        block->type = static_cast<SceKernelMemBlockType>(type);
+        std::strncpy(block->name, name.c_str(), KERNELOBJECT_MAX_NAME_LENGTH);
+        block->name[KERNELOBJECT_MAX_NAME_LENGTH] = '\0';
+        state->blocks.emplace(uid, block);
+        if (is_vm)
+            state->vm_blocks.emplace(uid, block);
+        recreated++;
+    }
+    uint32_t next_uid = 0, allocated_user = 0, allocated_cdram = 0, allocated_phycont = 0;
+    if (read32(next_uid) && read32(allocated_user) && read32(allocated_cdram) && read32(allocated_phycont)) {
+        // So this session does not hand a recreated block's number out again.
+        state->next_uid = std::max<SceUID>(state->next_uid, static_cast<SceUID>(next_uid));
+        state->allocated_user = allocated_user;
+        state->allocated_cdram = allocated_cdram;
+        state->allocated_phycont = allocated_phycont;
+    }
+    return recreated;
 }
 
 EXPORT(SceUID, sceKernelAllocMemBlock, const char *pName, SceKernelMemBlockType type, SceSize size, SceKernelAllocMemBlockOpt *optp) {

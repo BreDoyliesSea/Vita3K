@@ -105,6 +105,17 @@ typedef std::multimap<uint32_t, FuncBindingInfo> FuncBindingInfos;
 
 typedef std::map<uint32_t, uint32_t> ModuleUidByNid;
 
+struct EmuEnvState;
+
+// Savestate support, defined in modules/SceSysmem. A memory block is two things: the pages, which
+// are guest memory and come back with the rest of it, and the kernel's registry of uid -> where and
+// how big, which is host-side and does not. A load into a session that never made a block leaves the
+// restored guest holding a uid the kernel does not know -- `ksceKernelFreeMemBlock returned
+// SCE_KERNEL_ERROR_ILLEGAL_BLOCK_ID`, and once Spelunky answering that by calling its abort handler
+// and closing. Restore returns how many it put back; data may be null for a state without the chunk.
+std::vector<uint8_t> sysmem_save_blocks(EmuEnvState &emuenv);
+size_t sysmem_recreate_missing_blocks(EmuEnvState &emuenv, const uint8_t *data, size_t size);
+
 struct KernelState {
     KernelState();
 
