@@ -216,15 +216,26 @@ void ThreadState::remove() {
 }
 
 void ThreadState::end_for_savestate() {
-    const std::lock_guard<std::mutex> lock(mutex);
-    end_quietly = true;
-    request_ending(Ending::exit);
-    // The same wake-ups as remove(): whichever way this thread is stopped, it has to reach the top
-    // of run_loop to end. There it parks dormant, as an exit does.
-    if (status == ThreadStatus::running)
-        stop(*cpu);
-    status_cond.notify_all();
-    wait_cv.notify_all();
+    std::optional<WaitRelease> release;
+    {
+        const std::lock_guard<std::mutex> lock(wait_release_mutex);
+        release = wait_release;
+    }
+    {
+        const std::lock_guard<std::mutex> lock(mutex);
+        end_quietly = true;
+        request_ending(Ending::exit);
+        // Out of any wait, without what it waited for, the way a load takes a thread out of one
+        abandon_wait.store(true, std::memory_order_release);
+        // The same wake-ups as remove(): whichever way this thread is stopped, it has to reach the
+        // top of run_loop to end. There it parks dormant, as an exit does.
+        if (status == ThreadStatus::running)
+            stop(*cpu);
+        status_cond.notify_all();
+        wait_cv.notify_all();
+    }
+    if (release && release->release)
+        release->release();
 }
 
 void ThreadState::run_loop(bool top_level) {
@@ -316,6 +327,8 @@ void ThreadState::run_loop(bool top_level) {
                 break;
             ending = Ending::none;
             guest_returned = false;
+            // Set by end_for_savestate(); the next start() is a new run
+            abandon_wait.store(false, std::memory_order_release);
             // Status is now dormant: we'll park until the next start() or a delete
         }
 
@@ -374,6 +387,8 @@ void ThreadState::run_loop(bool top_level) {
                 const CPUContext ctx = *context_on_return;
                 context_on_return.reset();
                 abandon_wait.store(false, std::memory_order_release);
+                // The wake that released the wait, which the restarted call must not take as its own
+                wake_pending = false;
                 lock.unlock();
                 held_for_load.store(true, std::memory_order_release);
                 {
@@ -599,7 +614,7 @@ WaitResult ThreadState::wait(WaitTarget target, Deadline deadline, bool callback
     std::unique_lock<std::mutex> lock(mutex);
     // Callbacks don't nest, so inside a callback this is a plain wait
     const bool runs_callbacks = callbacks && !is_processing_callbacks;
-    const auto woken = [&] { return exiting() || wake_pending || (runs_callbacks && callbacks_notified()); };
+    const auto woken = [&] { return exiting() || wake_pending || wait_abandoned() || (runs_callbacks && callbacks_notified()); };
     wait_target = { callbacks ? target.type | WAITTYPE_CB_BIT : target.type, target.id };
     update_status(ThreadStatus::waiting);
     bool satisfied = true;
@@ -610,7 +625,9 @@ WaitResult ThreadState::wait(WaitTarget target, Deadline deadline, bool callback
     // A thread something holds goes on to its gate, which keeps it from its callbacks and its code
     update_status(ThreadStatus::running);
     wait_target = {};
-    if (exiting())
+    // A savestate load is replacing this thread's registers: the call must return without taking
+    // anything or running callbacks, like one whose thread exits
+    if (exiting() || wait_abandoned())
         return std::unexpected{ ThreadExiting{} };
     wake_pending = false;
     if (runs_callbacks && callbacks_notified()) {
@@ -618,7 +635,7 @@ WaitResult ThreadState::wait(WaitTarget target, Deadline deadline, bool callback
         process_callbacks();
         lock.lock();
         // The thread exited or was deleted during the callbacks, so the wait must not complete
-        if (exiting())
+        if (exiting() || wait_abandoned())
             return std::unexpected{ ThreadExiting{} };
         // The callbacks may have changed what the caller waits for, so it rechecks before waiting again
         return SCE_KERNEL_OK;
@@ -774,9 +791,12 @@ int ThreadState::vm_resume() {
 bool ThreadState::continue_from_on_return(uint32_t nid, const CPUContext &ctx) {
     // run_loop checks for this under the same mutex after every call returns, and call_import
     // puts the outer NID back before that. So a thread seen here as still inside `nid` has not yet
-    // been through the check, and will find the context when it gets there.
+    // been through the check, and will find the context when it gets there. Running at the top
+    // level inside that call, it is between two wait() calls of the same wait (guest code it runs
+    // from inside a call is a callback, a level deeper), and the next wait() returns at once.
     const std::lock_guard<std::mutex> lock(mutex);
-    if (status != ThreadStatus::waiting || current_import_nid.load(std::memory_order_relaxed) != nid)
+    const bool in_call = status == ThreadStatus::waiting || (status == ThreadStatus::running && run_loop_depth.load(std::memory_order_acquire) == 1);
+    if (!in_call || current_import_nid.load(std::memory_order_relaxed) != nid)
         return false;
     context_on_return = ctx;
     abandon_wait.store(true, std::memory_order_release);
@@ -793,9 +813,16 @@ void ThreadState::leave_wait() {
     wait_release.reset();
 }
 
-std::optional<ThreadState::WaitRelease> ThreadState::current_wait() const {
-    const std::lock_guard<std::mutex> lock(wait_release_mutex);
-    return wait_release;
+std::optional<ThreadState::WaitRelease> ThreadState::current_wait() {
+    {
+        const std::lock_guard<std::mutex> lock(wait_release_mutex);
+        if (wait_release)
+            return wait_release;
+    }
+    const std::lock_guard<std::mutex> lock(mutex);
+    if (status == ThreadStatus::waiting && wait_target.type != 0)
+        return WaitRelease{ [this] { wake(); } };
+    return std::nullopt;
 }
 
 std::string ThreadState::log_stack_traceback() const {
