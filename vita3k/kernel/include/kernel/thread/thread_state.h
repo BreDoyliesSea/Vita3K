@@ -184,9 +184,10 @@ struct ThreadState {
         return held_for_load.load(std::memory_order_acquire);
     }
 
-    // How a savestate load takes this thread out of the HLE wait it is parked in. Every blocking
-    // call registers one for as long as it is parked (ScopedWait, below), so the load needs no
-    // knowledge of the individual calls.
+    // How a savestate load takes this thread out of the HLE wait it is parked in. Every wait made
+    // through wait() has one already: once armed, wait() returns ThreadExiting, and the release
+    // only has to wake it. A call that blocks some other way registers its own for as long as it
+    // is parked (ScopedWait, below), as does one whose wait() cannot be restarted.
     struct WaitRelease {
         // Ends the wait without it being satisfied, and wakes the thread. Empty for a wait that
         // cannot be woken and ends on its own (sceAudioOutOutput).
@@ -197,11 +198,13 @@ struct ThreadState {
     };
     void enter_wait(WaitRelease how);
     void leave_wait();
-    std::optional<WaitRelease> current_wait() const;
+    // The registered release, or the one for wait() if the thread is blocked there.
+    std::optional<WaitRelease> current_wait();
 
-    // Set once a savestate load has armed this thread (continue_from_on_return) and is ending its
-    // wait. A wait that would otherwise go back to sleep, or run guest callbacks, on waking checks
-    // this and returns instead.
+    // Set once a savestate load has armed this thread (continue_from_on_return) or is ending it
+    // (end_for_savestate). wait() returns ThreadExiting while it is set; a wait made any other way
+    // that would otherwise go back to sleep, or run guest callbacks, on waking checks this and
+    // returns instead.
     bool wait_abandoned() const {
         return abandon_wait.load(std::memory_order_acquire);
     }

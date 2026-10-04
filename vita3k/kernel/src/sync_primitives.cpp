@@ -626,7 +626,9 @@ SceInt32 Condvar::wait(MemState &mem, const ThreadStatePtr &thread, SceUInt32 *t
         return SCE_KERNEL_ERROR_WAIT_CANCEL;
 
     guard.unlock();
-    // Taking the mutex back is still part of the condition variable wait
+    // Taking the mutex back is still part of the condition variable wait. A savestate cannot
+    // restart that: the call would wait on the condition variable again for a signal already taken.
+    const ScopedWait scoped_wait(*thread, { [self = thread.get()] { self->wake(); }, false });
     return associated_mutex->acquire(mem, thread, 1, timeout, false, { lightweight() ? SCE_KERNEL_WAITTYPE_LW_COND_LW_MUTEX : SCE_KERNEL_WAITTYPE_COND_MUTEX, uid }, callbacks);
 }
 
