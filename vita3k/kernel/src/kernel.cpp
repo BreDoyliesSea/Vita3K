@@ -218,7 +218,7 @@ ThreadStatePtr KernelState::create_thread_for_savestate(MemState &mem, SceUID id
     if (resume_after_load) {
         thread->hold_for_savestate_resume();
         const std::lock_guard<std::mutex> lock(mutex);
-        paused_threads_status[id] = ThreadStatus::run;
+        paused_threads_status[id] = ThreadStatus::running;
     }
     return thread;
 }
@@ -288,9 +288,9 @@ bool KernelState::wait_for_threads_paused(std::chrono::milliseconds timeout, std
                 // when pause_threads() ran is not executing guest code and never will be until
                 // it is resumed.
                 const auto recorded = paused_threads_status.find(id);
-                if (recorded == paused_threads_status.end() || recorded->second != ThreadStatus::run)
+                if (recorded == paused_threads_status.end() || recorded->second != ThreadStatus::running)
                     continue;
-                if (thread->status == ThreadStatus::run) {
+                if (thread->status == ThreadStatus::running) {
                     // Say which HLE call it is in, if any: a thread that will not stop is usually
                     // one blocked in a call that does not report its wait.
                     const uint32_t nid = thread->current_import_nid.load(std::memory_order_relaxed);

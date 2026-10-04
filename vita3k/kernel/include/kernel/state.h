@@ -204,7 +204,7 @@ struct KernelState {
     void resume_threads();
 
     // pause_threads() only *requests* a stop: it sets suspend_requested and kicks the JIT out of
-    // run(), and the thread does not actually reach ThreadStatus::suspend until its own run_loop
+    // run(), and the thread does not actually reach ThreadStatus::suspended until its own run_loop
     // comes back around -- after the current guest block finishes, and after any HLE import it is
     // inside of returns. Anything that rewrites guest memory underneath the guest has to wait for
     // that to have happened, or it is racing threads that are still executing. Returns false if a

@@ -2685,8 +2685,8 @@ EXPORT(int, sceGxmDisplayQueueAddEntry, Ptr<SceGxmSyncObject> oldBuffer, Ptr<Sce
             bool reported = false;
             {
                 const std::lock_guard<std::mutex> thread_lock(thread->mutex);
-                if (thread->status == ThreadStatus::run) {
-                    thread->update_status(ThreadStatus::wait, ThreadStatus::run);
+                if (thread->status == ThreadStatus::running) {
+                    thread->update_status(ThreadStatus::waiting, ThreadStatus::running);
                     reported = true;
                 }
             }
@@ -2696,8 +2696,8 @@ EXPORT(int, sceGxmDisplayQueueAddEntry, Ptr<SceGxmSyncObject> oldBuffer, Ptr<Sce
             }
             if (reported) {
                 const std::lock_guard<std::mutex> thread_lock(thread->mutex);
-                if (thread->status == ThreadStatus::wait)
-                    thread->update_status(ThreadStatus::run, ThreadStatus::wait);
+                if (thread->status == ThreadStatus::waiting)
+                    thread->update_status(ThreadStatus::running, ThreadStatus::waiting);
             }
         }
     }
@@ -2760,8 +2760,8 @@ EXPORT(int, sceGxmDisplayQueueAddEntry, Ptr<SceGxmSyncObject> oldBuffer, Ptr<Sce
         bool reported = false;
         {
             const std::lock_guard<std::mutex> thread_lock(thread->mutex);
-            if (thread->status == ThreadStatus::run) {
-                thread->update_status(ThreadStatus::wait, ThreadStatus::run);
+            if (thread->status == ThreadStatus::running) {
+                thread->update_status(ThreadStatus::waiting, ThreadStatus::running);
                 reported = true;
             }
         }
@@ -2771,8 +2771,8 @@ EXPORT(int, sceGxmDisplayQueueAddEntry, Ptr<SceGxmSyncObject> oldBuffer, Ptr<Sce
         }
         if (reported) {
             const std::lock_guard<std::mutex> thread_lock(thread->mutex);
-            if (thread->status == ThreadStatus::wait)
-                thread->update_status(ThreadStatus::run, ThreadStatus::wait);
+            if (thread->status == ThreadStatus::waiting)
+                thread->update_status(ThreadStatus::running, ThreadStatus::waiting);
         }
     }
 
@@ -3518,7 +3518,7 @@ EXPORT(int, sceGxmNotificationWait, const SceGxmNotification *notification) {
         auto *const renderer = emuenv.renderer.get();
         {
             const std::lock_guard<std::mutex> thread_lock(thread->mutex);
-            thread->update_status(ThreadStatus::wait);
+            thread->update_status(ThreadStatus::waiting);
         }
         {
             const ScopedWait scoped_wait(*thread, { [renderer] {
@@ -3530,8 +3530,8 @@ EXPORT(int, sceGxmNotificationWait, const SceGxmNotification *notification) {
             });
         }
         const std::lock_guard<std::mutex> thread_lock(thread->mutex);
-        if (thread->status == ThreadStatus::wait)
-            thread->update_status(ThreadStatus::run);
+        if (thread->status == ThreadStatus::waiting)
+            thread->update_status(ThreadStatus::running);
     }
 
     return 0;

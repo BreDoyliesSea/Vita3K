@@ -245,10 +245,10 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
     {
         const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
         for (const auto &[uid, thread] : emuenv.kernel.threads) {
-            if (thread && thread->nesting_level() > 1 && thread->status != ThreadStatus::wait)
+            if (thread && thread->nesting_level() > 1 && thread->status != ThreadStatus::waiting)
                 return Result::retry(fmt::format("thread {} \"{}\" is running inside a callback, which a load would have to catch again",
                     uid, thread->name));
-            if (!thread || thread->status != ThreadStatus::wait)
+            if (!thread || thread->status != ThreadStatus::waiting)
                 continue;
             const std::optional<ThreadState::WaitRelease> wait = thread->current_wait();
             if (!wait || !wait->restartable) {
@@ -331,7 +331,7 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
             put(cpu_raw, entry.second);
         }
 
-        // A thread in ThreadStatus::wait is blocked inside a host C++ frame in one of the
+        // A thread in ThreadStatus::waiting is blocked inside a host C++ frame in one of the
         // sync primitive helpers, and WaitingThreadData holds raw pointers into that frame's
         // locals (was_canceled, outBits, result_pattern...). None of that lives in guest
         // memory or registers, so a load does not restore it: it makes the call again (see
@@ -341,10 +341,10 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
             if (!pair.second)
                 continue;
             switch (pair.second->status) {
-            case ThreadStatus::run: running++; break;
+            case ThreadStatus::running: running++; break;
             case ThreadStatus::dormant: dormant++; break;
-            case ThreadStatus::wait: waiting++; break;
-            case ThreadStatus::suspend: suspended++; break;
+            case ThreadStatus::waiting: waiting++; break;
+            case ThreadStatus::suspended: suspended++; break;
             }
         }
         LOG_INFO("Savestate: thread status at snapshot - run {}, dormant {}, wait {}, suspend {}",
@@ -361,7 +361,7 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
         if (waiting > 0) {
             std::map<uint32_t, int> parked_in;
             for (const auto &pair : emuenv.kernel.threads) {
-                if (!pair.second || pair.second->status != ThreadStatus::wait)
+                if (!pair.second || pair.second->status != ThreadStatus::waiting)
                     continue;
                 parked_in[pair.second->current_import_nid.load(std::memory_order_relaxed)]++;
             }
@@ -383,7 +383,7 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
             // rather than "this code cannot emit". This runs once per savestate, on user request.
             for (const auto &pair : emuenv.kernel.threads) {
                 const auto &thread = pair.second;
-                if (!thread || thread->status != ThreadStatus::wait)
+                if (!thread || thread->status != ThreadStatus::waiting)
                     continue;
                 const uint32_t nid = thread->current_import_nid.load(std::memory_order_relaxed);
                 const char *const name = nid ? import_name(nid) : nullptr;
@@ -422,7 +422,7 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
         return Result::retry("a scene is still being drawn");
 
     // --- WAIT: what each parked thread is blocked in ------------------------------------------
-    // A thread in ThreadStatus::wait is inside a host C++ frame that no snapshot can describe.
+    // A thread in ThreadStatus::waiting is inside a host C++ frame that no snapshot can describe.
     // Rather than try to rebuild that frame on load, record what the wait *is*, so the load can
     // check the guest is still parked the same way and refuse if it is not.
     std::vector<uint8_t> wait_raw;
@@ -430,7 +430,7 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
         const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
         std::vector<std::pair<SceUID, const ThreadState *>> parked;
         for (const auto &pair : emuenv.kernel.threads) {
-            if (pair.second && pair.second->status == ThreadStatus::wait)
+            if (pair.second && pair.second->status == ThreadStatus::waiting)
                 parked.emplace_back(pair.first, pair.second.get());
         }
         put<uint32_t>(wait_raw, static_cast<uint32_t>(parked.size()));
@@ -1390,7 +1390,7 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
             }
 
             // This session's side: a thread waiting now is taken out of its call.
-            if (thread->status == ThreadStatus::wait) {
+            if (thread->status == ThreadStatus::waiting) {
                 const uint32_t nid = thread->current_import_nid.load(std::memory_order_relaxed);
                 const char *const name = nid ? import_name(nid) : nullptr;
                 const std::string call = name ? name : fmt::format("{}", log_hex(nid));
@@ -1405,7 +1405,7 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
             // For the log only: how many threads the all-or-nothing match this replaced would have
             // refused the load over.
             const bool parked_then = p != parked.end();
-            const bool parked_now = thread->status == ThreadStatus::wait;
+            const bool parked_now = thread->status == ThreadStatus::waiting;
             if (parked_then != parked_now
                 || (parked_now
                     && (p->second.nid != thread->current_import_nid.load(std::memory_order_relaxed)
@@ -1742,7 +1742,7 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
     for (const ThreadStatePtr &thread : left_on_their_own) {
         wait_until(thread, [&] {
             const std::lock_guard<std::mutex> thread_lock(thread->mutex);
-            return thread->status == ThreadStatus::suspend;
+            return thread->status == ThreadStatus::suspended;
         });
     }
 

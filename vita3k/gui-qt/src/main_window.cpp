@@ -1488,16 +1488,16 @@ void MainWindow::on_thread_dump_requested() {
     collect(nullptr);
 
     for (Sample &s : samples) {
-        if (s.status == ThreadStatus::run && s.thread)
+        if (s.status == ThreadStatus::running && s.thread)
             s.traceback = s.thread->log_stack_traceback();
     }
 
     const auto status_name = [](ThreadStatus s) {
         switch (s) {
-        case ThreadStatus::run: return "run ";
+        case ThreadStatus::running: return "run ";
         case ThreadStatus::dormant: return "dorm";
-        case ThreadStatus::wait: return "wait";
-        case ThreadStatus::suspend: return "susp";
+        case ThreadStatus::waiting: return "wait";
+        case ThreadStatus::suspended: return "susp";
         }
         return "????";
     };
@@ -1509,7 +1509,7 @@ void MainWindow::on_thread_dump_requested() {
         const bool moved = before != first_pc.end() && before->second != s.pc;
         LOG_INFO("  [{}] id={} \"{}\" pc={}{} lr={} sp={} in {}({}, {}, {})",
             status_name(s.status), s.id, s.name, log_hex(s.pc),
-            (s.status == ThreadStatus::run) ? (moved ? " (advancing)" : " (PC UNCHANGED over 250ms)") : "",
+            (s.status == ThreadStatus::running) ? (moved ? " (advancing)" : " (PC UNCHANGED over 250ms)") : "",
             log_hex(s.lr), log_hex(s.sp), import ? import : "-",
             log_hex(s.args[0]), log_hex(s.args[1]), log_hex(s.args[2]));
         if (!s.traceback.empty())
@@ -1580,10 +1580,10 @@ bool wait_for_display_queue_gap(EmuEnvState &emuenv, int timeout_ms, DisplayQueu
     if (const ThreadStatePtr thread = emuenv.kernel.get_thread(gxm.display_queue_thread)) {
         const char *status = "?";
         switch (thread->status) {
-        case ThreadStatus::run: status = "running"; break;
+        case ThreadStatus::running: status = "running"; break;
         case ThreadStatus::dormant: status = "dormant"; break;
-        case ThreadStatus::suspend: status = "suspended"; break;
-        case ThreadStatus::wait: status = "waiting"; break;
+        case ThreadStatus::suspended: status = "suspended"; break;
+        case ThreadStatus::waiting: status = "waiting"; break;
         }
         const uint32_t nid = thread->current_import_nid.load(std::memory_order_relaxed);
         const char *const call = nid ? import_name(nid) : nullptr;
