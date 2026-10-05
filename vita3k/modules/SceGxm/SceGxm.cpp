@@ -2700,6 +2700,12 @@ EXPORT(int, sceGxmDisplayQueueAddEntry, Ptr<SceGxmSyncObject> oldBuffer, Ptr<Sce
                     thread->update_status(ThreadStatus::running, ThreadStatus::waiting);
             }
         }
+
+        // Taken out of either wait by a savestate load: its registers are about to be replaced, so
+        // the call must not go on. Queued now, the entry would outlive the load, and the display
+        // thread would free callback data that the load has handed to the state's own allocations.
+        if (thread->wait_abandoned())
+            return 0;
     }
 
     const Address address = alloc(emuenv.mem, emuenv.gxm.params.displayQueueCallbackDataSize, __FUNCTION__);
