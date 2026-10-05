@@ -1625,6 +1625,7 @@ std::string gxm::rollback_to_layout(GxmState &gxm, const MemState &mem, renderer
             if (patcher)
                 patcher->~SceGxmShaderPatcher();
             gxm.shader_patchers.erase(address);
+            std::erase_if(gxm.mask_update_programs, [&](const auto &entry) { return entry.second == address; });
             out.shader_patchers++;
         }
     }
@@ -1881,6 +1882,58 @@ std::string gxm::recreate_programs(GxmState &gxm, const MemState &mem, renderer:
                 VertexProgramCacheKey{ SceGxmRegisteredProgram{ Ptr<const SceGxmProgram>(identity.program) }, static_cast<VertexCacheHash>(identity.key_hash) },
                 Ptr<SceGxmVertexProgram>(identity.address));
         }
+        recreated++;
+    }
+    return {};
+}
+
+std::vector<gxm::MaskProgramIdentity> gxm::capture_mask_programs(GxmState &gxm) {
+    std::vector<MaskProgramIdentity> out;
+    const std::lock_guard<std::mutex> lock(gxm.shader_patcher_mutex);
+    for (const auto &[address, patcher] : gxm.mask_update_programs) {
+        MaskProgramIdentity identity;
+        identity.address = address;
+        identity.patcher = patcher;
+        out.push_back(identity);
+    }
+    return out;
+}
+
+uint32_t gxm::destroy_mask_programs(GxmState &gxm, const MemState &mem) {
+    const std::lock_guard<std::mutex> lock(gxm.shader_patcher_mutex);
+    uint32_t destroyed = 0;
+    for (const auto &[address, _] : gxm.mask_update_programs) {
+        SceGxmFragmentProgram *const fp = Ptr<SceGxmFragmentProgram>(address).get(mem);
+        if (!fp)
+            continue;
+        while (fp->compile_threads_on.load(std::memory_order_acquire) > 0)
+            std::this_thread::yield();
+        fp->~SceGxmFragmentProgram();
+        destroyed++;
+    }
+    gxm.mask_update_programs.clear();
+    return destroyed;
+}
+
+std::string gxm::recreate_mask_programs(GxmState &gxm, const MemState &mem, renderer::State &renderer, const std::vector<MaskProgramIdentity> &saved, uint32_t &recreated) {
+    const std::lock_guard<std::mutex> lock(gxm.shader_patcher_mutex);
+    for (const MaskProgramIdentity &identity : saved) {
+        SceGxmFragmentProgram *const fp = Ptr<SceGxmFragmentProgram>(identity.address).get(mem);
+        if (!fp)
+            return fmt::format("mask update program {} is not in mapped memory", log_hex(identity.address));
+        // The program pointer comes back with the restored bytes, as the guest's copy of mask_gxp.
+        const Ptr<const SceGxmProgram> program_ptr = fp->program;
+        const uint32_t reference_count = fp->reference_count.load(std::memory_order_relaxed);
+        const SceGxmProgram *const program = program_ptr.get(mem);
+        if (!program)
+            return fmt::format("the shader program behind mask update program {} is not in mapped memory", log_hex(identity.address));
+        new (fp) SceGxmFragmentProgram{};
+        fp->is_maskupdate = true;
+        fp->program = program_ptr;
+        fp->reference_count = reference_count;
+        if (!renderer::create(fp->renderer_data, renderer, *program, nullptr, renderer.gxp_ptr_map))
+            return fmt::format("mask update program {} cannot be made again", log_hex(identity.address));
+        gxm.mask_update_programs[identity.address] = identity.patcher;
         recreated++;
     }
     return {};
@@ -5139,6 +5192,10 @@ EXPORT(int, sceGxmShaderPatcherCreateMaskUpdateFragmentProgram, SceGxmShaderPatc
         return RET_ERROR(SCE_GXM_ERROR_DRIVER);
     }
 
+    {
+        const std::lock_guard<std::mutex> lock(emuenv.gxm.shader_patcher_mutex);
+        emuenv.gxm.mask_update_programs[fragmentProgram->address()] = Ptr<SceGxmShaderPatcher>(shaderPatcher, mem).address();
+    }
     return 0;
 }
 
@@ -5204,6 +5261,7 @@ EXPORT(int, sceGxmShaderPatcherDestroy, Ptr<SceGxmShaderPatcher> shaderPatcher) 
     {
         const std::lock_guard<std::mutex> lock(emuenv.gxm.shader_patcher_mutex);
         emuenv.gxm.shader_patchers.erase(shaderPatcher.address());
+        std::erase_if(emuenv.gxm.mask_update_programs, [&](const auto &entry) { return entry.second == shaderPatcher.address(); });
     }
     free_callbacked(emuenv, thread_id, shaderPatcher.get(emuenv.mem), shaderPatcher);
 
@@ -5343,6 +5401,10 @@ EXPORT(int, sceGxmShaderPatcherReleaseFragmentProgram, SceGxmShaderPatcher *shad
                 shaderPatcher->fragment_program_cache.erase(it);
                 break;
             }
+        }
+        if (fp->is_maskupdate) {
+            const std::lock_guard<std::mutex> lock(emuenv.gxm.shader_patcher_mutex);
+            emuenv.gxm.mask_update_programs.erase(fragmentProgram.address());
         }
         free_callbacked(emuenv, thread_id, shaderPatcher, fragmentProgram);
     }
