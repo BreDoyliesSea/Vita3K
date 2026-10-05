@@ -41,6 +41,7 @@
 #include <miniz.h>
 
 #include <algorithm>
+#include <functional>
 #include <optional>
 #include <set>
 #include <thread>
@@ -112,31 +113,35 @@ constexpr uint32_t TAG_GXMK = 0x4B4D5847U;
 // when it resumes. Import stubs are ARM -- `svc #0`, `mov pc, lr`, then the NID -- and a thread
 // inside the call has its PC just past the svc (run_loop reads the NID at pc + 4). Its argument
 // registers are untouched until the call returns, so they are still the ones it was made with.
-// Checked rather than assumed; empty on success, otherwise why not.
-// Why such a context cannot be pointed back at its call; empty when it can. The save asks this
-// too, so that it never writes a state whose threads no load could restart.
-std::string why_not_at_a_call(const MemState &mem, const CPUContext &ctx) {
+// Checked rather than assumed: why such a context cannot be pointed back at its call, empty when
+// it can. The save asks this too, so that it never writes a state whose threads no load could
+// restart.
+// Reads a 32-bit word of guest memory, or nothing if the address is not mapped.
+using WordReader = std::function<std::optional<uint32_t>(Address)>;
+
+static std::string why_not_at_a_call(const WordReader &read, const CPUContext &ctx) {
     const uint32_t pc = ctx.get_pc();
     if (ctx.cpsr & 0x20)
         return fmt::format("its PC {} is in Thumb code, not an import stub", log_hex(pc));
-    if (pc < 4 || !Ptr<uint32_t>(pc - 4).valid(mem) || !Ptr<uint32_t>(pc).valid(mem))
+    const std::optional<uint32_t> before = pc < 4 ? std::nullopt : read(pc - 4);
+    const std::optional<uint32_t> at = read(pc);
+    if (!before || !at)
         return fmt::format("its PC {} is not in mapped memory", log_hex(pc));
     constexpr uint32_t SVC_0 = 0xEF000000U;
     constexpr uint32_t MOV_PC_LR = 0xE1A0F00EU;
-    const uint32_t before = *Ptr<uint32_t>(pc - 4).get(mem);
-    const uint32_t at = *Ptr<uint32_t>(pc).get(mem);
-    if (before != SVC_0 || at != MOV_PC_LR)
+    if (*before != SVC_0 || *at != MOV_PC_LR)
         return fmt::format("its PC {} is not just past an import stub's svc ({} at PC-4, {} at PC)",
-            log_hex(pc), log_hex(before), log_hex(at));
+            log_hex(pc), log_hex(*before), log_hex(*at));
     return {};
 }
 
-std::string rewind_to_call(MemState &mem, CPUContext &ctx) {
-    const std::string why = why_not_at_a_call(mem, ctx);
-    if (!why.empty())
-        return why;
-    ctx.cpu_registers[15] = ctx.get_pc() - 4;
-    return {};
+std::string why_not_at_a_call(const MemState &mem, const CPUContext &ctx) {
+    return why_not_at_a_call([&mem](Address address) -> std::optional<uint32_t> {
+        if (!Ptr<uint32_t>(address).valid(mem))
+            return std::nullopt;
+        return *Ptr<uint32_t>(address).get(mem);
+    },
+        ctx);
 }
 
 // A state records the emulator build that produced it. Guest memory is full of pointers into
@@ -1349,6 +1354,8 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
     // dormant instead of being deleted: the state has them, dormant, and the guest can still wait
     // on or delete the ID.
     std::vector<ThreadStatePtr> to_end;
+    // Threads the state has parked in a call, to be pointed back at it (see "rewind" below).
+    std::vector<SceUID> to_rewind;
     {
         const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
         for (const auto &[id, thread] : emuenv.kernel.threads) {
@@ -1370,9 +1377,7 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
                 if (p != parked.end()) {
                     if (p->second.nid == 0)
                         return Result::fail(fmt::format("thread {} was parked outside any call", id));
-                    const std::string why = rewind_to_call(emuenv.mem, ctx);
-                    if (!why.empty())
-                        return Result::fail(fmt::format("thread {} cannot be restarted: {}", id, why));
+                    to_rewind.push_back(id);
                     restarts++;
                 }
                 to_recreate.emplace_back(id, saved->second.status);
@@ -1409,9 +1414,7 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
                     return Result::fail(fmt::format("thread {} was parked outside any call", id));
                 if (saved->second.level != 1)
                     return Result::fail(fmt::format("thread {} was parked inside a callback, where a load cannot restart it", id));
-                const std::string why = rewind_to_call(emuenv.mem, ctx);
-                if (!why.empty())
-                    return Result::fail(fmt::format("thread {} cannot be restarted: {}", id, why));
+                to_rewind.push_back(id);
                 restarts++;
             }
 
@@ -1684,6 +1687,29 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
             return Result::fail("corrupt memory chunk");
         saved.push_back({ addr, size, mr.pos });
         mr.pos += size;
+    }
+
+    // --- rewind: each thread the state has parked in a call goes back to the start of it -----
+    // Checked against the state's memory, not this session's. A session that has not got as far
+    // as the state can have nothing mapped at such a PC - Oddworld's Mono-compiled code, refused
+    // as "not in mapped memory" when loaded into a fresh boot - and whatever it does have there
+    // is not the code the restored thread will run.
+    const auto state_word = [&](Address address) -> std::optional<uint32_t> {
+        for (const SavedRegion &region : saved) {
+            if (address >= region.addr && address - region.addr <= region.size - 4) {
+                uint32_t word;
+                std::memcpy(&word, mem_raw.data() + region.offset + (address - region.addr), 4);
+                return word;
+            }
+        }
+        return std::nullopt;
+    };
+    for (const SceUID id : to_rewind) {
+        CPUContext &ctx = contexts.at(id);
+        const std::string why = why_not_at_a_call(state_word, ctx);
+        if (!why.empty())
+            return Result::fail(fmt::format("thread {} cannot be restarted: {}", id, why));
+        ctx.cpu_registers[15] = ctx.get_pc() - 4;
     }
 
     // Reconcile the address space, then restore, all under one hold of generation_mutex.
