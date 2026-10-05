@@ -278,6 +278,35 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
         }
     }
 
+    // --- refuse if a frame is in flight --------------------------------------------------------
+    // The display queue thread peeks the front entry, runs the guest's display callback, and only
+    // then pops it -- so an empty queue means no callback is part-way through. That matters
+    // because the callback's progress is tracked by renderer-side sync timestamps while the
+    // SceGxmSyncObject they are compared against lives in guest memory. A load rewinds the guest
+    // side and not the host side, and the queue thread is then waiting on a timestamp that will
+    // never arrive: the main thread blocks in sceGxmDisplayQueueAddEntry and the guest stops.
+    //
+    // Snapshotting only when the queue is empty removes the inconsistency rather than trying to
+    // restore around it. The caller drains it before quiescing the guest; this is the check that
+    // it actually worked, and it has to be here because by now nothing else can be running.
+    // Both checks come before the memory copy, which takes about a second: a refused attempt keeps
+    // the guest paused for as long as it runs, and Disgaea 4 refused 40 in a row while the game had
+    // 16 ms to move between them.
+    {
+        const std::lock_guard<std::mutex> queue_lock(emuenv.gxm.display_queue.get_mutex());
+        const size_t pending = emuenv.gxm.display_queue.size();
+        if (pending > 0)
+            return Result::retry(fmt::format("a frame is still in flight ({} display queue entries)", pending));
+    }
+
+    // Nor in the middle of drawing a scene. The renderer mirrors the guest's scene state --
+    // everything the guest submitted has run by now (MainWindow::run_with_guest_quiesced drains it)
+    // -- and restoring a guest outside a scene into a renderer still recording one makes the next
+    // sceGxmBeginScene fail to start ("already recording") and the texture upload after it fault
+    // in the driver. Measured on Disgaea 4 and Project DIVA f, about 40 ms after a load.
+    if (gxm::scene_in_progress(emuenv.gxm, emuenv.mem))
+        return Result::retry("a scene is still being drawn");
+
     // --- MEM: every live allocation, verbatim ---------------------------------------------
     std::vector<uint8_t> mem_raw;
     uint32_t region_count = 0;
@@ -394,32 +423,6 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
             }
         }
     }
-
-    // --- refuse if a frame is in flight --------------------------------------------------------
-    // The display queue thread peeks the front entry, runs the guest's display callback, and only
-    // then pops it -- so an empty queue means no callback is part-way through. That matters
-    // because the callback's progress is tracked by renderer-side sync timestamps while the
-    // SceGxmSyncObject they are compared against lives in guest memory. A load rewinds the guest
-    // side and not the host side, and the queue thread is then waiting on a timestamp that will
-    // never arrive: the main thread blocks in sceGxmDisplayQueueAddEntry and the guest stops.
-    //
-    // Snapshotting only when the queue is empty removes the inconsistency rather than trying to
-    // restore around it. The caller drains it before quiescing the guest; this is the check that
-    // it actually worked, and it has to be here because by now nothing else can be running.
-    {
-        const std::lock_guard<std::mutex> queue_lock(emuenv.gxm.display_queue.get_mutex());
-        const size_t pending = emuenv.gxm.display_queue.size();
-        if (pending > 0)
-            return Result::retry(fmt::format("a frame is still in flight ({} display queue entries)", pending));
-    }
-
-    // Nor in the middle of drawing a scene. The renderer mirrors the guest's scene state --
-    // everything the guest submitted has run by now (MainWindow::run_with_guest_quiesced drains it)
-    // -- and restoring a guest outside a scene into a renderer still recording one makes the next
-    // sceGxmBeginScene fail to start ("already recording") and the texture upload after it fault
-    // in the driver. Measured on Disgaea 4 and Project DIVA f, about 40 ms after a load.
-    if (gxm::scene_in_progress(emuenv.gxm, emuenv.mem))
-        return Result::retry("a scene is still being drawn");
 
     // --- WAIT: what each parked thread is blocked in ------------------------------------------
     // A thread in ThreadStatus::waiting is inside a host C++ frame that no snapshot can describe.
