@@ -170,6 +170,7 @@ MainWindow::MainWindow(EmuEnvState &emuenv,
 }
 
 MainWindow::~MainWindow() {
+    stop_savestate_task();
     shutdown_discord();
 }
 
@@ -1077,6 +1078,7 @@ void MainWindow::on_game_closed() {
     if (!m_game_window)
         return;
 
+    stop_savestate_task();
     LOG_INFO("Game closed: {}", emuenv.current_app_title);
 
     m_game_window->stop_ui_updates();
@@ -1369,12 +1371,6 @@ static bool drain_renderer(renderer::State &renderer) {
 // A dedicated pause reason keeps this independent of the user's own pause, so taking a state
 // while already paused does not resume the game underneath them.
 bool MainWindow::run_with_guest_quiesced(const char *what, const std::function<savestate::Result()> &action) {
-    if (!m_game_window) {
-        statusBar()->showMessage(tr("%1: no game is running").arg(QString::fromUtf8(what)), 4000);
-        return false;
-    }
-
-    logging::name_this_thread("savestate/gui");
     m_app_session.set_pause_reason(app::AppSessionPauseReason::Savestate, true);
 
     // set_pause_reason only asks the threads to stop. Wait until they actually have: the load
@@ -1420,15 +1416,46 @@ bool MainWindow::run_with_guest_quiesced(const char *what, const std::function<s
     m_app_session.set_pause_reason(app::AppSessionPauseReason::Savestate, false);
 
     if (result) {
-        statusBar()->showMessage(tr("%1 complete").arg(QString::fromUtf8(what)), 4000);
+        show_status_message(tr("%1 complete").arg(QString::fromUtf8(what)), 4000);
         return true;
     }
 
     LOG_ERROR("{} failed: {}", what, result.reason);
-    statusBar()->showMessage(tr("%1 failed: %2").arg(QString::fromUtf8(what),
-                                 QString::fromStdString(result.reason)),
+    show_status_message(tr("%1 failed: %2").arg(QString::fromUtf8(what), QString::fromStdString(result.reason)),
         8000);
     return false;
+}
+
+// Saving and loading run off the GUI thread: one attempt can take seconds, and a refused one is
+// retried up to 60 times, which kept the window from answering for minutes.
+void MainWindow::start_savestate_task(const char *what, void (MainWindow::*task)()) {
+    if (!m_game_window) {
+        statusBar()->showMessage(tr("%1: no game is running").arg(QString::fromUtf8(what)), 4000);
+        return;
+    }
+    if (m_savestate_busy.exchange(true)) {
+        statusBar()->showMessage(tr("%1: a quicksave or quickload is still running").arg(QString::fromUtf8(what)), 4000);
+        return;
+    }
+    if (m_savestate_thread.joinable())
+        m_savestate_thread.join();
+    m_savestate_cancel = false;
+    m_savestate_thread = std::thread([this, task] {
+        logging::name_this_thread("savestate");
+        (this->*task)();
+        m_savestate_busy = false;
+    });
+}
+
+// Lets the attempt in progress finish and starts no other. Called before the session is torn down.
+void MainWindow::stop_savestate_task() {
+    m_savestate_cancel = true;
+    if (m_savestate_thread.joinable())
+        m_savestate_thread.join();
+}
+
+void MainWindow::show_status_message(const QString &message, const int timeout) {
+    QMetaObject::invokeMethod(this, [this, message, timeout] { statusBar()->showMessage(message, timeout); }, Qt::QueuedConnection);
 }
 
 void MainWindow::on_thread_dump_requested() {
@@ -1441,6 +1468,10 @@ void MainWindow::on_thread_dump_requested() {
     // never be set and a thread making slow progress are indistinguishable from one sample.
     if (!m_game_window) {
         statusBar()->showMessage(tr("Thread dump: no game is running"), 4000);
+        return;
+    }
+    if (m_savestate_busy) {
+        statusBar()->showMessage(tr("Thread dump: a quicksave or quickload is running"), 4000);
         return;
     }
 
@@ -1581,10 +1612,16 @@ struct DisplayQueueHold {
     }
 };
 
-bool wait_for_display_queue_gap(EmuEnvState &emuenv, int timeout_ms, DisplayQueueHold &hold) {
+bool wait_for_display_queue_gap(EmuEnvState &emuenv, int timeout_ms, DisplayQueueHold &hold, const std::atomic<bool> &cancel) {
     GxmState &gxm = emuenv.gxm;
     const auto started = std::chrono::steady_clock::now();
-    const bool empty = gxm.display_queue.wait_empty_and_hold(std::chrono::milliseconds(timeout_ms));
+    const auto deadline = started + std::chrono::milliseconds(timeout_ms);
+    bool empty = false;
+    while (!(empty = gxm.display_queue.wait_empty_and_hold(std::chrono::milliseconds(100)))
+        && !cancel && std::chrono::steady_clock::now() < deadline) {
+    }
+    if (!empty && cancel)
+        return false;
     const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - started);
 
@@ -1614,6 +1651,10 @@ bool wait_for_display_queue_gap(EmuEnvState &emuenv, int timeout_ms, DisplayQueu
 }
 
 void MainWindow::on_quicksave_triggered() {
+    start_savestate_task("Quicksave", &MainWindow::quicksave);
+}
+
+void MainWindow::quicksave() {
     // Generous, because the gap is the game's to give: its depth was seen sitting at 1 for two
     // full seconds under load, and taken after 644 ms and 19 ms in others.
     // Retry: catching the queue empty and quiescing the guest are not one atomic step, so the
@@ -1631,9 +1672,12 @@ void MainWindow::on_quicksave_triggered() {
     int attempts = 0;
     for (int attempt = 1; attempt <= max_attempts; attempt++) {
         attempts = attempt;
+        if (m_savestate_cancel)
+            return;
         DisplayQueueHold hold;
-        if (!wait_for_display_queue_gap(emuenv, 10000, hold)) {
-            statusBar()->showMessage(tr("Quicksave: a frame is still in flight, try again"), 6000);
+        if (!wait_for_display_queue_gap(emuenv, 10000, hold, m_savestate_cancel)) {
+            if (!m_savestate_cancel)
+                show_status_message(tr("Quicksave: a frame is still in flight, try again"), 6000);
             return;
         }
 
@@ -1658,10 +1702,14 @@ void MainWindow::on_quicksave_triggered() {
     }
 
     LOG_ERROR("Quicksave gave up after {} attempt(s): {}", attempts, last.reason);
-    statusBar()->showMessage(tr("Quicksave failed, the previous quicksave is kept: %1").arg(QString::fromStdString(last.reason)), 8000);
+    show_status_message(tr("Quicksave failed, the previous quicksave is kept: %1").arg(QString::fromStdString(last.reason)), 8000);
 }
 
 void MainWindow::on_quickload_triggered() {
+    start_savestate_task("Quickload", &MainWindow::quickload);
+}
+
+void MainWindow::quickload() {
     // Load at a frame boundary, the same kind of moment the save was taken at: with the display
     // queue empty no display callback is part-way through (see savestate::load).
     //
@@ -1681,9 +1729,12 @@ void MainWindow::on_quickload_triggered() {
     int attempts = 0;
     for (int attempt = 1; attempt <= max_attempts; attempt++) {
         attempts = attempt;
+        if (m_savestate_cancel)
+            return;
         DisplayQueueHold hold;
-        if (!wait_for_display_queue_gap(emuenv, 10000, hold)) {
-            statusBar()->showMessage(tr("Quickload: could not catch a frame boundary, try again"), 6000);
+        if (!wait_for_display_queue_gap(emuenv, 10000, hold, m_savestate_cancel)) {
+            if (!m_savestate_cancel)
+                show_status_message(tr("Quickload: could not catch a frame boundary, try again"), 6000);
             return;
         }
 
@@ -1716,7 +1767,7 @@ void MainWindow::on_quickload_triggered() {
     }
 
     LOG_ERROR("Quickload gave up after {} attempt(s): {}", attempts, last.reason);
-    statusBar()->showMessage(tr("Quickload failed: %1").arg(QString::fromStdString(last.reason)), 8000);
+    show_status_message(tr("Quickload failed: %1").arg(QString::fromStdString(last.reason)), 8000);
 }
 
 void MainWindow::on_stop_triggered() {
