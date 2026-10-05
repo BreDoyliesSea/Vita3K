@@ -136,9 +136,11 @@ public:
         return cond_.wait_for(mlock, timeout, [&]() { return aborted || queue_.empty(); });
     }
 
-    // The same, but the queue stays empty until release_hold(): push() waits, as it already does
-    // when the queue is full. A savestate needs the empty moment to last long enough to stop the
-    // guest, and merely observing it is not enough to get it. pop() notifies cond_, which wakes
+    // The same, but the queue stays empty until release_hold(): a producer waits at its gate
+    // (wait_while_held, at the top of sceGxmDisplayQueueAddEntry); push() itself does not look at
+    // the hold, so a producer already past the gate still queues, and the caller has to check the
+    // queue again once the guest is stopped. A savestate needs the empty moment to last long
+    // enough to stop the guest, and merely observing it is not enough to get it. pop() notifies cond_, which wakes
     // both this wait and the guest thread blocked in push() waiting for the slot that just freed,
     // so whoever takes the mutex first decides; when a game keeps the queue full - every game
     // measured here runs it at depth 1 - the pusher usually wins and the next entry is in before
