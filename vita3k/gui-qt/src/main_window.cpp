@@ -59,6 +59,7 @@
 #include <ctrl/functions.h>
 #include <display/functions.h>
 #include <display/state.h>
+#include <gxm/functions.h>
 #include <gxm/state.h>
 #include <interface.h>
 #include <io/state.h>
@@ -1627,6 +1628,13 @@ bool wait_for_display_queue_gap(EmuEnvState &emuenv, int timeout_ms, DisplayQueu
 
     if (empty) {
         hold.emuenv = &emuenv;
+        // With the queue held the game finishes the scene it is drawing and stops at the queue's
+        // gate in sceGxmDisplayQueueAddEntry, which is the moment a save or load can take. Pausing
+        // straight away, attempts a frame apart kept landing inside the scene: Disgaea 4 refused 60
+        // in a row, five times running.
+        const auto scene_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
+        while (gxm::scene_in_progress(gxm, emuenv.mem) && std::chrono::steady_clock::now() < scene_deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
         LOG_INFO("Savestate: caught the display queue empty after {} ms and held it", waited.count());
         return true;
     }
