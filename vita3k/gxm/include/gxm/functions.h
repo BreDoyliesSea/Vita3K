@@ -75,7 +75,7 @@ std::string check_layout(GxmState &gxm, const MemState &mem, const HostObjectLay
 // state, 5 and 5 in the session; every load of such a state was refused).
 //
 // Mask-update fragment programs are not here: sceGxmShaderPatcherCreateMaskUpdateFragmentProgram
-// never puts one in the cache, so neither the layout nor this sees them.
+// never puts one in the cache, so neither the layout nor this sees them. See MaskProgramIdentity.
 struct ProgramIdentity {
     Address address = 0;
     Address patcher = 0;
@@ -98,6 +98,18 @@ std::vector<ProgramIdentity> capture_program_identities(GxmState &gxm, const Mem
 // program, and the attribute and stream vectors) belong to the saved session, so each is rebuilt
 // from its identity and put back in its patcher's cache. Vulkan only, for the same reason.
 std::string recreate_programs(GxmState &gxm, const MemState &mem, renderer::State &renderer, const std::vector<ProgramIdentity> &missing, uint32_t &recreated);
+
+// Mask-update fragment programs. A restored one carries the renderer program pointer of the process
+// that saved it, and the first draw with it after a load into another process faulted in
+// gxmSetUniformBuffers (Oddworld, backlog 26). A load destroys the session's before the restore and
+// makes each one the state names again after it, at its address. Vulkan only, like the others.
+struct MaskProgramIdentity {
+    Address address = 0;
+    Address patcher = 0;
+};
+std::vector<MaskProgramIdentity> capture_mask_programs(GxmState &gxm);
+uint32_t destroy_mask_programs(GxmState &gxm, const MemState &mem);
+std::string recreate_mask_programs(GxmState &gxm, const MemState &mem, renderer::State &renderer, const std::vector<MaskProgramIdentity> &saved, uint32_t &recreated);
 
 // Destroy the host half of every object that is live here but not in `saved`: the ones the guest
 // created after the state was taken. Their guest memory came from the guest's own heap (shader

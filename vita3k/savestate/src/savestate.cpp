@@ -104,6 +104,8 @@ constexpr uint32_t TAG_ADEC = 0x43454441U;
 constexpr uint32_t TAG_ADCI = 0x49434441U;
 // "MBLK" - the kernel memory block registry: uid, name, where and how big. Optional.
 constexpr uint32_t TAG_MBLK = 0x4B4C424DU;
+// "GXMK" - the mask-update fragment programs and their patchers. Optional, so older states still load.
+constexpr uint32_t TAG_GXMK = 0x4B4D5847U;
 
 
 // Point a context saved inside an HLE call back at the call itself, so the thread makes it again
@@ -719,6 +721,16 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
         }
     }
 
+    std::vector<uint8_t> gxmk_raw;
+    {
+        const std::vector<gxm::MaskProgramIdentity> masks = gxm::capture_mask_programs(emuenv.gxm);
+        put<uint32_t>(gxmk_raw, static_cast<uint32_t>(masks.size()));
+        for (const gxm::MaskProgramIdentity &mask : masks) {
+            put<uint32_t>(gxmk_raw, mask.address);
+            put<uint32_t>(gxmk_raw, mask.patcher);
+        }
+    }
+
     // --- which GPU memory regions are mapped ----------------------------------------------------
     // sceGxmMapMemory registrations are host state: the guest's registry, and with memory mapping
     // on a host buffer per region as well. They are not part of guest memory, so a load restores a
@@ -817,6 +829,11 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
     put<uint64_t>(file, gxpg_raw.size());
     put<uint64_t>(file, gxpg_raw.size());
     file.insert(file.end(), gxpg_raw.begin(), gxpg_raw.end());
+
+    put(file, TAG_GXMK);
+    put<uint64_t>(file, gxmk_raw.size());
+    put<uint64_t>(file, gxmk_raw.size());
+    file.insert(file.end(), gxmk_raw.begin(), gxmk_raw.end());
 
     // --- THRI: what each thread is made of -----------------------------------------------------
     // Enough to recreate one the session has since deleted: see savestate::load. Its TLS block is
@@ -1058,6 +1075,8 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
     size_t gxrt_size = 0;
     const uint8_t *gxpg_data = nullptr;
     size_t gxpg_size = 0;
+    const uint8_t *gxmk_data = nullptr;
+    size_t gxmk_size = 0;
     const uint8_t *thrd_data = nullptr;
     size_t thrd_size = 0;
     const uint8_t *thri_data = nullptr;
@@ -1135,6 +1154,10 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
         case TAG_GXPG:
             gxpg_data = payload;
             gxpg_size = static_cast<size_t>(stored);
+            break;
+        case TAG_GXMK:
+            gxmk_data = payload;
+            gxmk_size = static_cast<size_t>(stored);
             break;
         case TAG_THRD:
             thrd_data = payload;
@@ -1433,6 +1456,7 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
     // program the game has compiled so far, and a session still on its title screen has almost none
     // of them (notes/19, gap A).
     std::vector<gxm::ProgramIdentity> programs_to_recreate;
+    std::optional<std::vector<gxm::MaskProgramIdentity>> masks_to_recreate;
     if (gxml_data) {
         Reader gr{ gxml_data, gxml_size, 0 };
         gxm::HostObjectLayout layout;
@@ -1530,6 +1554,20 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
                 }
                 if (!programs_handled)
                     break;
+            }
+        }
+
+        if (gxmk_data && emuenv.renderer->current_backend == renderer::Backend::Vulkan) {
+            Reader mr{ gxmk_data, gxmk_size, 0 };
+            uint32_t count = 0;
+            if (!mr.get(count))
+                return Result::fail("corrupt mask program chunk");
+            masks_to_recreate.emplace();
+            for (uint32_t i = 0; i < count; i++) {
+                gxm::MaskProgramIdentity mask;
+                if (!mr.get(mask.address) || !mr.get(mask.patcher))
+                    return Result::fail("corrupt mask program chunk");
+                masks_to_recreate->push_back(mask);
             }
         }
 
@@ -1683,6 +1721,8 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
             LOG_INFO("Savestate: destroyed {} vertex program(s), {} fragment program(s), {} shader patcher(s), {} sync object(s) and {} render target(s) the guest created after the save",
                 rolled.vertex_programs, rolled.fragment_programs, rolled.shader_patchers, rolled.sync_objects, rolled.render_targets);
     }
+    if (masks_to_recreate)
+        gxm::destroy_mask_programs(emuenv.gxm, emuenv.mem);
     std::vector<std::pair<Address, uint32_t>> host_owned_ranges;
     gxm::collect_host_owned_ranges(emuenv.gxm, emuenv.mem, host_owned_ranges);
 
@@ -1923,6 +1963,14 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
         const std::string why = gxm::recreate_programs(emuenv.gxm, emuenv.mem, *emuenv.renderer, programs_to_recreate, recreated_programs);
         if (recreated_programs > 0)
             LOG_INFO("Savestate: made again {} shader program(s) this session had not compiled", recreated_programs);
+        if (!why.empty())
+            LOG_ERROR("Savestate: {}", why);
+    }
+
+    if (masks_to_recreate) {
+        uint32_t recreated_masks = 0;
+        const std::string why = gxm::recreate_mask_programs(emuenv.gxm, emuenv.mem, *emuenv.renderer, *masks_to_recreate, recreated_masks);
+        LOG_INFO_IF(recreated_masks > 0, "Savestate: made again {} mask update program(s)", recreated_masks);
         if (!why.empty())
             LOG_ERROR("Savestate: {}", why);
     }

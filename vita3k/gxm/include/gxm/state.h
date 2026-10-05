@@ -87,6 +87,8 @@ struct GxmState {
     // where they were until then. See gxm::collect_host_owned_ranges.
     std::mutex shader_patcher_mutex;
     std::set<Address> shader_patchers;
+    // Mask-update fragment programs, which no patcher caches: program -> the patcher that made it.
+    std::map<Address, Address> mask_update_programs;
 
 
     void deinit() {
