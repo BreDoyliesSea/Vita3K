@@ -73,6 +73,8 @@ protected:
 
 public:
     bool deque_voice(Voice *voice);
+    // For savestates: put a voice in the queue or take it out, whatever its state says
+    void set_queued(const MemState &mem, Voice *voice, bool queued);
 
     bool play(const MemState &mem, Voice *voice);
     bool pause(const MemState &mem, Voice *voice);

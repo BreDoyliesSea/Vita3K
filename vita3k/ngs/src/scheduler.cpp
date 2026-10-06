@@ -26,6 +26,15 @@
 
 namespace ngs {
 
+void VoiceScheduler::set_queued(const MemState &mem, Voice *voice, const bool queued) {
+    const std::lock_guard<std::recursive_mutex> guard(mutex);
+    const bool is_queued = get_position(voice) != -1;
+    if (queued && !is_queued)
+        deque_insert(mem, voice);
+    else if (!queued && is_queued)
+        deque_voice(voice);
+}
+
 bool VoiceScheduler::deque_voice(Voice *voice) {
     const std::lock_guard<std::recursive_mutex> guard(mutex);
 

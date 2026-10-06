@@ -64,6 +64,11 @@ struct Patch {
 
 struct ModuleLogicalState {
     virtual ~ModuleLogicalState() = default;
+
+    // For savestates: the loop count travels with the voice's position, and whatever was decoded
+    // ahead of that position is dropped, as on a key-on.
+    virtual int32_t loop_count() const { return 0; }
+    virtual void restart_at_position(int32_t loop_count) {}
 };
 
 struct ModuleRuntimeState {
