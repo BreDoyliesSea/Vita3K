@@ -1463,7 +1463,9 @@ void MainWindow::on_thread_dump_requested() {
     // that is still running actually doing".
     //
     // Running threads get their PC sampled twice, because a thread spinning on a flag that will
-    // never be set and a thread making slow progress are indistinguishable from one sample.
+    // never be set and a thread making slow progress are indistinguishable from one sample. The PC
+    // of a running thread is only written back when the JIT returns, so an unchanged one does not
+    // mean the thread is stuck on that instruction: it can be anywhere in the code since.
     if (!m_game_window) {
         statusBar()->showMessage(tr("Thread dump: no game is running"), 4000);
         return;
@@ -1541,7 +1543,7 @@ void MainWindow::on_thread_dump_requested() {
         const bool moved = before != first_pc.end() && before->second != s.pc;
         LOG_INFO("  [{}] id={} \"{}\" pc={}{} lr={} sp={} in {}({}, {}, {})",
             status_name(s.status), s.id, s.name, log_hex(s.pc),
-            (s.status == ThreadStatus::running) ? (moved ? " (advancing)" : " (PC UNCHANGED over 250ms)") : "",
+            (s.status == ThreadStatus::running) ? (moved ? " (advancing)" : " (same saved PC after 250ms, maybe still inside the JIT)") : "",
             log_hex(s.lr), log_hex(s.sp), import ? import : "-",
             log_hex(s.args[0]), log_hex(s.args[1]), log_hex(s.args[2]));
         if (!s.traceback.empty())
