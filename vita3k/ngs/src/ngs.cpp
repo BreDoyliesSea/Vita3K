@@ -27,6 +27,7 @@
 #include <util/log.h>
 #include <algorithm>
 #include <cstring>
+#include <map>
 #include <queue>
 #include <string>
 #include <type_traits>
@@ -606,6 +607,77 @@ uint32_t relocate_after_restore(State &ngs, MemState &mem, const RelocationStash
 
     return static_cast<uint32_t>(std::count_if(stash.moves.begin(), stash.moves.end(),
         [](const RelocationStash::Move &move) { return move.from != move.to; }));
+}
+
+std::vector<SavedVoice> capture_voices(State &ngs, const MemState &mem) {
+    std::vector<SavedVoice> out;
+    for (System *system : ngs.systems) {
+        if (!system)
+            continue;
+        for (Rack *rack : system->racks) {
+            if (!rack)
+                continue;
+            for (const Ptr<Voice> &voice_ptr : rack->voices) {
+                Voice *voice = voice_ptr.get(mem);
+                if (!voice)
+                    continue;
+                SavedVoice saved;
+                saved.addr = voice_ptr.address();
+                saved.state = voice->state;
+                saved.is_pending = voice->is_pending;
+                saved.is_paused = voice->is_paused;
+                saved.is_keyed_off = voice->is_keyed_off;
+                saved.frame_count = voice->frame_count;
+                for (const ModuleData &data : voice->datas) {
+                    SavedVoice::Module module;
+                    module.guest_state = data.guest_state_data;
+                    module.loop_count = data.logical_state ? data.logical_state->loop_count() : 0;
+                    saved.modules.push_back(std::move(module));
+                }
+                out.push_back(std::move(saved));
+            }
+        }
+    }
+    return out;
+}
+
+uint32_t restore_voices(State &ngs, const MemState &mem, const std::vector<SavedVoice> &saved) {
+    std::map<Address, const SavedVoice *> by_address;
+    for (const SavedVoice &voice : saved)
+        by_address[voice.addr] = &voice;
+
+    uint32_t restored = 0;
+    for (System *system : ngs.systems) {
+        if (!system)
+            continue;
+        const std::lock_guard<std::recursive_mutex> guard(system->voice_scheduler.mutex);
+        for (Rack *rack : system->racks) {
+            if (!rack)
+                continue;
+            for (const Ptr<Voice> &voice_ptr : rack->voices) {
+                Voice *voice = voice_ptr.get(mem);
+                const auto it = by_address.find(voice_ptr.address());
+                if (!voice || it == by_address.end() || it->second->modules.size() != voice->datas.size())
+                    continue;
+                const SavedVoice &from = *it->second;
+                voice->state = static_cast<VoiceState>(from.state);
+                voice->is_pending = from.is_pending;
+                voice->is_paused = from.is_paused;
+                voice->is_keyed_off = from.is_keyed_off;
+                voice->frame_count = from.frame_count;
+                for (size_t i = 0; i < voice->datas.size(); i++) {
+                    ModuleData &data = voice->datas[i];
+                    data.guest_state_data = from.modules[i].guest_state;
+                    if (data.logical_state)
+                        data.logical_state->restart_at_position(from.modules[i].loop_count);
+                }
+                const bool playing = voice->state == VOICE_STATE_ACTIVE || voice->state == VOICE_STATE_FINALIZING;
+                system->voice_scheduler.set_queued(mem, voice, playing && !voice->is_paused);
+                restored++;
+            }
+        }
+    }
+    return restored;
 }
 
 void on_savestate_loaded(State &ngs, const MemState &mem) {

@@ -78,6 +78,15 @@ struct Atrac9LogicalState : public ModuleLogicalState {
     uint32_t decoder_config = 0;
     // preserve the decoder's MDCT history so the runtime decoder can be rebuilt
     Atrac9DecoderSavedState saved_state{};
+
+    int32_t loop_count() const override { return current_loop_count; }
+    void restart_at_position(const int32_t loop_count) override {
+        current_loop_count = static_cast<int8_t>(loop_count);
+        decoded_pcm.clear();
+        rate_resampler.reset();
+        superframe_staging.clear();
+        saved_state = {};
+    }
 };
 
 struct Atrac9RuntimeState : public ModuleRuntimeState {

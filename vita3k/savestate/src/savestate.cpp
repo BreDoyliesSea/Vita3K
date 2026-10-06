@@ -107,6 +107,8 @@ constexpr uint32_t TAG_ADCI = 0x49434441U;
 constexpr uint32_t TAG_MBLK = 0x4B4C424DU;
 // "GXMK" - the mask-update fragment programs and their patchers. Optional, so older states still load.
 constexpr uint32_t TAG_GXMK = 0x4B4D5847U;
+// "NGSV" - each NGS voice's playback: state, and per module its position and loop count. Optional.
+constexpr uint32_t TAG_NGSV = 0x5653474EU;
 
 
 // Point a context saved inside an HLE call back at the call itself, so the thread makes it again
@@ -669,6 +671,26 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
         }
     }
 
+    std::vector<uint8_t> ngsv_raw;
+    {
+        const std::vector<ngs::SavedVoice> voices = ngs::capture_voices(emuenv.ngs, emuenv.mem);
+        put<uint32_t>(ngsv_raw, static_cast<uint32_t>(voices.size()));
+        for (const ngs::SavedVoice &voice : voices) {
+            put<uint32_t>(ngsv_raw, voice.addr);
+            put<uint32_t>(ngsv_raw, voice.state);
+            put<uint8_t>(ngsv_raw, voice.is_pending ? 1 : 0);
+            put<uint8_t>(ngsv_raw, voice.is_paused ? 1 : 0);
+            put<uint8_t>(ngsv_raw, voice.is_keyed_off ? 1 : 0);
+            put<uint32_t>(ngsv_raw, voice.frame_count);
+            put<uint32_t>(ngsv_raw, static_cast<uint32_t>(voice.modules.size()));
+            for (const ngs::SavedVoice::Module &module : voice.modules) {
+                put<uint32_t>(ngsv_raw, static_cast<uint32_t>(module.guest_state.size()));
+                ngsv_raw.insert(ngsv_raw.end(), module.guest_state.begin(), module.guest_state.end());
+                put<int32_t>(ngsv_raw, module.loop_count);
+            }
+        }
+    }
+
     // --- where the GXM objects are ------------------------------------------------------------
     // See gxm::check_layout. A load refuses a state whose objects are not all still where it had them.
     std::vector<uint8_t> gxml_raw;
@@ -839,6 +861,11 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
     put<uint64_t>(file, gxmk_raw.size());
     put<uint64_t>(file, gxmk_raw.size());
     file.insert(file.end(), gxmk_raw.begin(), gxmk_raw.end());
+
+    put(file, TAG_NGSV);
+    put<uint64_t>(file, ngsv_raw.size());
+    put<uint64_t>(file, ngsv_raw.size());
+    file.insert(file.end(), ngsv_raw.begin(), ngsv_raw.end());
 
     // --- THRI: what each thread is made of -----------------------------------------------------
     // Enough to recreate one the session has since deleted: see savestate::load. Its TLS block is
@@ -1082,6 +1109,8 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
     size_t gxpg_size = 0;
     const uint8_t *gxmk_data = nullptr;
     size_t gxmk_size = 0;
+    const uint8_t *ngsv_data = nullptr;
+    size_t ngsv_size = 0;
     const uint8_t *thrd_data = nullptr;
     size_t thrd_size = 0;
     const uint8_t *thri_data = nullptr;
@@ -1164,6 +1193,10 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
             gxmk_data = payload;
             gxmk_size = static_cast<size_t>(stored);
             break;
+        case TAG_NGSV:
+            ngsv_data = payload;
+            ngsv_size = static_cast<size_t>(stored);
+            break;
         case TAG_THRD:
             thrd_data = payload;
             thrd_size = static_cast<size_t>(stored);
@@ -1214,6 +1247,37 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
         return Result::fail("state is missing a required chunk");
     if (!thrd_data)
         return Result::fail("state predates restarting waits on load; take a new one");
+
+    std::optional<std::vector<ngs::SavedVoice>> saved_voices;
+    if (ngsv_data) {
+        Reader vr{ ngsv_data, ngsv_size, 0 };
+        uint32_t count = 0;
+        if (!vr.get(count))
+            return Result::fail("corrupt NGS voice chunk");
+        saved_voices.emplace();
+        for (uint32_t i = 0; i < count; i++) {
+            ngs::SavedVoice voice;
+            uint8_t pending = 0, paused = 0, keyed_off = 0;
+            uint32_t modules = 0;
+            if (!vr.get(voice.addr) || !vr.get(voice.state) || !vr.get(pending) || !vr.get(paused) || !vr.get(keyed_off)
+                || !vr.get(voice.frame_count) || !vr.get(modules))
+                return Result::fail("corrupt NGS voice chunk");
+            voice.is_pending = pending != 0;
+            voice.is_paused = paused != 0;
+            voice.is_keyed_off = keyed_off != 0;
+            voice.modules.resize(modules);
+            for (ngs::SavedVoice::Module &module : voice.modules) {
+                uint32_t size = 0;
+                if (!vr.get(size) || !vr.need(size))
+                    return Result::fail("corrupt NGS voice chunk");
+                module.guest_state.assign(vr.data + vr.pos, vr.data + vr.pos + size);
+                vr.pos += size;
+                if (!vr.get(module.loop_count))
+                    return Result::fail("corrupt NGS voice chunk");
+            }
+            saved_voices->push_back(std::move(voice));
+        }
+    }
 
     // The display queue must be empty here, for the same reason the save requires it, and it has
     // to be re-checked now rather than trusted from before the pause. The queue's host thread
@@ -2587,6 +2651,10 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
     // has just been rewound underneath them, so that position is now wrong and the next frame
     // unpacks nonsense -- observed as a storm of Atrac9 decode failures ending in a fault. Tell
     // them to resynchronise.
+    if (saved_voices) {
+        const uint32_t restored = ngs::restore_voices(emuenv.ngs, emuenv.mem, *saved_voices);
+        LOG_INFO("Savestate: put {} NGS voice(s) back where the state had them in what they play", restored);
+    }
     ngs::on_savestate_loaded(emuenv.ngs, emuenv.mem);
     // And the decoders the guest opens itself through sceAudiodec: all flushed, then the ATRAC9
     // ones put back where the state had them inside their superframes. Without that, Gravity Rush's
