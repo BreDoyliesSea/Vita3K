@@ -27,6 +27,7 @@
 #include <map>
 #include <string>
 #include <variant>
+#include <vector>
 
 class SyncPrimitive : public KernelObject {
 public:
@@ -240,6 +241,10 @@ public:
 
     SceSize receive(const ThreadStatePtr &thread, SceUInt32 wait_mode, void *buf, SceSize size, SceUInt32 *timeout, bool callbacks);
     SceSize send(const ThreadStatePtr &thread, SceUInt32 wait_mode, const void *buf, SceSize size, SceUInt32 *timeout, bool callbacks);
+
+    // Savestate support: the bytes waiting in the pipe, and replacing them with a state's.
+    std::vector<uint8_t> contents() const;
+    void set_contents(const uint8_t *bytes, std::size_t size);
 
 private:
     struct WaitEntry {
