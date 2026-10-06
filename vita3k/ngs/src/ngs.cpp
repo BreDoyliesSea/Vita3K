@@ -628,6 +628,12 @@ std::vector<SavedVoice> capture_voices(State &ngs, const MemState &mem) {
                 saved.is_paused = voice->is_paused;
                 saved.is_keyed_off = voice->is_keyed_off;
                 saved.frame_count = voice->frame_count;
+                for (const Voice::Patches &port : voice->patches) {
+                    std::vector<Address> addresses;
+                    for (const Ptr<Patch> &patch : port)
+                        addresses.push_back(patch.address());
+                    saved.patches.push_back(std::move(addresses));
+                }
                 for (const ModuleData &data : voice->datas) {
                     SavedVoice::Module module;
                     module.guest_state = data.guest_state_data;
@@ -671,6 +677,14 @@ uint32_t restore_voices(State &ngs, const MemState &mem, const std::vector<Saved
                     if (data.logical_state)
                         data.logical_state->restart_at_position(from.modules[i].loop_count);
                 }
+                if (from.patches.size() == voice->patches.size()) {
+                    for (size_t port = 0; port < voice->patches.size(); port++) {
+                        voice->patches[port].clear();
+                        for (const Address address : from.patches[port])
+                            voice->patches[port].push_back(Ptr<Patch>(address));
+                    }
+                }
+                voice->inputs.reset_inputs();
                 const bool playing = voice->state == VOICE_STATE_ACTIVE || voice->state == VOICE_STATE_FINALIZING;
                 system->voice_scheduler.set_queued(mem, voice, playing && !voice->is_paused);
                 restored++;

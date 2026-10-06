@@ -92,6 +92,10 @@ struct SavedVoice {
     bool is_keyed_off = false;
     uint32_t frame_count = 0;
     std::vector<Module> modules;
+    // The patches it feeds, per output port. The Patch objects are guest memory and come back with
+    // the state; the voice's list of them did not, and mixing then followed this session's list
+    // into whatever the restored memory held there.
+    std::vector<std::vector<Address>> patches;
 };
 std::vector<SavedVoice> capture_voices(State &ngs, const MemState &mem);
 // The number of voices put back. A voice the state does not describe, or describes with

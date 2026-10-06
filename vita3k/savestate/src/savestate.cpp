@@ -688,6 +688,12 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
                 ngsv_raw.insert(ngsv_raw.end(), module.guest_state.begin(), module.guest_state.end());
                 put<int32_t>(ngsv_raw, module.loop_count);
             }
+            put<uint32_t>(ngsv_raw, static_cast<uint32_t>(voice.patches.size()));
+            for (const std::vector<Address> &port : voice.patches) {
+                put<uint32_t>(ngsv_raw, static_cast<uint32_t>(port.size()));
+                for (const Address patch : port)
+                    put<uint32_t>(ngsv_raw, patch);
+            }
         }
     }
 
@@ -1274,6 +1280,18 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
                 vr.pos += size;
                 if (!vr.get(module.loop_count))
                     return Result::fail("corrupt NGS voice chunk");
+            }
+            uint32_t ports = 0;
+            if (!vr.get(ports))
+                return Result::fail("corrupt NGS voice chunk");
+            voice.patches.resize(ports);
+            for (std::vector<Address> &port : voice.patches) {
+                uint32_t patches = 0;
+                if (!vr.get(patches) || !vr.need(static_cast<size_t>(patches) * sizeof(Address)))
+                    return Result::fail("corrupt NGS voice chunk");
+                port.resize(patches);
+                for (Address &patch : port)
+                    vr.get(patch);
             }
             saved_voices->push_back(std::move(voice));
         }
