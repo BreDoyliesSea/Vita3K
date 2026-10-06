@@ -17,15 +17,13 @@
 
 #include <savestate/savestate.h>
 
+#include <audio/state.h>
 #include <codec/state.h>
 #include <config/version.h>
 #include <cpu/functions.h>
 #include <emuenv/state.h>
-#include <audio/state.h>
+#include <gxm/functions.h>
 #include <gxm/state.h>
-#include <renderer/functions.h>
-#include <renderer/state.h>
-#include <rtc/rtc.h>
 #include <io/functions.h>
 #include <io/state.h>
 #include <kernel/state.h>
@@ -33,24 +31,27 @@
 #include <kernel/thread/thread_state.h>
 #include <mem/functions.h>
 #include <mem/state.h>
-#include <gxm/functions.h>
 #include <ngs/state.h>
 #include <nids/functions.h>
+#include <renderer/functions.h>
+#include <renderer/state.h>
+#include <rtc/rtc.h>
 #include <util/log.h>
 
 #include <miniz.h>
 
 #include <algorithm>
+#include <array>
+#include <cstring>
+#include <ctime>
+#include <fstream>
 #include <functional>
+#include <limits>
+#include <map>
 #include <optional>
 #include <set>
 #include <thread>
 #include <tuple>
-#include <cstring>
-#include <ctime>
-#include <fstream>
-#include <limits>
-#include <map>
 #include <type_traits>
 #include <vector>
 
@@ -110,7 +111,6 @@ constexpr uint32_t TAG_GXMK = 0x4B4D5847U;
 // "NGSV" - each NGS voice's playback: state, and per module its position and loop count. Optional.
 constexpr uint32_t TAG_NGSV = 0x5653474EU;
 
-
 // Point a context saved inside an HLE call back at the call itself, so the thread makes it again
 // when it resumes. Import stubs are ARM -- `svc #0`, `mov pc, lr`, then the NID -- and a thread
 // inside the call has its PC just past the svc (run_loop reads the NID at pc + 4). Its argument
@@ -169,6 +169,53 @@ void put(std::vector<uint8_t> &out, const T &value) {
 void put_string(std::vector<uint8_t> &out, const std::string &s) {
     put<uint32_t>(out, static_cast<uint32_t>(s.size()));
     out.insert(out.end(), s.begin(), s.end());
+}
+
+// Every T in the kernel's UID table, in UID order, as the per-type maps used to hold them. The
+// UIDs are gathered under the table's lock and looked up after it, since find takes it too. Each
+// object's fields are guarded by its own lock (KernelObject::lock), which the readers take.
+template <KernelObjectClass T, typename As = T>
+std::vector<std::pair<SceUID, std::shared_ptr<As>>> kernel_table(const KernelState &kernel) {
+    std::vector<SceUID> uids;
+    kernel.objects.for_each<T>([&](T &obj) { uids.push_back(obj.uid); });
+    std::vector<std::pair<SceUID, std::shared_ptr<As>>> table;
+    table.reserve(uids.size());
+    for (const SceUID uid : uids) {
+        if (std::shared_ptr<As> obj = kernel.objects.find<T>(uid))
+            table.emplace_back(uid, std::move(obj));
+    }
+    return table;
+}
+
+using MutexTable = std::vector<std::pair<SceUID, MutexPtr>>;
+using CondvarTable = std::vector<std::pair<SceUID, CondvarPtr>>;
+
+// The UIDs of the Ts the session holds that keep does not list.
+template <KernelObjectClass T>
+std::vector<SceUID> kernel_uids_not_in(const KernelState &kernel, const std::set<SceUID> &keep) {
+    std::vector<SceUID> extra;
+    kernel.objects.for_each<T>([&](T &obj) {
+        if (!keep.contains(obj.uid))
+            extra.push_back(obj.uid);
+    });
+    return extra;
+}
+
+// Deletes the T with this UID as the guest's delete call does, which leaves an object that threads
+// still wait on alone. False if it was not deleted.
+template <KernelObjectClass T>
+bool delete_kernel_object(KernelState &kernel, SceUID uid) {
+    const std::shared_ptr<T> obj = kernel.objects.find<T>(uid);
+    if (!obj)
+        return false;
+    {
+        const auto guard = obj->lock();
+        if (guard && !obj->waiters.empty()) {
+            LOG_WARN("Savestate: \"{}\" ({}) is not in the state but has waiting threads; keeping it", obj->name, uid);
+            return false;
+        }
+    }
+    return kernel.objects.remove<T>(uid);
 }
 
 struct Reader {
@@ -481,41 +528,53 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
     // Only the scalars are recorded, not the objects themselves: this restores into the same
     // running session, where every object still exists under the same uid. Loading a state into a
     // fresh session would need the objects constructed, which is a different and much larger job.
+    const auto semaphores = kernel_table<Semaphore>(emuenv.kernel);
+    const auto eventflags = kernel_table<EventFlag>(emuenv.kernel);
+    const auto simple_events = kernel_table<SimpleEvent>(emuenv.kernel);
+    const auto heavy_mutexes = kernel_table<HeavyMutex, Mutex>(emuenv.kernel);
+    const auto lw_mutexes = kernel_table<LwMutex, Mutex>(emuenv.kernel);
+    const auto heavy_condvars = kernel_table<HeavyCond, Condvar>(emuenv.kernel);
+    const auto lw_condvars = kernel_table<LwCond, Condvar>(emuenv.kernel);
+    const auto rwlocks = kernel_table<RWLock>(emuenv.kernel);
+    const auto msgpipes = kernel_table<MsgPipe>(emuenv.kernel);
+    const auto timers = kernel_table<Timer>(emuenv.kernel);
     std::vector<uint8_t> sync_raw;
     {
-        const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
-
-        put<uint32_t>(sync_raw, static_cast<uint32_t>(emuenv.kernel.semaphores.size()));
-        for (const auto &[uid, sema] : emuenv.kernel.semaphores) {
+        put<uint32_t>(sync_raw, static_cast<uint32_t>(semaphores.size()));
+        for (const auto &[uid, sema] : semaphores) {
+            const auto guard = sema->lock();
             put(sync_raw, uid);
-            put<int32_t>(sync_raw, sema ? sema->val : 0);
+            put<int32_t>(sync_raw, guard ? sema->val : 0);
         }
 
-        put<uint32_t>(sync_raw, static_cast<uint32_t>(emuenv.kernel.eventflags.size()));
-        for (const auto &[uid, ef] : emuenv.kernel.eventflags) {
+        put<uint32_t>(sync_raw, static_cast<uint32_t>(eventflags.size()));
+        for (const auto &[uid, ef] : eventflags) {
+            const auto guard = ef->lock();
             put(sync_raw, uid);
-            put<int32_t>(sync_raw, ef ? ef->flags : 0);
+            put<int32_t>(sync_raw, guard ? ef->flags : 0);
         }
 
-        put<uint32_t>(sync_raw, static_cast<uint32_t>(emuenv.kernel.simple_events.size()));
-        for (const auto &[uid, ev] : emuenv.kernel.simple_events) {
+        put<uint32_t>(sync_raw, static_cast<uint32_t>(simple_events.size()));
+        for (const auto &[uid, ev] : simple_events) {
+            const auto guard = ev->lock();
             put(sync_raw, uid);
-            put<uint32_t>(sync_raw, ev ? ev->pattern : 0);
-            put<uint64_t>(sync_raw, ev ? ev->last_user_data : 0);
+            put<uint32_t>(sync_raw, guard ? ev->pattern : 0);
+            put<uint64_t>(sync_raw, guard ? ev->last_user_data : 0);
         }
 
         // Mutexes and lwmutexes share a type. The owner is a ThreadStatePtr; record its uid,
         // which is what a restore can look back up.
-        const auto put_mutexes = [&sync_raw](const MutexPtrs &mutexes) {
+        const auto put_mutexes = [&sync_raw](const MutexTable &mutexes) {
             put<uint32_t>(sync_raw, static_cast<uint32_t>(mutexes.size()));
             for (const auto &[uid, mutex] : mutexes) {
+                const auto guard = mutex->lock();
                 put(sync_raw, uid);
-                put<int32_t>(sync_raw, mutex ? mutex->lock_count : 0);
-                put<SceUID>(sync_raw, (mutex && mutex->owner) ? mutex->owner->id : 0);
+                put<int32_t>(sync_raw, guard ? mutex->lock_count : 0);
+                put<SceUID>(sync_raw, (guard && mutex->owner) ? mutex->owner->id : 0);
             }
         };
-        put_mutexes(emuenv.kernel.mutexes);
-        put_mutexes(emuenv.kernel.lwmutexes);
+        put_mutexes(heavy_mutexes);
+        put_mutexes(lw_mutexes);
     }
 
     // --- SYN2: the rest of the sync primitives ---------------------------------------------------
@@ -525,14 +584,13 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
     // to another session, so they are stored relative to now.
     std::vector<uint8_t> syn2_raw;
     {
-        const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
-
-        put<uint32_t>(syn2_raw, static_cast<uint32_t>(emuenv.kernel.rwlocks.size()));
-        for (const auto &[uid, rwlock] : emuenv.kernel.rwlocks) {
+        put<uint32_t>(syn2_raw, static_cast<uint32_t>(rwlocks.size()));
+        for (const auto &[uid, rwlock] : rwlocks) {
+            const auto guard = rwlock->lock();
             put(syn2_raw, uid);
-            put<uint32_t>(syn2_raw, rwlock ? static_cast<uint32_t>(rwlock->state) : 0);
-            put<uint32_t>(syn2_raw, rwlock ? static_cast<uint32_t>(rwlock->owners.size()) : 0);
-            if (rwlock) {
+            put<uint32_t>(syn2_raw, guard ? static_cast<uint32_t>(rwlock->state) : 0);
+            put<uint32_t>(syn2_raw, guard ? static_cast<uint32_t>(rwlock->owners.size()) : 0);
+            if (guard) {
                 for (const auto &[owner, count] : rwlock->owners) {
                     put<SceUID>(syn2_raw, owner ? owner->id : 0);
                     put<int32_t>(syn2_raw, count);
@@ -540,14 +598,10 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
             }
         }
 
-        put<uint32_t>(syn2_raw, static_cast<uint32_t>(emuenv.kernel.msgpipes.size()));
-        for (const auto &[uid, pipe] : emuenv.kernel.msgpipes) {
+        put<uint32_t>(syn2_raw, static_cast<uint32_t>(msgpipes.size()));
+        for (const auto &[uid, pipe] : msgpipes) {
             put(syn2_raw, uid);
-            std::vector<uint8_t> bytes;
-            if (pipe) {
-                bytes.resize(pipe->data_buffer.Used());
-                pipe->data_buffer.Peek(bytes.data(), bytes.size());
-            }
+            const std::vector<uint8_t> bytes = pipe->contents();
             put<uint32_t>(syn2_raw, static_cast<uint32_t>(bytes.size()));
             syn2_raw.insert(syn2_raw.end(), bytes.begin(), bytes.end());
         }
@@ -556,16 +610,17 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
         const auto relative = [now](uint64_t when) {
             return when == std::numeric_limits<uint64_t>::max() ? std::numeric_limits<int64_t>::max() : static_cast<int64_t>(when - now);
         };
-        put<uint32_t>(syn2_raw, static_cast<uint32_t>(emuenv.kernel.timers.size()));
-        for (const auto &[uid, timer] : emuenv.kernel.timers) {
+        put<uint32_t>(syn2_raw, static_cast<uint32_t>(timers.size()));
+        for (const auto &[uid, timer] : timers) {
+            const auto guard = timer->lock();
             put(syn2_raw, uid);
-            const uint8_t flags = timer
+            const uint8_t flags = guard
                 ? static_cast<uint8_t>((timer->is_started ? 1 : 0) | (timer->is_repeat ? 2 : 0) | (timer->is_pulse ? 4 : 0) | (timer->event_set ? 8 : 0))
                 : 0;
             put<uint8_t>(syn2_raw, flags);
-            put<uint64_t>(syn2_raw, timer ? timer->event_interval : 0);
-            put<int64_t>(syn2_raw, timer ? relative(timer->next_event) : 0);
-            put<int64_t>(syn2_raw, timer ? static_cast<int64_t>(timer->time - now) : 0);
+            put<uint64_t>(syn2_raw, guard ? timer->event_interval : 0);
+            put<int64_t>(syn2_raw, guard ? relative(timer->next_event) : 0);
+            put<int64_t>(syn2_raw, guard ? static_cast<int64_t>(timer->time - now) : 0);
         }
     }
 
@@ -909,45 +964,46 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
     // with the worker. See savestate::load.
     std::vector<uint8_t> syni_raw;
     {
-        const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
-        put<uint32_t>(syni_raw, static_cast<uint32_t>(emuenv.kernel.semaphores.size()));
-        for (const auto &[uid, sema] : emuenv.kernel.semaphores) {
+        // Names, attributes and initial values never change; only the flags need the lock.
+        put<uint32_t>(syni_raw, static_cast<uint32_t>(semaphores.size()));
+        for (const auto &[uid, sema] : semaphores) {
             put(syni_raw, uid);
-            put_string(syni_raw, sema ? std::string(sema->name) : std::string());
-            put<uint32_t>(syni_raw, sema ? sema->attr : 0);
-            put<int32_t>(syni_raw, sema ? sema->init_val : 0);
-            put<int32_t>(syni_raw, sema ? sema->max : 0);
+            put_string(syni_raw, sema->name);
+            put<uint32_t>(syni_raw, sema->attr);
+            put<int32_t>(syni_raw, sema->init_val);
+            put<int32_t>(syni_raw, sema->max);
         }
-        put<uint32_t>(syni_raw, static_cast<uint32_t>(emuenv.kernel.eventflags.size()));
-        for (const auto &[uid, ef] : emuenv.kernel.eventflags) {
+        put<uint32_t>(syni_raw, static_cast<uint32_t>(eventflags.size()));
+        for (const auto &[uid, ef] : eventflags) {
+            const auto guard = ef->lock();
             put(syni_raw, uid);
-            put_string(syni_raw, ef ? std::string(ef->name) : std::string());
-            put<uint32_t>(syni_raw, ef ? ef->attr : 0);
-            put<uint32_t>(syni_raw, ef ? static_cast<uint32_t>(ef->flags) : 0);
+            put_string(syni_raw, ef->name);
+            put<uint32_t>(syni_raw, ef->attr);
+            put<uint32_t>(syni_raw, guard ? static_cast<uint32_t>(ef->flags) : 0);
         }
-        const auto put_mutexes = [&syni_raw](const MutexPtrs &mutexes) {
+        const auto put_mutexes = [&syni_raw](const MutexTable &mutexes) {
             put<uint32_t>(syni_raw, static_cast<uint32_t>(mutexes.size()));
             for (const auto &[uid, mutex] : mutexes) {
                 put(syni_raw, uid);
-                put_string(syni_raw, mutex ? std::string(mutex->name) : std::string());
-                put<uint32_t>(syni_raw, mutex ? mutex->attr : 0);
-                put<int32_t>(syni_raw, mutex ? mutex->init_count : 0);
-                put<uint32_t>(syni_raw, mutex ? mutex->workarea.address() : 0);
+                put_string(syni_raw, mutex->name);
+                put<uint32_t>(syni_raw, mutex->attr);
+                put<int32_t>(syni_raw, mutex->init_count);
+                put<uint32_t>(syni_raw, mutex->workarea.address());
             }
         };
-        put_mutexes(emuenv.kernel.mutexes);
-        put_mutexes(emuenv.kernel.lwmutexes);
-        const auto put_condvars = [&syni_raw](const CondvarPtrs &condvars) {
+        put_mutexes(heavy_mutexes);
+        put_mutexes(lw_mutexes);
+        const auto put_condvars = [&syni_raw](const CondvarTable &condvars) {
             put<uint32_t>(syni_raw, static_cast<uint32_t>(condvars.size()));
             for (const auto &[uid, cv] : condvars) {
                 put(syni_raw, uid);
-                put_string(syni_raw, cv ? std::string(cv->name) : std::string());
-                put<uint32_t>(syni_raw, cv ? cv->attr : 0);
-                put<SceUID>(syni_raw, (cv && cv->associated_mutex) ? cv->associated_mutex->uid : 0);
+                put_string(syni_raw, cv->name);
+                put<uint32_t>(syni_raw, cv->attr);
+                put<SceUID>(syni_raw, cv->associated_mutex ? cv->associated_mutex->uid : 0);
             }
         };
-        put_condvars(emuenv.kernel.condvars);
-        put_condvars(emuenv.kernel.lwcondvars);
+        put_condvars(heavy_condvars);
+        put_condvars(lw_condvars);
     }
 
     // --- AUDP: each audio out port's configuration ---------------------------------------------
@@ -1041,7 +1097,6 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
         static_cast<double>(file.size()) / (1024.0 * 1024.0));
     return Result::ok();
 }
-
 
 Result load(EmuEnvState &emuenv, const fs::path &path) {
     if (emuenv.io.title_id.empty())
@@ -2117,152 +2172,149 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
         Reader nr{ syni_data, syni_size, 0 };
         bool ok = true;
         const auto read_count = [&](uint32_t &count) { return ok && (ok = nr.get(count)); };
-        // Semaphores.
-        {
-            uint32_t count = 0;
-            std::set<SceUID> in_state;
-            if (read_count(count)) {
-                for (uint32_t i = 0; i < count && ok; i++) {
-                    SceUID uid = 0;
-                    std::string name;
-                    uint32_t attr = 0;
-                    int32_t init_val = 0, max_val = 0;
-                    ok = nr.get(uid) && nr.get_string(name) && nr.get(attr) && nr.get(init_val) && nr.get(max_val);
-                    if (!ok)
-                        break;
-                    in_state.insert(uid);
-                    bool present;
-                    {
-                        const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
-                        present = emuenv.kernel.semaphores.contains(uid);
-                    }
-                    if (!present) {
-                        semaphore_recreate(emuenv.kernel, uid, name.c_str(), attr, init_val, max_val);
-                        objects_recreated++;
-                    }
-                }
-                std::vector<SceUID> extra;
-                {
-                    const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
-                    for (const auto &[uid, _] : emuenv.kernel.semaphores)
-                        if (!in_state.contains(uid))
-                            extra.push_back(uid);
-                }
-                for (const SceUID uid : extra)
-                    if (semaphore_delete(emuenv.kernel, "savestate", 0, uid) == SCE_KERNEL_OK)
-                        objects_deleted++;
+        // Every table is read before anything changes. The session keeps one UID table for all
+        // of them, so an object it holds under a UID the state gives another class has to go
+        // before the state's object can be put back under that UID.
+        struct SemaRecord {
+            SceUID uid = 0;
+            std::string name;
+            uint32_t attr = 0;
+            int32_t init_val = 0, max_val = 0;
+        };
+        struct FlagRecord {
+            SceUID uid = 0;
+            std::string name;
+            uint32_t attr = 0, flags = 0;
+        };
+        struct MutexRecord {
+            SceUID uid = 0;
+            std::string name;
+            uint32_t attr = 0, workarea = 0;
+            int32_t init_count = 0;
+        };
+        struct CondRecord {
+            SceUID uid = 0, assoc = 0;
+            std::string name;
+            uint32_t attr = 0;
+        };
+        std::vector<SemaRecord> semas;
+        std::vector<FlagRecord> flags;
+        std::array<std::vector<MutexRecord>, 2> mutexes; // heavy, light
+        std::array<std::vector<CondRecord>, 2> condvars; // heavy, light
+        uint32_t count = 0;
+        if (read_count(count)) {
+            for (uint32_t i = 0; i < count && ok; i++) {
+                SemaRecord r;
+                ok = nr.get(r.uid) && nr.get_string(r.name) && nr.get(r.attr) && nr.get(r.init_val) && nr.get(r.max_val);
+                if (ok)
+                    semas.push_back(std::move(r));
             }
         }
-        // Event flags.
-        {
-            uint32_t count = 0;
-            std::set<SceUID> in_state;
-            if (read_count(count)) {
-                for (uint32_t i = 0; i < count && ok; i++) {
-                    SceUID uid = 0;
-                    std::string name;
-                    uint32_t attr = 0, flags = 0;
-                    ok = nr.get(uid) && nr.get_string(name) && nr.get(attr) && nr.get(flags);
-                    if (!ok)
-                        break;
-                    in_state.insert(uid);
-                    bool present;
-                    {
-                        const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
-                        present = emuenv.kernel.eventflags.contains(uid);
-                    }
-                    if (!present) {
-                        eventflag_recreate(emuenv.kernel, uid, name.c_str(), attr, flags);
-                        objects_recreated++;
-                    }
-                }
-                std::vector<SceUID> extra;
-                {
-                    const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
-                    for (const auto &[uid, _] : emuenv.kernel.eventflags)
-                        if (!in_state.contains(uid))
-                            extra.push_back(uid);
-                }
-                for (const SceUID uid : extra)
-                    if (eventflag_delete(emuenv.kernel, "savestate", 0, uid) == SCE_KERNEL_OK)
-                        objects_deleted++;
+        if (read_count(count)) {
+            for (uint32_t i = 0; i < count && ok; i++) {
+                FlagRecord r;
+                ok = nr.get(r.uid) && nr.get_string(r.name) && nr.get(r.attr) && nr.get(r.flags);
+                if (ok)
+                    flags.push_back(std::move(r));
             }
         }
-        // Mutexes, heavy then light.
-        for (const SyncWeight weight : { SyncWeight::Heavy, SyncWeight::Light }) {
-            uint32_t count = 0;
-            std::set<SceUID> in_state;
+        for (auto &table : mutexes) {
             if (!read_count(count))
                 break;
-            const MutexPtrs &table = weight == SyncWeight::Heavy ? emuenv.kernel.mutexes : emuenv.kernel.lwmutexes;
             for (uint32_t i = 0; i < count && ok; i++) {
-                SceUID uid = 0;
-                std::string name;
-                uint32_t attr = 0, workarea = 0;
-                int32_t init_count = 0;
-                ok = nr.get(uid) && nr.get_string(name) && nr.get(attr) && nr.get(init_count) && nr.get(workarea);
-                if (!ok)
-                    break;
-                in_state.insert(uid);
-                bool present;
-                {
-                    const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
-                    present = table.contains(uid);
-                }
-                if (!present) {
-                    mutex_recreate(emuenv.kernel, uid, name.c_str(), attr, init_count, Ptr<SceKernelLwMutexWork>(workarea), weight);
-                    objects_recreated++;
-                }
+                MutexRecord r;
+                ok = nr.get(r.uid) && nr.get_string(r.name) && nr.get(r.attr) && nr.get(r.init_count) && nr.get(r.workarea);
+                if (ok)
+                    table.push_back(std::move(r));
             }
-            std::vector<SceUID> extra;
-            {
-                const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
-                for (const auto &[uid, _] : table)
-                    if (!in_state.contains(uid))
-                        extra.push_back(uid);
-            }
-            for (const SceUID uid : extra)
-                if (mutex_delete(emuenv.kernel, "savestate", 0, uid, weight) == SCE_KERNEL_OK)
-                    objects_deleted++;
         }
-        // Condvars, heavy then light; their mutexes exist by now.
-        for (const SyncWeight weight : { SyncWeight::Heavy, SyncWeight::Light }) {
-            uint32_t count = 0;
-            std::set<SceUID> in_state;
+        for (auto &table : condvars) {
             if (!read_count(count))
                 break;
-            const CondvarPtrs &table = weight == SyncWeight::Heavy ? emuenv.kernel.condvars : emuenv.kernel.lwcondvars;
             for (uint32_t i = 0; i < count && ok; i++) {
-                SceUID uid = 0, assoc = 0;
-                std::string name;
-                uint32_t attr = 0;
-                ok = nr.get(uid) && nr.get_string(name) && nr.get(attr) && nr.get(assoc);
-                if (!ok)
-                    break;
-                in_state.insert(uid);
-                bool present;
-                {
-                    const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
-                    present = table.contains(uid);
-                }
-                if (!present) {
-                    if (condvar_recreate(emuenv.kernel, uid, name.c_str(), attr, assoc, weight))
-                        objects_recreated++;
-                    else
-                        LOG_ERROR("Savestate: condvar {} \"{}\" could not be recreated: its mutex {} is missing", uid, name, assoc);
-                }
+                CondRecord r;
+                ok = nr.get(r.uid) && nr.get_string(r.name) && nr.get(r.attr) && nr.get(r.assoc);
+                if (ok)
+                    table.push_back(std::move(r));
             }
-            std::vector<SceUID> extra;
-            {
-                const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
-                for (const auto &[uid, _] : table)
-                    if (!in_state.contains(uid))
-                        extra.push_back(uid);
-            }
-            for (const SceUID uid : extra)
-                if (condvar_delete(emuenv.kernel, "savestate", 0, uid, weight) == SCE_KERNEL_OK)
-                    objects_deleted++;
         }
+
+        // Delete what the state does not have, condvars before the mutexes they name. Only for
+        // a chunk that read to the end: a partial one would delete objects it never got to.
+        if (ok) {
+            const auto uids_of = [](const auto &records) {
+                std::set<SceUID> uids;
+                for (const auto &r : records)
+                    uids.insert(r.uid);
+                return uids;
+            };
+            const auto count_deleted = [&](bool deleted) {
+                if (deleted)
+                    objects_deleted++;
+            };
+            KernelState &kernel = emuenv.kernel;
+            for (const SceUID uid : kernel_uids_not_in<HeavyCond>(kernel, uids_of(condvars[0])))
+                count_deleted(delete_kernel_object<HeavyCond>(kernel, uid));
+            for (const SceUID uid : kernel_uids_not_in<LwCond>(kernel, uids_of(condvars[1])))
+                count_deleted(delete_kernel_object<LwCond>(kernel, uid));
+            for (const SceUID uid : kernel_uids_not_in<HeavyMutex>(kernel, uids_of(mutexes[0])))
+                count_deleted(delete_kernel_object<HeavyMutex>(kernel, uid));
+            for (const SceUID uid : kernel_uids_not_in<LwMutex>(kernel, uids_of(mutexes[1])))
+                count_deleted(delete_kernel_object<LwMutex>(kernel, uid));
+            for (const SceUID uid : kernel_uids_not_in<EventFlag>(kernel, uids_of(flags)))
+                count_deleted(delete_kernel_object<EventFlag>(kernel, uid));
+            for (const SceUID uid : kernel_uids_not_in<Semaphore>(kernel, uids_of(semas)))
+                count_deleted(delete_kernel_object<Semaphore>(kernel, uid));
+        }
+
+        // Put back what the session lacks, mutexes before the condvars that name them. A UID
+        // still held by an object of another class (one the guest made after the state and the
+        // delete above could not remove) is reported and left alone.
+        const auto needs_recreating = [&]<KernelObjectClass T>(std::type_identity<T>, SceUID uid, const std::string &name) {
+            if (emuenv.kernel.objects.find<T>(uid))
+                return false;
+            if (emuenv.kernel.objects.find(uid)) {
+                LOG_ERROR("Savestate: \"{}\" ({}) could not be put back: another kind of object holds its UID", name, uid);
+                return false;
+            }
+            return true;
+        };
+        // Built as the guest's create call builds it, under the state's UID, without touching guest
+        // memory (a lightweight mutex's work area is restored with the rest of memory) and with no
+        // owner; the sync-primitive pass below sets the counts and the owner.
+        const auto put_back = [&](std::shared_ptr<KernelObject> obj, SceUID uid) {
+            emuenv.kernel.ensure_next_uid_above(uid);
+            emuenv.kernel.objects.add(std::move(obj), uid);
+            objects_recreated++;
+        };
+        for (const SemaRecord &r : semas) {
+            if (needs_recreating(std::type_identity<Semaphore>{}, r.uid, r.name))
+                put_back(std::make_shared<Semaphore>(r.attr, r.name.c_str(), r.init_val, r.max_val), r.uid);
+        }
+        for (const FlagRecord &r : flags) {
+            if (needs_recreating(std::type_identity<EventFlag>{}, r.uid, r.name))
+                put_back(std::make_shared<EventFlag>(r.attr, r.name.c_str(), r.flags), r.uid);
+        }
+        const auto recreate_mutexes = [&]<KernelObjectClass T>(std::type_identity<T> type, const std::vector<MutexRecord> &records) {
+            for (const MutexRecord &r : records) {
+                if (needs_recreating(type, r.uid, r.name))
+                    put_back(std::make_shared<T>(r.attr, r.name.c_str(), r.init_count, nullptr, Ptr<SceKernelLwMutexWork>(r.workarea)), r.uid);
+            }
+        };
+        recreate_mutexes(std::type_identity<HeavyMutex>{}, mutexes[0]);
+        recreate_mutexes(std::type_identity<LwMutex>{}, mutexes[1]);
+        const auto recreate_condvars = [&]<KernelObjectClass T, KernelObjectClass M>(std::type_identity<T> type, std::type_identity<M>, const std::vector<CondRecord> &records) {
+            for (const CondRecord &r : records) {
+                if (!needs_recreating(type, r.uid, r.name))
+                    continue;
+                if (MutexPtr mutex = emuenv.kernel.objects.find<M>(r.assoc))
+                    put_back(std::make_shared<T>(r.attr, r.name.c_str(), std::move(mutex)), r.uid);
+                else
+                    LOG_ERROR("Savestate: condvar {} \"{}\" could not be recreated: its mutex {} is missing", r.uid, r.name, r.assoc);
+            }
+        };
+        recreate_condvars(std::type_identity<HeavyCond>{}, std::type_identity<HeavyMutex>{}, condvars[0]);
+        recreate_condvars(std::type_identity<LwCond>{}, std::type_identity<LwMutex>{}, condvars[1]);
         if (!ok)
             LOG_ERROR("Savestate: the sync object chunk is corrupt; objects the guest deleted since the save were not all put back");
     }
@@ -2390,9 +2442,8 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
     uint32_t sync_restored = 0, sync_skipped = 0;
     {
         Reader sr{ sync_data, sync_size, 0 };
-        const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
 
-        const auto read_table = [&](const auto &table, auto &&apply) -> bool {
+        const auto read_table = [&](auto &&find, auto &&apply) -> bool {
             uint32_t count = 0;
             if (!sr.get(count))
                 return false;
@@ -2400,65 +2451,73 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
                 SceUID uid = 0;
                 if (!sr.get(uid))
                     return false;
-                const auto it = table.find(uid);
-                if (!apply(it != table.end() ? it->second : nullptr))
+                if (!apply(find(uid)))
                     return false;
             }
             return true;
         };
+        const auto find_in = [&]<KernelObjectClass T>(std::type_identity<T>) {
+            return [&](SceUID uid) { return emuenv.kernel.objects.find<T>(uid); };
+        };
 
         const auto count_it = [&](bool present) { present ? sync_restored++ : sync_skipped++; };
+        // The object's lock, which is empty when there is no object or it has been deleted
+        const auto lock_of = [](const auto &obj) { return obj ? obj->lock() : std::unique_lock<std::mutex>(); };
 
-        bool ok = read_table(emuenv.kernel.semaphores, [&](const SemaphorePtr &sema) {
+        bool ok = read_table(find_in(std::type_identity<Semaphore>{}), [&](const SemaphorePtr &sema) {
             int32_t val = 0;
             if (!sr.get(val))
                 return false;
-            if (sema)
+            const auto guard = lock_of(sema);
+            if (guard)
                 sema->val = val;
-            count_it(sema != nullptr);
+            count_it(guard.owns_lock());
             return true;
         });
 
-        ok = ok && read_table(emuenv.kernel.eventflags, [&](const EventFlagPtr &ef) {
+        ok = ok && read_table(find_in(std::type_identity<EventFlag>{}), [&](const EventFlagPtr &ef) {
             int32_t flags = 0;
             if (!sr.get(flags))
                 return false;
-            if (ef)
+            const auto guard = lock_of(ef);
+            if (guard)
                 ef->flags = flags;
-            count_it(ef != nullptr);
+            count_it(guard.owns_lock());
             return true;
         });
 
-        ok = ok && read_table(emuenv.kernel.simple_events, [&](const SimpleEventPtr &ev) {
+        ok = ok && read_table(find_in(std::type_identity<SimpleEvent>{}), [&](const SimpleEventPtr &ev) {
             uint32_t pattern = 0;
             uint64_t user_data = 0;
             if (!sr.get(pattern) || !sr.get(user_data))
                 return false;
-            if (ev) {
+            const auto guard = lock_of(ev);
+            if (guard) {
                 ev->pattern = pattern;
                 ev->last_user_data = user_data;
             }
-            count_it(ev != nullptr);
+            count_it(guard.owns_lock());
             return true;
         });
 
-        const auto restore_mutexes = [&](const MutexPtrs &table) {
-            return read_table(table, [&](const MutexPtr &mutex) {
+        const auto restore_mutexes = [&](auto &&find) {
+            return read_table(find, [&](const MutexPtr &mutex) {
                 int32_t lock_count = 0;
                 SceUID owner_id = 0;
                 if (!sr.get(lock_count) || !sr.get(owner_id))
                     return false;
-                if (mutex) {
+                ThreadStatePtr owner = emuenv.kernel.get_thread(owner_id);
+                const auto guard = lock_of(mutex);
+                if (guard) {
                     mutex->lock_count = lock_count;
-                    const auto owner = emuenv.kernel.threads.find(owner_id);
-                    mutex->owner = (owner != emuenv.kernel.threads.end()) ? owner->second : nullptr;
+                    mutex->owner = std::move(owner);
                 }
-                count_it(mutex != nullptr);
+                count_it(guard.owns_lock());
                 return true;
             });
         };
-        ok = ok && restore_mutexes(emuenv.kernel.mutexes);
-        ok = ok && restore_mutexes(emuenv.kernel.lwmutexes);
+        ok = ok && restore_mutexes(find_in(std::type_identity<HeavyMutex>{}));
+        ok = ok && restore_mutexes(find_in(std::type_identity<LwMutex>{}));
 
         if (!ok)
             return Result::fail("corrupt sync chunk");
@@ -2492,26 +2551,24 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
     // Past the point of no return, so a chunk that does not parse is reported, not refused.
     if (syn2_data) {
         Reader xr{ syn2_data, syn2_size, 0 };
-        const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
         uint32_t count = 0;
         bool ok = xr.get(count);
         for (uint32_t i = 0; ok && i < count; i++) {
             SceUID uid = 0;
             uint32_t state = 0, owner_count = 0;
             ok = xr.get(uid) && xr.get(state) && xr.get(owner_count);
-            RWLockOwners owners;
+            std::map<ThreadStatePtr, int> owners;
             for (uint32_t j = 0; ok && j < owner_count; j++) {
                 SceUID owner = 0;
                 int32_t held = 0;
                 ok = xr.get(owner) && xr.get(held);
-                const auto t = emuenv.kernel.threads.find(owner);
-                if (ok && t != emuenv.kernel.threads.end() && t->second)
-                    owners.emplace(t->second, held);
+                if (ThreadStatePtr thread = ok ? emuenv.kernel.get_thread(owner) : nullptr)
+                    owners.emplace(std::move(thread), held);
             }
-            const auto it = emuenv.kernel.rwlocks.find(uid);
-            if (ok && it != emuenv.kernel.rwlocks.end() && it->second) {
-                it->second->state = static_cast<RWLockState>(state);
-                it->second->owners = std::move(owners);
+            const RWLockPtr rwlock = ok ? emuenv.kernel.objects.find<RWLock>(uid) : nullptr;
+            if (const auto guard = rwlock ? rwlock->lock() : std::unique_lock<std::mutex>()) {
+                rwlock->state = static_cast<RWLockState>(state);
+                rwlock->owners = std::move(owners);
             }
         }
 
@@ -2524,13 +2581,8 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
                 break;
             const uint8_t *const bytes = xr.data + xr.pos;
             xr.pos += used;
-            const auto it = emuenv.kernel.msgpipes.find(uid);
-            if (it != emuenv.kernel.msgpipes.end() && it->second) {
-                ByteRingBuffer &buffer = it->second->data_buffer;
-                std::vector<uint8_t> discard(buffer.Used());
-                buffer.Remove(discard.data(), discard.size());
-                buffer.Insert(bytes, used);
-            }
+            if (const MsgPipePtr pipe = emuenv.kernel.objects.find<MsgPipe>(uid))
+                pipe->set_contents(bytes, used);
         }
 
         const uint64_t now = sync_timer_clock();
@@ -2541,9 +2593,9 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
             uint64_t interval = 0;
             int64_t next = 0, time = 0;
             ok = xr.get(uid) && xr.get(flags) && xr.get(interval) && xr.get(next) && xr.get(time);
-            const auto it = emuenv.kernel.timers.find(uid);
-            if (ok && it != emuenv.kernel.timers.end() && it->second) {
-                Timer &timer = *it->second;
+            const TimerPtr timer_ptr = ok ? emuenv.kernel.objects.find<Timer>(uid) : nullptr;
+            if (const auto guard = timer_ptr ? timer_ptr->lock() : std::unique_lock<std::mutex>()) {
+                Timer &timer = *timer_ptr;
                 timer.is_started = flags & 1;
                 timer.is_repeat = flags & 2;
                 timer.is_pulse = flags & 4;
@@ -2639,7 +2691,7 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
     }
 
     // Restoring the counts above wrote numbers the waiting-thread queues know nothing about. A
-    // waiter can now be satisfiable with nobody left to wake it, because semaphore_signal is the
+    // waiter can now be satisfiable with nobody left to wake it, because Semaphore::signal is the
     // only thing that ever wakes one -- which presents as the guest hanging with a correct-looking
     // frame on screen. Put the invariant back.
     reconcile_waiters_after_load(emuenv.kernel);

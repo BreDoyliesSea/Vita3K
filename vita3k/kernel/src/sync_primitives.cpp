@@ -1309,3 +1309,21 @@ SceInt32 MsgPipe::cancel(SceUInt32 *num_send_wait_threads, SceUInt32 *num_receiv
 
     return SCE_KERNEL_OK;
 }
+
+std::vector<uint8_t> MsgPipe::contents() const {
+    std::vector<uint8_t> bytes;
+    if (const auto guard = lock()) {
+        bytes.resize(data_buffer.Used());
+        data_buffer.Peek(bytes.data(), bytes.size());
+    }
+    return bytes;
+}
+
+void MsgPipe::set_contents(const uint8_t *bytes, std::size_t size) {
+    const auto guard = lock();
+    if (!guard)
+        return;
+    std::vector<uint8_t> discard(data_buffer.Used());
+    data_buffer.Remove(discard.data(), discard.size());
+    data_buffer.Insert(bytes, size);
+}

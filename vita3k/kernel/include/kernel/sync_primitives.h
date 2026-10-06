@@ -29,6 +29,7 @@
 #include <span>
 #include <string>
 #include <variant>
+#include <vector>
 
 class SyncPrimitive : public KernelObject {
 public:
@@ -335,6 +336,10 @@ public:
     std::expected<SceSize, SceInt32> receive(const ThreadStatePtr &thread, MemState &mem, SceUInt32 wait_mode, std::span<const MsgPipeVector> pieces, SceUInt32 *timeout, bool callbacks);
     std::expected<SceSize, SceInt32> send(const ThreadStatePtr &thread, MemState &mem, SceUInt32 wait_mode, std::span<const MsgPipeVector> pieces, SceUInt32 *timeout, bool callbacks);
     SceInt32 cancel(SceUInt32 *num_send_wait_threads, SceUInt32 *num_receive_wait_threads);
+
+    // Savestate support: the bytes waiting in the pipe, and replacing them with a state's.
+    std::vector<uint8_t> contents() const;
+    void set_contents(const uint8_t *bytes, std::size_t size);
 
     struct WaitEntry {
         SceSize request_size;
