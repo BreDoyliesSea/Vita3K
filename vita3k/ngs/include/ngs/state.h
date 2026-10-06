@@ -76,6 +76,28 @@ struct SavedLayout {
 
 SavedLayout capture_layout(State &ngs, const MemState &mem);
 
+// Where each voice is in what it plays. The Voice objects are kept across a load (see
+// collect_host_owned_ranges), and so was their playback: the restored guest then got the
+// end-of-data callbacks of sounds it had not started yet, and Borderlands 2's audio thread read
+// through the null it had for them. A load puts this back on the voices it kept instead.
+struct SavedVoice {
+    struct Module {
+        std::vector<uint8_t> guest_state;
+        int32_t loop_count = 0;
+    };
+    Address addr = 0;
+    uint32_t state = 0;
+    bool is_pending = false;
+    bool is_paused = false;
+    bool is_keyed_off = false;
+    uint32_t frame_count = 0;
+    std::vector<Module> modules;
+};
+std::vector<SavedVoice> capture_voices(State &ngs, const MemState &mem);
+// The number of voices put back. A voice the state does not describe, or describes with
+// different modules, is left as it is.
+uint32_t restore_voices(State &ngs, const MemState &mem, const std::vector<SavedVoice> &saved);
+
 // Empty if the live objects can be moved onto `saved`, otherwise why not. Touches nothing.
 std::string check_relocatable(State &ngs, const MemState &mem, const SavedLayout &saved);
 
