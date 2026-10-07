@@ -1675,13 +1675,41 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
             }
 
             const gxm::HostObjectLayout live = gxm::capture_layout(emuenv.gxm, emuenv.mem);
+            // A program this session made at the same address as one in the state is only the same
+            // program if it wraps the same GXP blob the same way. LittleBigPlanet makes and releases
+            // programs as it streams, so another session can hold a different one there; kept, its
+            // preserved wrapper points at a blob address the load fills with the state's bytes, and
+            // the next draw translates whatever is there (a fault in shader::get_program_input).
+            // Such a program is dropped from the saved layout, so the rollback destroys this
+            // session's, and made again from the state's description.
+            std::map<Address, gxm::ProgramIdentity> live_identities;
+            for (gxm::ProgramIdentity &identity : gxm::capture_program_identities(emuenv.gxm, emuenv.mem))
+                live_identities[identity.address] = std::move(identity);
+            const auto same_program = [&](const Address address) {
+                const auto saved_it = described.find(address);
+                const auto live_it = live_identities.find(address);
+                if (saved_it == described.end() || live_it == live_identities.end())
+                    return true;
+                const gxm::ProgramIdentity &a = saved_it->second;
+                const gxm::ProgramIdentity &b = live_it->second;
+                if (a.fragment != b.fragment || a.program != b.program || a.patcher != b.patcher)
+                    return false;
+                if (a.fragment)
+                    return a.has_blend_info == b.has_blend_info && memcmp(&a.blend_info, &b.blend_info, sizeof(a.blend_info)) == 0;
+                return a.key_hash == b.key_hash;
+            };
+            uint32_t replaced_programs = 0;
             programs_handled = true;
             for (const auto &[kind, saved_list, live_list] : {
                      std::tuple{ "vertex program", &layout.vertex_programs, &live.vertex_programs },
                      std::tuple{ "fragment program", &layout.fragment_programs, &live.fragment_programs } }) {
+                std::vector<Address> replaced;
                 for (const Address address : *saved_list) {
-                    if (std::binary_search(live_list->begin(), live_list->end(), address))
-                        continue;
+                    if (std::binary_search(live_list->begin(), live_list->end(), address)) {
+                        if (same_program(address))
+                            continue;
+                        replaced.push_back(address);
+                    }
                     const auto it = described.find(address);
                     if (it == described.end()) {
                         programs_handled = false;
@@ -1694,7 +1722,12 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
                 }
                 if (!programs_handled)
                     break;
+                for (const Address address : replaced)
+                    saved_list->erase(std::lower_bound(saved_list->begin(), saved_list->end(), address));
+                replaced_programs += static_cast<uint32_t>(replaced.size());
             }
+            if (programs_handled && replaced_programs > 0)
+                LOG_INFO("Savestate: {} program(s) in this session sit where the state has a different one; they are made again from the state", replaced_programs);
         }
 
         if (gxmk_data && emuenv.renderer->current_backend == renderer::Backend::Vulkan) {
