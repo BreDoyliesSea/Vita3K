@@ -17,6 +17,13 @@
 
 #include <module/module.h>
 
+#include <kernel/state.h>
+#include <kernel/thread/thread_state.h>
+
 EXPORT(int, sceKernelGetCpuId) {
-    return UNIMPLEMENTED();
+    const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
+    if (!thread || !emuenv.kernel.sched.is_enabled())
+        return 0;
+    const int cpu = emuenv.kernel.sched.info(*thread).current_cpu;
+    return cpu < 0 ? 0 : cpu;
 }

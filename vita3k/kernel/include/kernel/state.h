@@ -21,6 +21,7 @@
 #include <kernel/callback.h>
 #include <kernel/debugger.h>
 #include <kernel/object_store.h>
+#include <kernel/scheduler.h>
 #include <kernel/sync_primitives.h>
 #include <kernel/types.h>
 #include <mem/allocator.h>
@@ -141,6 +142,8 @@ struct KernelState {
 
     bool cpu_opt;
     CorenumAllocator corenum_allocator;
+    // Shares the emulated cores among the guest threads
+    Scheduler sched;
     CallImportFunc call_import;
 
     // Shared NOP+WFI sentinel used by the Dynarmic as the halt return address
@@ -169,7 +172,7 @@ struct KernelState {
         return next_uid++;
     }
 
-    bool init(MemState &mem, const CallImportFunc &call_import, bool cpu_opt);
+    bool init(MemState &mem, const CallImportFunc &call_import, bool cpu_opt, bool thread_scheduler);
     void deinit(MemState &mem);
     void load_process_param(MemState &mem, Ptr<uint32_t> ptr);
     ThreadStatePtr create_thread(MemState &mem, const char *name, Ptr<const void> entry_point = Ptr<const void>(0));

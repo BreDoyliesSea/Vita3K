@@ -19,6 +19,7 @@
 
 #include <cpu/state.h>
 #include <kernel/callback.h>
+#include <kernel/scheduler.h>
 #include <kernel/thread/wait_queue.h>
 #include <kernel/types.h>
 #include <mem/block.h>
@@ -81,6 +82,9 @@ struct ThreadState {
     const SceInt32 init_affinity_mask;
     // The registers each run starts with
     const CPUContext init_cpu_ctx;
+    // Where the thread is among the emulated cores, and the priority and cores the scheduler places
+    // it by. Guarded by the scheduler's mutex.
+    Scheduler::Node sched;
 
     ThreadState() = delete;
     // A dormant thread with its stack and TLS, which runs on cpu

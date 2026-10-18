@@ -10,6 +10,7 @@ set(SOURCE_LIST
 	include/kernel/debugger.h
 	include/kernel/load_self.h
 	include/kernel/callback.h
+	include/kernel/scheduler.h
 	src/kernel.cpp
 	src/thread.cpp
 	src/debugger.cpp
@@ -17,6 +18,7 @@ set(SOURCE_LIST
 	src/sync_primitives.cpp
 	src/relocation.cpp
 	src/callback.cpp
+	src/scheduler.cpp
 )
 
 add_library(

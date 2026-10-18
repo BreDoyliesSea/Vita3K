@@ -2712,7 +2712,12 @@ EXPORT(int, sceGxmFinish, SceGxmContext *context) {
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
 
     // Wait on this context's rendering finish code.
+    const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
+    if (thread)
+        thread->begin_host_wait();
     renderer::finish(*emuenv.renderer, renderer_context);
+    if (thread)
+        thread->end_host_wait();
 
     return 0;
 }
@@ -3016,7 +3021,12 @@ EXPORT(int, sceGxmNotificationWait, const SceGxmNotification *notification) {
 
     std::unique_lock<std::mutex> lock(emuenv.renderer->notification_mutex);
     if (*value != target_value) {
+        const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
+        if (thread)
+            thread->begin_host_wait();
         emuenv.renderer->notification_ready.wait(lock, [&]() { return *value == target_value || emuenv.display.abort.load(); });
+        if (thread)
+            thread->end_host_wait();
     }
 
     return 0;
@@ -5673,7 +5683,12 @@ EXPORT(int, sceGxmTransferFill, uint32_t fillColor, SceGxmTransferFormat destFor
 EXPORT(int, sceGxmTransferFinish) {
     TRACY_FUNC(sceGxmTransferFinish);
     // same as sceGxmFinish
+    const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
+    if (thread)
+        thread->begin_host_wait();
     renderer::finish(*emuenv.renderer, nullptr);
+    if (thread)
+        thread->end_host_wait();
 
     return 0;
 }
