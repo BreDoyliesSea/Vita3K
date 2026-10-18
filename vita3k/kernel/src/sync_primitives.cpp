@@ -909,7 +909,8 @@ SceInt32 Condvar::wait(MemState &mem, const ThreadStatePtr &thread, SceUInt32 *t
     if (!guard)
         return lightweight() ? SCE_KERNEL_ERROR_UNKNOWN_LW_COND_ID : SCE_KERNEL_ERROR_UNKNOWN_COND_ID;
 
-    if (const SceInt32 error = associated_mutex->release(mem, thread, 1))
+    // A savestate load that made this call again from inside the wait: the mutex was given up then
+    if (const SceInt32 error = associated_mutex->release(mem, thread, 1); error && !thread->restarted_call)
         return error;
 
     const Deadline deadline = deadline_from(timeout);

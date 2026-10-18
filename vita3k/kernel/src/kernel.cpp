@@ -192,19 +192,18 @@ ThreadStatePtr KernelState::create_thread(MemState &mem, const char *name, Ptr<c
     return create_thread(mem, name, entry_point, SCE_KERNEL_DEFAULT_PRIORITY, SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT, SCE_KERNEL_STACK_SIZE_USER_MAIN, nullptr);
 }
 
-// Register the thread and give it its host thread, which parks in run_loop until start().
-static void spawn_host_thread(KernelState &kernel, const ThreadStatePtr &thread) {
+void KernelState::spawn_host_thread(const ThreadStatePtr &thread) {
     {
-        const std::lock_guard<std::mutex> lock(kernel.mutex);
-        kernel.threads.emplace(thread->id, thread);
-        if (kernel.threads_paused)
+        const std::lock_guard<std::mutex> lock(mutex);
+        threads.emplace(thread->id, thread);
+        if (threads_paused)
             thread->pause();
-        if (kernel.threads_suspended)
+        if (threads_suspended)
             thread->suspend();
     }
 
     ThreadParams params;
-    params.kernel = &kernel;
+    params.kernel = this;
     params.thread = thread;
 
     params.host_may_destroy_params = SDL_CreateSemaphore(0);
@@ -218,7 +217,7 @@ ThreadStatePtr KernelState::create_thread(MemState &mem, const char *name, Ptr<c
     if (thread->init(name, entry_point, init_priority, affinity_mask, stack_size, option) < 0)
         return nullptr;
 
-    spawn_host_thread(*this, thread);
+    spawn_host_thread(thread);
     return thread;
 }
 
@@ -228,7 +227,7 @@ ThreadStatePtr KernelState::create_thread_for_savestate(MemState &mem, SceUID id
     if (thread->adopt_for_savestate(name, entry_point, priority, affinity_mask, stack, stack_size, tls, init_ctx) < 0)
         return nullptr;
 
-    spawn_host_thread(*this, thread);
+    spawn_host_thread(thread);
     if (resume_after_load)
         thread->hold_for_savestate_resume();
     return thread;

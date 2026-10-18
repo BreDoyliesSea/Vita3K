@@ -211,13 +211,13 @@ struct KernelState {
     void suspend_threads();
     void resume_suspended_threads();
 
-    // pause_threads() only *requests* a stop: it sets suspend_requested and kicks the JIT out of
-    // run(), and the thread does not actually reach ThreadStatus::suspended until its own run_loop
-    // comes back around -- after the current guest block finishes, and after any HLE import it is
-    // inside of returns. Anything that rewrites guest memory underneath the guest has to wait for
-    // that to have happened, or it is racing threads that are still executing. Returns false if a
-    // thread was still running when the timeout expired, in which case the caller must not
-    // proceed. Names the offending thread for the log.
+    // pause_threads() only *requests* a stop: it holds each thread and kicks the JIT out of run(),
+    // and the thread does not actually stop until its own run_loop reaches its gate -- after the
+    // current guest block finishes, and after any HLE import it is inside of returns. Anything that
+    // rewrites guest memory underneath the guest has to wait for that to have happened, or it is
+    // racing threads that are still executing. Returns false if a thread was still running when the
+    // timeout expired, in which case the caller must not proceed. Names the offending thread for
+    // the log.
     bool wait_for_threads_paused(std::chrono::milliseconds timeout, std::string *blocker = nullptr);
 
 
@@ -234,6 +234,8 @@ struct KernelState {
 
 private:
     std::atomic<SceUID> next_uid{ 1 };
+    // Registers the thread and gives it its host thread, which parks in run_loop until start()
+    void spawn_host_thread(const ThreadStatePtr &thread);
     bool threads_paused = false;
     bool threads_suspended = false;
 };

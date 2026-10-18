@@ -192,6 +192,9 @@ struct ThreadState {
     int vm_resume();
     // Whether vm_suspend holds the thread. Called with mutex held.
     bool vm_suspended() const { return holds.vm > 0; }
+    // The vm_suspend calls no vm_resume undid yet, for a savestate to record and put back
+    int vm_suspend_count();
+    void set_vm_suspend_count(int count);
     // Waits, with mutex held through lock, until the thread no longer runs or vm_suspend no longer holds it
     void wait_for_vm_stop(std::unique_lock<std::mutex> &lock);
     // Whether the thread is inside a kernel call: waiting, or held on its way back from one. Called
@@ -206,6 +209,16 @@ struct ThreadState {
         const std::lock_guard<std::mutex> lock(mutex);
         return status == ThreadStatus::running && !parked;
     }
+
+    // Set by a savestate load that points this thread back at the start of the call it was parked
+    // in, so the call is made again from inside its wait: a condition variable wait had already
+    // given up its mutex. Taken by the next call the thread makes, as restarted_call.
+    std::atomic<bool> restart_pending{ false };
+    // Whether the call this thread is making is such a restart. Only the thread itself touches it.
+    bool restarted_call = false;
+
+    // Whether something holds the thread at its gate. Called with mutex held.
+    bool held_at_gate() const { return parked; }
 
     // Depth of run_loop frames: 1 for a thread at its top level, more inside a callback.
     int nesting_level() const {

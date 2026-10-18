@@ -369,7 +369,9 @@ void ThreadState::run_loop(bool top_level) {
             const bool syscall = cpu->svc_called;
             if (syscall) {
                 const uint32_t nid = *Ptr<uint32_t>(read_pc(*cpu) + 4).get(mem);
+                restarted_call = restart_pending.exchange(false, std::memory_order_acq_rel);
                 kernel.call_import(*cpu, nid, id);
+                restarted_call = false;
                 clear_exclusive(*cpu);
             }
 
@@ -786,6 +788,18 @@ int ThreadState::vm_resume() {
     // The gate waits for this, and so may a suspend that waits for the thread to stop
     status_cond.notify_all();
     return 0;
+}
+
+int ThreadState::vm_suspend_count() {
+    const std::lock_guard<std::mutex> lock(mutex);
+    return holds.vm;
+}
+
+void ThreadState::set_vm_suspend_count(int count) {
+    const std::lock_guard<std::mutex> lock(mutex);
+    holds.vm = count;
+    // The gate shows the thread as suspended or not by its holds
+    status_cond.notify_all();
 }
 
 bool ThreadState::continue_from_on_return(uint32_t nid, const CPUContext &ctx) {

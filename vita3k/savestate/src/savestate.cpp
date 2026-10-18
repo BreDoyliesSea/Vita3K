@@ -518,6 +518,15 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
             put(thrd_raw, status);
             put(thrd_raw, level);
         }
+        // How many sceKernelSuspendThreadForVM calls hold each thread, after the threads, so a state
+        // without it still reads. The hold is host-side: a load must put back the state's, or a
+        // thread the session's garbage collector had stopped stays stopped for good.
+        put<uint32_t>(thrd_raw, static_cast<uint32_t>(threads.size()));
+        for (const auto &[uid, status, level] : threads) {
+            const ThreadStatePtr thread = emuenv.kernel.threads.at(uid);
+            put(thrd_raw, uid);
+            put<int32_t>(thrd_raw, thread->vm_suspend_count());
+        }
     }
 
     // --- SYNC: scalar state of the kernel sync primitives --------------------------------------
@@ -620,7 +629,14 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
             put<uint8_t>(syn2_raw, flags);
             put<uint64_t>(syn2_raw, guard ? timer->event_interval : 0);
             put<int64_t>(syn2_raw, guard ? relative(timer->next_event) : 0);
-            put<int64_t>(syn2_raw, guard ? static_cast<int64_t>(timer->time - now) : 0);
+            put<int64_t>(syn2_raw, guard && timer->base != 0 ? static_cast<int64_t>(timer->base - now) : std::numeric_limits<int64_t>::min());
+        }
+        // The count a stopped timer holds, after the timers, so a state without it still reads
+        put<uint32_t>(syn2_raw, static_cast<uint32_t>(timers.size()));
+        for (const auto &[uid, timer] : timers) {
+            const auto guard = timer->lock();
+            put(syn2_raw, uid);
+            put<uint64_t>(syn2_raw, guard ? timer->stopped_count : 0);
         }
     }
 
@@ -1413,6 +1429,7 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
         int32_t level;
     };
     std::map<SceUID, SavedThread> saved_threads;
+    std::map<SceUID, int32_t> saved_vm_suspends;
     {
         Reader tr{ thrd_data, thrd_size, 0 };
         uint32_t count = 0;
@@ -1425,6 +1442,15 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
             if (!tr.get(id) || !tr.get(status) || !tr.get(level))
                 return Result::fail("corrupt thread chunk");
             saved_threads[id] = { static_cast<ThreadStatus>(status), level };
+        }
+        if (tr.get(count)) {
+            for (uint32_t i = 0; i < count; i++) {
+                SceUID id = 0;
+                int32_t vm_count = 0;
+                if (!tr.get(id) || !tr.get(vm_count))
+                    return Result::fail("corrupt thread chunk");
+                saved_vm_suspends[id] = vm_count;
+            }
         }
     }
 
@@ -1981,7 +2007,7 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
     for (const ThreadStatePtr &thread : left_on_their_own) {
         wait_until(thread, [&] {
             const std::lock_guard<std::mutex> thread_lock(thread->mutex);
-            return thread->status == ThreadStatus::suspended;
+            return thread->held_at_gate();
         });
     }
 
@@ -2455,6 +2481,13 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
             restored++;
         }
 
+        // The rewound ones make their call again from inside its wait
+        for (const SceUID id : to_rewind) {
+            const auto it = emuenv.kernel.threads.find(id);
+            if (it != emuenv.kernel.threads.end() && it->second)
+                it->second->restart_pending.store(true, std::memory_order_release);
+        }
+
         // Restoring memory can change code the JIT has already translated, so every cached
         // block has to go. Without this the CPU happily keeps executing translations of
         // instructions that no longer exist.
@@ -2635,7 +2668,17 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
                 timer.event_set = flags & 8;
                 timer.event_interval = interval;
                 timer.next_event = next == std::numeric_limits<int64_t>::max() ? std::numeric_limits<uint64_t>::max() : now + next;
-                timer.time = now + time;
+                timer.base = time == std::numeric_limits<int64_t>::min() ? 0 : now + time;
+            }
+        }
+        if (ok && xr.get(count)) {
+            for (uint32_t i = 0; ok && i < count; i++) {
+                SceUID uid = 0;
+                uint64_t stopped_count = 0;
+                ok = xr.get(uid) && xr.get(stopped_count);
+                const TimerPtr timer_ptr = ok ? emuenv.kernel.objects.find<Timer>(uid) : nullptr;
+                if (const auto guard = timer_ptr ? timer_ptr->lock() : std::unique_lock<std::mutex>())
+                    timer_ptr->stopped_count = stopped_count;
             }
         }
 
@@ -2776,6 +2819,25 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
     LOG_INFO_IF(audio_decoders > 0, "Savestate: flushed {} sceAudiodec decoder(s)", audio_decoders);
     const size_t audio_positions = audiodec_restore_positions(emuenv, adec_data, adec_size);
     LOG_INFO_IF(audio_positions > 0, "Savestate: put {} ATRAC9 decoder(s) back where the state had them", audio_positions);
+
+    // The ForVM suspends the state had, in place of the session's: a load in the middle of a
+    // garbage collection here would otherwise leave the threads it had stopped stopped for good,
+    // since the restored collector never resumes them. A state without the counts has none.
+    {
+        size_t vm_changed = 0;
+        const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
+        for (const auto &[uid, thread] : emuenv.kernel.threads) {
+            if (!thread)
+                continue;
+            const auto saved = saved_vm_suspends.find(uid);
+            const int32_t count = saved == saved_vm_suspends.end() ? 0 : saved->second;
+            if (thread->vm_suspend_count() != count) {
+                thread->set_vm_suspend_count(count);
+                vm_changed++;
+            }
+        }
+        LOG_INFO_IF(vm_changed > 0, "Savestate: put back the ForVM suspend count of {} thread(s)", vm_changed);
+    }
 
     LOG_INFO("Savestate loaded: {} ({} regions, {}/{} threads, {} sync object(s), {} file position(s), {} reopened; {} sync and {} file gone)",
         path.string(), region_count, restored, thread_count, sync_restored, files_restored, files_reopened,
