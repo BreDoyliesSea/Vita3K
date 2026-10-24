@@ -19,10 +19,12 @@
 
 #include <kernel/types.h>
 
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <vector>
 
 struct EmuEnvState;
 struct MemState;

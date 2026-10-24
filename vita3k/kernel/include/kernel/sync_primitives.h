@@ -159,6 +159,9 @@ public:
     SceInt32 get_pattern(SceUInt32 &result);
     // Fills info with what the event's info reports, or returns UNKNOWN_EVENT_ID if it was deleted.
     SceInt32 info(SceKernelEventInfo &info);
+    // Replaces the whole pattern, system bits too, and the user data, for an event a snapshot rebuilds.
+    // Wakes nobody.
+    SceInt32 restore(SceUInt32 pattern, SceUInt64 user_data);
 
 protected:
     Event(SceUInt32 attr, const char *name, SceUInt32 init_pattern, SceUInt64 init_user_data);

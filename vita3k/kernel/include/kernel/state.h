@@ -175,6 +175,9 @@ struct KernelState {
     ThreadStatePtr create_thread(MemState &mem, const char *name, Ptr<const void> entry_point = Ptr<const void>(0));
     // Creates a dormant thread with these creation arguments, attr without THREAD_ATTR_USER, or returns null
     ThreadStatePtr create_thread(MemState &mem, const char *name, Ptr<const void> entry_point, int init_priority, SceInt32 affinity_mask, int stack_size, SceUInt32 attr, const SceKernelThreadOptParam *option);
+    // A dormant thread under id, on the stack and TLS already allocated at those addresses, which it
+    // then owns, for a thread a snapshot rebuilds. Paused or suspended like any new thread.
+    ThreadStatePtr create_thread_on(MemState &mem, SceUID id, const char *name, Address entry_point, int init_priority, SceInt32 affinity_mask, int stack_size, SceUInt32 attr, Address stack, Address tls, const CPUContext &init_cpu_ctx);
 
     ThreadStatePtr get_thread(SceUID thread_id);
 
@@ -207,6 +210,9 @@ struct KernelState {
     SceKernelModuleInfo *find_module_by_addr(Address address);
 
 private:
+    // Registers a new thread, holds it like the others, and starts its host thread
+    void add_thread(const ThreadStatePtr &thread);
+
     std::atomic<SceUID> next_uid{ 1 };
     bool threads_paused = false;
     bool threads_suspended = false;

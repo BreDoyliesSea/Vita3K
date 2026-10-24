@@ -56,9 +56,12 @@
 #include <config/settings.h>
 #include <config/state.h>
 #include <config/version.h>
+#include <cpu/functions.h>
+#include <nids/functions.h>
 #include <ctrl/functions.h>
 #include <display/functions.h>
 #include <display/state.h>
+#include <gxm/functions.h>
 #include <gxm/state.h>
 #include <interface.h>
 #include <io/state.h>
@@ -109,7 +112,15 @@
 #include <QWidgetAction>
 #include <QtResource>
 
+#include <algorithm>
+#include <chrono>
+#include <shared_mutex>
+#include <limits>
+#include <map>
 #include <optional>
+#include <string>
+#include <thread>
+#include <vector>
 
 #if defined(HAVE_X11) || defined(HAVE_WAYLAND)
 #include <qpa/qplatformnativeinterface.h>
@@ -164,6 +175,7 @@ MainWindow::MainWindow(EmuEnvState &emuenv,
 }
 
 MainWindow::~MainWindow() {
+    stop_savestate_task();
     shutdown_discord();
 }
 
@@ -1055,6 +1067,15 @@ std::optional<AppLaunchRequest> MainWindow::boot_game_once(const AppLaunchReques
     connect(m_kb_filter, &CtrlKeyboardFilter::exit_requested,
         m_game_window, &QWindow::close, Qt::QueuedConnection);
 
+    connect(m_kb_filter, &CtrlKeyboardFilter::quicksave_requested,
+        this, [this]() { on_quicksave_triggered(); });
+
+    connect(m_kb_filter, &CtrlKeyboardFilter::quickload_requested,
+        this, [this]() { on_quickload_triggered(); });
+
+    connect(m_kb_filter, &CtrlKeyboardFilter::thread_dump_requested,
+        this, [this]() { on_thread_dump_requested(); });
+
     if (auto next_request = take_pending_app_launch_request()) {
         on_game_closed();
         return next_request;
@@ -1068,6 +1089,10 @@ std::optional<AppLaunchRequest> MainWindow::boot_game_once(const AppLaunchReques
 
     LOG_INFO("Game started: {} ({})", emuenv.current_app_title, launch_request.app_path);
 
+    // For tests, see savestate::start_roundtrip_from_env
+    m_savestate_cancel = false;
+    m_roundtrip_thread = savestate::start_roundtrip_from_env(emuenv, m_app_session, m_savestate_cancel);
+
     if (m_settings_dialog)
         m_settings_dialog->set_storage_path_locked(true);
     refresh_emulation_actions();
@@ -1079,6 +1104,7 @@ void MainWindow::on_game_closed() {
     if (!m_game_window)
         return;
 
+    stop_savestate_task();
     LOG_INFO("Game closed: {}", emuenv.current_app_title);
 
     m_game_window->stop_ui_updates();
@@ -1376,6 +1402,166 @@ void MainWindow::on_pause_triggered() {
     const bool is_paused = m_app_session.is_paused();
     m_app_session.set_pause_reason(app::AppSessionPauseReason::User, !is_paused);
     refresh_emulation_actions();
+}
+
+// Saving and loading run off the GUI thread: one attempt can take seconds, and a refused one is
+// retried up to 60 times, which kept the window from answering for minutes.
+void MainWindow::start_savestate_task(const char *what, void (MainWindow::*task)()) {
+    if (!m_game_window) {
+        statusBar()->showMessage(tr("%1: no game is running").arg(QString::fromUtf8(what)), 4000);
+        return;
+    }
+    if (m_savestate_busy.exchange(true)) {
+        statusBar()->showMessage(tr("%1: a quicksave or quickload is still running").arg(QString::fromUtf8(what)), 4000);
+        return;
+    }
+    if (m_savestate_thread.joinable())
+        m_savestate_thread.join();
+    m_savestate_cancel = false;
+    m_savestate_thread = std::thread([this, task] {
+        logging::name_this_thread("savestate");
+        (this->*task)();
+        m_savestate_busy = false;
+    });
+}
+
+// Lets the attempt in progress finish and starts no other. Called before the session is torn down.
+void MainWindow::stop_savestate_task() {
+    m_savestate_cancel = true;
+    if (m_savestate_thread.joinable())
+        m_savestate_thread.join();
+    if (m_roundtrip_thread) {
+        m_roundtrip_thread->join();
+        m_roundtrip_thread.reset();
+    }
+}
+
+void MainWindow::show_status_message(const QString &message, const int timeout) {
+    QMetaObject::invokeMethod(this, [this, message, timeout] { statusBar()->showMessage(message, timeout); }, Qt::QueuedConnection);
+}
+
+void MainWindow::on_thread_dump_requested() {
+    // A snapshot of what every guest thread is doing right now. Built for diagnosing a guest that
+    // has stopped making progress, where the useful question is not "which threads are waiting"
+    // -- that distribution looks normal even when nothing is advancing -- but "what is the one
+    // that is still running actually doing".
+    //
+    // Running threads get their PC sampled twice, because a thread spinning on a flag that will
+    // never be set and a thread making slow progress are indistinguishable from one sample. The PC
+    // of a running thread is only written back when the JIT returns, so an unchanged one does not
+    // mean the thread is stuck on that instruction: it can be anywhere in the code since.
+    if (!m_game_window) {
+        statusBar()->showMessage(tr("Thread dump: no game is running"), 4000);
+        return;
+    }
+    if (m_savestate_busy) {
+        statusBar()->showMessage(tr("Thread dump: a quicksave or quickload is running"), 4000);
+        return;
+    }
+
+    struct Sample {
+        SceUID id;
+        ThreadStatePtr thread;
+        std::string name;
+        ThreadStatus status;
+        uint32_t nid;
+        uint32_t args[3];
+        uint32_t pc, lr, sp;
+        std::string traceback;
+    };
+    std::vector<Sample> samples;
+    std::map<SceUID, uint32_t> first_pc;
+
+    // Everything that reads kernel state happens under the kernel lock and nothing else does.
+    // log_stack_traceback() in particular must NOT be called from here: it resolves addresses via
+    // KernelState::find_module_by_addr, which takes the same non-recursive mutex, and locking it
+    // twice on one thread terminates the process outright.
+    const auto collect = [&](std::map<SceUID, uint32_t> *pc_only) {
+        const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
+        for (const auto &pair : emuenv.kernel.threads) {
+            const auto &thread = pair.second;
+            if (!thread || !thread->cpu)
+                continue;
+            if (pc_only) {
+                (*pc_only)[pair.first] = read_pc(*thread->cpu);
+                continue;
+            }
+            Sample s{};
+            s.id = pair.first;
+            s.thread = thread; // keeps it alive once the lock is gone
+            s.name = thread->name;
+            s.status = thread->get_status();
+            s.pc = read_pc(*thread->cpu);
+            // A thread in a call is just past its import stub's svc, and the NID follows
+            if (s.status == ThreadStatus::waiting && Ptr<uint32_t>(s.pc + 4).valid(emuenv.mem))
+                s.nid = *Ptr<uint32_t>(s.pc + 4).get(emuenv.mem);
+            for (int i = 0; i < 3; i++)
+                s.args[i] = read_reg(*thread->cpu, i);
+            s.lr = read_lr(*thread->cpu);
+            s.sp = read_sp(*thread->cpu);
+            samples.push_back(std::move(s));
+        }
+    };
+
+    collect(&first_pc);
+    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    collect(nullptr);
+
+    for (Sample &s : samples) {
+        if (s.status == ThreadStatus::running && s.thread)
+            s.traceback = s.thread->log_stack_traceback();
+    }
+
+    const auto status_name = [](ThreadStatus s) {
+        switch (s) {
+        case ThreadStatus::running: return "run ";
+        case ThreadStatus::dormant: return "dorm";
+        case ThreadStatus::waiting: return "wait";
+        case ThreadStatus::suspended: return "susp";
+        case ThreadStatus::deleted: return "dele";
+        }
+        return "????";
+    };
+
+    LOG_INFO("=== thread dump: {} thread(s) ===", samples.size());
+    for (const Sample &s : samples) {
+        const char *const import = s.nid ? import_name(s.nid) : nullptr;
+        const auto before = first_pc.find(s.id);
+        const bool moved = before != first_pc.end() && before->second != s.pc;
+        LOG_INFO("  [{}] id={} \"{}\" pc={}{} lr={} sp={} in {}({}, {}, {})",
+            status_name(s.status), s.id, s.name, log_hex(s.pc),
+            (s.status == ThreadStatus::running) ? (moved ? " (advancing)" : " (same saved PC after 250ms, maybe still inside the JIT)") : "",
+            log_hex(s.lr), log_hex(s.sp), import ? import : "-",
+            log_hex(s.args[0]), log_hex(s.args[1]), log_hex(s.args[2]));
+        if (!s.traceback.empty())
+            LOG_INFO("{}", s.traceback);
+    }
+    LOG_INFO("=== end thread dump ===");
+    statusBar()->showMessage(tr("Thread dump written to the log (%1 threads)").arg(samples.size()), 4000);
+}
+
+void MainWindow::on_quicksave_triggered() {
+    start_savestate_task("Quicksave", &MainWindow::quicksave);
+}
+
+void MainWindow::quicksave() {
+    const savestate::Result result = savestate::quicksave(emuenv, m_app_session, 0, m_savestate_cancel);
+    if (result)
+        show_status_message(tr("Quicksave complete"), 4000);
+    else if (!m_savestate_cancel)
+        show_status_message(tr("Quicksave failed, the previous quicksave is kept: %1").arg(QString::fromStdString(result.reason)), 8000);
+}
+
+void MainWindow::on_quickload_triggered() {
+    start_savestate_task("Quickload", &MainWindow::quickload);
+}
+
+void MainWindow::quickload() {
+    const savestate::Result result = savestate::quickload(emuenv, m_app_session, 0, m_savestate_cancel);
+    if (result)
+        show_status_message(tr("Quickload complete"), 4000);
+    else if (!m_savestate_cancel)
+        show_status_message(tr("Quickload failed: %1").arg(QString::fromStdString(result.reason)), 8000);
 }
 
 void MainWindow::on_stop_triggered() {
