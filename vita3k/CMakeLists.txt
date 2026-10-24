@@ -144,6 +144,7 @@ add_subdirectory(overlay)
 add_subdirectory(regmgr)
 add_subdirectory(renderer)
 add_subdirectory(rtc)
+add_subdirectory(savestate)
 add_subdirectory(sdl-frontend)
 add_subdirectory(shader)
 add_subdirectory(threads)
@@ -208,7 +209,7 @@ if(WIN32)
 	target_sources(vita3k PRIVATE util/src/vc_runtime_checker.cpp)
 endif()
 
-target_link_libraries(vita3k PRIVATE app audio compat config ctrl dialog display ime lang gdbstub gxm io miniz modules motion packages patch renderer sdl-frontend shader touch util psvpfsparser)
+target_link_libraries(vita3k PRIVATE app audio compat config ctrl dialog display ime lang gdbstub gxm io miniz modules motion packages patch renderer savestate sdl-frontend shader touch util psvpfsparser)
 if(NOT ANDROID)
 	target_link_libraries(vita3k PRIVATE gui-qt)
 endif()
@@ -252,6 +253,14 @@ if(NOT ANDROID)
 endif()
 
 set_target_properties(vita3k PROPERTIES OUTPUT_NAME Vita3K)
+
+# A linker map, so a fault offset from a crash dump or from the Windows Application log can be
+# turned into a function name. Much cheaper than building the whole tree with debug info, and it
+# is the only way to read the dumps Windows Error Reporting is already writing: there is no
+# debugger installed on the machines this gets built on.
+if(MSVC)
+	target_link_options(vita3k PRIVATE /MAP)
+endif()
 
 if(NOT ANDROID)
 	set_target_properties(vita3k PROPERTIES
