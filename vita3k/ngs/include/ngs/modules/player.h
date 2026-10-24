@@ -83,6 +83,16 @@ struct PlayerLogicalState : public ModuleLogicalState {
     int8_t current_loop_count = 0;
     // preserve HE-ADPCM predictor history so the runtime decoder can be rebuilt
     ADPCMHistory adpcm_history[SCE_NGS_PLAYER_MAX_PCM_CHANNELS] = {};
+
+    int32_t loop_count() const override { return current_loop_count; }
+    void restart_at_position(const int32_t loop_count) override {
+        current_loop_count = static_cast<int8_t>(loop_count);
+        decoded_pcm.clear();
+        rate_resampler.reset();
+        adpcm_buffer.clear();
+        for (ADPCMHistory &history : adpcm_history)
+            history = {};
+    }
 };
 
 struct PlayerRuntimeState : public ModuleRuntimeState {
