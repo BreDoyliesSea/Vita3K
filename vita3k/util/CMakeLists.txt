@@ -20,6 +20,10 @@ add_library(
 target_include_directories(util PUBLIC include)
 target_link_libraries(util PUBLIC ${Boost_LIBRARIES} fmt spdlog http mem)
 target_link_libraries(util PRIVATE libcurl crypto SDL3::SDL3)
+if(WIN32)
+	# dbghelp, for turning a crash address into a function name in the exception handler.
+	target_link_libraries(util PRIVATE dbghelp)
+endif()
 if(ANDROID)
 	target_link_libraries(util PUBLIC emuenv android xxHash::xxhash)
 	target_link_libraries(util PRIVATE adrenotools)

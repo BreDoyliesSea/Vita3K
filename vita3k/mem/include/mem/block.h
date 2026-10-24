@@ -69,6 +69,25 @@ public:
         return addr;
     }
 
+    // Point at a different guest address without freeing the old one.
+    //
+    // For savestate loading only. Restoring a state re-lays-out the guest address space, and a
+    // thread's stack can land at a different address than the one this Block was created with --
+    // the two sessions' allocations diverge by a page early on and everything after shifts. The
+    // old allocation has already been released by the reconciliation, so running the deleter on
+    // it here would be a double free; the caller has established that.
+    void rebase_for_savestate(Address new_addr) {
+        addr = new_addr;
+    }
+
+    // Give up ownership without freeing. For savestate loading only: a thread the state does not
+    // have is being ended, and its stack and TLS are either regions the reconciliation has already
+    // released or regions a thread recreated from the state now owns. Either way the deleter must
+    // not run.
+    void release_for_savestate() {
+        deleter = nullptr;
+    }
+
     template <class T>
     Ptr<T> get_ptr() const {
         return Ptr<T>(addr);

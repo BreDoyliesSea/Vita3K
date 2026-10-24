@@ -20,6 +20,8 @@
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
+
+#include <DbgHelp.h>
 #endif
 
 #include <spdlog/async.h>
@@ -34,7 +36,11 @@
 
 #include <functional>
 #include <iostream>
+#include <functional>
+#include <map>
 #include <mutex>
+#include <thread>
+#include <string>
 #include <vector>
 
 namespace logging {
@@ -51,7 +57,10 @@ static std::mutex s_log_callback_mutex;
 static void register_log_exception_handler();
 static void rebuild_default_logger();
 
-static void flush() {
+// Declared in util/log.h. Anything that might be followed by a crash should call this: the sink
+// is asynchronous, so the last seconds of the log are still queued when the process dies, and
+// that is exactly the part worth having.
+void flush() {
     spdlog::details::registry::instance().flush_all();
 }
 
@@ -176,10 +185,102 @@ void rebuild_default_logger() {
     spdlog::set_pattern(LOG_PATTERN);
 }
 
+// Names for the threads the crash handler is likely to report. A flat table rather than
+// thread_local: the handler needs to describe whichever thread faulted, and "thread 18400" on its
+// own says nothing about whether host code or the guest was at fault.
+static std::mutex s_thread_name_mutex;
+static std::map<uint64_t, std::string> s_thread_names;
+
+static uint64_t this_thread_key() {
+    return static_cast<uint64_t>(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+}
+
+void name_this_thread(std::string name) {
+    const std::lock_guard<std::mutex> lock(s_thread_name_mutex);
+    s_thread_names[this_thread_key()] = std::move(name);
+}
+
+std::string current_thread_label() {
+    const std::lock_guard<std::mutex> lock(s_thread_name_mutex);
+    const auto it = s_thread_names.find(this_thread_key());
+    return it == s_thread_names.end() ? std::string("\"?\"") : fmt::format("\"{}\"", it->second);
+}
+
 // log exceptions and flush log file on exceptions
 #ifdef _WIN32
+// Base and extent of our own executable image, resolved once at startup by walking the PE
+// headers. Doing it here rather than in the handler keeps the handler free of loader calls, which
+// are not safe to make while a fault is being dispatched.
+static uintptr_t s_exe_base = 0;
+static size_t s_exe_size = 0;
+
+// Symbol lookup for crash addresses. Initialised once at startup, because SymInitialize walks the
+// module list and must not be called while a fault is being dispatched. SymFromAddr itself is not
+// documented as safe inside a handler either, but by the time this runs the process is already
+// going down and a function name is worth more than the small risk of not getting one.
+static bool s_symbols_ready = false;
+
+static void init_symbols() {
+    SymSetOptions(SYMOPT_DEFERRED_LOADS | SYMOPT_UNDNAME);
+    s_symbols_ready = SymInitialize(GetCurrentProcess(), nullptr, TRUE) != FALSE;
+}
+
+static std::string symbol_for(uintptr_t address) {
+    if (!s_symbols_ready)
+        return {};
+    alignas(SYMBOL_INFO) char buffer[sizeof(SYMBOL_INFO) + MAX_SYM_NAME] = {};
+    auto *symbol = reinterpret_cast<SYMBOL_INFO *>(buffer);
+    symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+    symbol->MaxNameLen = MAX_SYM_NAME;
+    DWORD64 displacement = 0;
+    if (!SymFromAddr(GetCurrentProcess(), address, &displacement, symbol))
+        return {};
+    return fmt::format(" [{}+{}]", symbol->Name, displacement);
+}
+
+static void resolve_own_image() {
+    const auto base = reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr));
+    if (!base)
+        return;
+    const auto *dos = reinterpret_cast<const IMAGE_DOS_HEADER *>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+        return;
+    const auto *nt = reinterpret_cast<const IMAGE_NT_HEADERS *>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE)
+        return;
+    s_exe_base = base;
+    s_exe_size = nt->OptionalHeader.SizeOfImage;
+}
+
+// Where the faulting instruction was, not just what it touched. An address inside our own image
+// means host code followed a bad pointer; an address outside every image is almost always
+// dynarmic's generated code, which means the guest is executing something it should not be. The
+// two have completely different causes and the fault address alone does not distinguish them.
+static void log_fault_origin(PEXCEPTION_POINTERS pExp) {
+    const auto pc = reinterpret_cast<uintptr_t>(pExp->ExceptionRecord->ExceptionAddress);
+    const std::string symbol = symbol_for(pc);
+    const std::string who = current_thread_label();
+    if (s_exe_base && pc >= s_exe_base && pc < s_exe_base + s_exe_size) {
+        LOG_CRITICAL("  faulting instruction at Vita3K.exe+{}{} (thread {} {})",
+            log_hex(static_cast<uint64_t>(pc - s_exe_base)), symbol, GetCurrentThreadId(), who);
+    } else {
+        LOG_CRITICAL("  faulting instruction at {}{}, outside our image - JIT-generated or another "
+                     "module (thread {} {})",
+            log_hex(static_cast<uint64_t>(pc)), symbol, GetCurrentThreadId(), who);
+    }
+}
+
 static LONG WINAPI exception_handler(PEXCEPTION_POINTERS pExp) noexcept {
     const unsigned ec = pExp->ExceptionRecord->ExceptionCode;
+    // Deliberately NOT called for every exception code. On EXCEPTION_STACK_OVERFLOW there is no
+    // stack budget left to run it in -- it allocates a std::string and calls into dbghelp -- and
+    // doing so killed the process outright before anything reached the log.
+    // Only for access violations. After a guard-page hit there is not enough stack left to
+    // resolve anything: SymFromAddr killed the process outright, and so did a plain map lookup
+    // plus a format. Identifying the thread that blew its stack needs a dump written from
+    // another thread, not more work on this one.
+    if (ec == EXCEPTION_ACCESS_VIOLATION)
+        log_fault_origin(pExp);
     switch (ec) {
     case EXCEPTION_ACCESS_VIOLATION:
         LOG_CRITICAL("Exception EXCEPTION_ACCESS_VIOLATION ({}). ", log_hex(ec));
@@ -229,6 +330,8 @@ static LONG WINAPI exception_handler(PEXCEPTION_POINTERS pExp) noexcept {
 }
 
 void register_log_exception_handler() {
+    resolve_own_image();
+    init_symbols();
     if (!AddVectoredExceptionHandler(0, exception_handler)) {
         LOG_CRITICAL("Failed to register an exception handler");
     }
