@@ -18,6 +18,7 @@
 #pragma once
 
 #include <app/session_controller.h>
+#include <savestate/savestate.h>
 #include <app/state.h>
 #include <emuenv/state.h>
 
@@ -26,8 +27,11 @@
 #include <QPointer>
 #include <QTimer>
 
+#include <atomic>
+#include <functional>
 #include <memory>
 #include <optional>
+#include <thread>
 #include <vector>
 
 class GuiSettings;
@@ -111,6 +115,10 @@ private slots:
 
     void on_pause_triggered();
     void on_stop_triggered();
+    void on_quicksave_triggered();
+    void on_thread_dump_requested();
+    void on_quickload_triggered();
+    bool run_with_guest_quiesced(const char *what, const std::function<savestate::Result()> &action);
     void on_ps_button();
     void on_toolbar_refresh();
     void on_toolbar_fullscreen();
@@ -120,6 +128,11 @@ private slots:
     void resize_icons(int index);
 
 private:
+    void quicksave();
+    void quickload();
+    void start_savestate_task(const char *what, void (MainWindow::*task)());
+    void stop_savestate_task();
+    void show_status_message(const QString &message, int timeout);
     void refresh_emulation_actions();
     void initialize();
     void init_current_user();
@@ -183,6 +196,9 @@ private:
     GameCompatibility *m_game_compat = nullptr;
     QWindow *m_game_container = nullptr;
     QTimer *m_sdl_pump_timer = nullptr;
+    std::thread m_savestate_thread;
+    std::atomic<bool> m_savestate_busy{ false };
+    std::atomic<bool> m_savestate_cancel{ false };
 
     QPointer<TrophyCollectionDialog> m_trophy_dialog;
     QPointer<UserManagementDialog> m_user_mgmt_dialog;

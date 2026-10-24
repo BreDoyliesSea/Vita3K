@@ -85,6 +85,16 @@ bool CtrlKeyboardFilter::eventFilter(QObject *watched, QEvent *event) {
         if (pressed && matches(cfg.keyboard_take_screenshot, cfg.keyboard_take_screenshot_alt))
             emit screenshot_requested();
 
+        if (pressed && matches(cfg.keyboard_quicksave, cfg.keyboard_quicksave_alt))
+            emit quicksave_requested();
+
+        if (pressed && matches(cfg.keyboard_quickload, cfg.keyboard_quickload_alt))
+            emit quickload_requested();
+
+
+        if (pressed && matches(cfg.keyboard_dump_threads, cfg.keyboard_dump_threads_alt))
+            emit thread_dump_requested();
+
         return false;
     }
     case QEvent::MouseButtonPress:
