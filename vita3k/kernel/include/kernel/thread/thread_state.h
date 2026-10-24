@@ -25,6 +25,7 @@
 #include <mem/ptr.h>
 
 #include <algorithm>
+#include <atomic>
 #include <condition_variable>
 #include <expected>
 #include <list>
@@ -85,6 +86,9 @@ struct ThreadState {
     ThreadState() = delete;
     // A dormant thread with its stack and TLS, which runs on cpu
     ThreadState(SceUID id, KernelState &kernel, MemState &mem, CPUStatePtr cpu, const char *name, Address entry_point, int init_priority, SceInt32 affinity_mask, int stack_size, SceUInt32 attr, const SceKernelThreadOptParam *option);
+    // A dormant thread on blocks that already hold its stack and TLS, which are left as they are,
+    // for a thread a snapshot rebuilds. init_priority is the priority it runs at, already converted.
+    ThreadState(SceUID id, KernelState &kernel, MemState &mem, CPUStatePtr cpu, const char *name, Address entry_point, int init_priority, SceInt32 affinity_mask, int stack_size, SceUInt32 attr, Block stack, Block tls, const CPUContext &init_cpu_ctx);
 
     // Lifecycle
     int start(SceSize arglen, const Ptr<void> argp, bool run_entry_callback = false);
@@ -192,6 +196,26 @@ struct ThreadState {
     // TPIDRURW and whether it stopped inside a kernel call. Returns NOT_SUSPENDED if no ForVM
     // suspend holds it.
     SceInt32 get_vm_context(CPUContext &context, uint32_t &tpidrurw, bool &in_kernel_call);
+    // How many sceKernelSuspendThreadForVM calls hold the thread
+    int vm_suspend_count() const;
+
+    // Snapshots
+    // While set, a kernel wait the thread is in or starts ends at once, as if the thread were
+    // ending, so a snapshot can stop it at its gate and make the call again later
+    void abandon_wait(bool abandon);
+    // How the next condition variable wait goes on, for a thread a snapshot stopped in one
+    enum class ResumedWait : uint8_t {
+        none,
+        // Stopped waiting for the signal: the mutex is already given up
+        signal,
+        // Stopped taking the mutex back: signalled already
+        relock,
+    };
+    void resume_wait(ResumedWait how);
+    // Returns how the next condition variable wait goes on, once
+    ResumedWait take_resumed_wait();
+    // How many run_loop levels run on the thread: 1 at the top, 2 inside a callback
+    int call_depth() const;
 
 private:
     // How a thread ends, each value stronger than the ones before it
@@ -252,7 +276,7 @@ private:
     bool callback_ends_wait() const { return wait_target.callbacks && !is_processing_callbacks && callbacks_notified(); }
     // Whether the thread's current wait is over, by a wake, its end or a callback it runs, though
     // the thread hasn't gone on yet. With mutex held.
-    bool wait_over() const { return exiting() || wake_pending || callback_ends_wait(); }
+    bool wait_over() const { return exiting() || wake_pending || wait_abandoned || callback_ends_wait(); }
     // Keeps the thread from going on into guest code while anything holds it, unless it's ending.
     // With mutex held through lock.
     void wait_while_held(std::unique_lock<std::mutex> &lock, StopPoint where);
@@ -318,6 +342,12 @@ private:
     bool step_requested = false;
     // Where the thread stopped the last time something held it
     StopPoint stop_point = StopPoint::guest_code;
+
+    // Snapshots
+    bool wait_abandoned = false;
+    ResumedWait resumed_wait = ResumedWait::none;
+    // Not guarded, run_loop counts its levels
+    std::atomic<int> run_depth{ 0 };
 
     // Threads blocked in sceKernelWaitThreadEnd on this one, with their own lock, taken after mutex
     std::mutex end_waiters_mutex;

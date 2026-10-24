@@ -182,7 +182,26 @@ ThreadStatePtr KernelState::create_thread(MemState &mem, const char *name, Ptr<c
     if (!cpu)
         return nullptr;
     ThreadStatePtr thread = std::make_shared<ThreadState>(id, *this, mem, std::move(cpu), name, entry_point.address(), init_priority, affinity_mask, stack_size, attr, option);
+    add_thread(thread);
+    return thread;
+}
 
+ThreadStatePtr KernelState::create_thread_on(MemState &mem, SceUID id, const char *name, Address entry_point, int init_priority, SceInt32 affinity_mask, int stack_size, SceUInt32 attr, Address stack, Address tls, const CPUContext &init_cpu_ctx) {
+    int core_num = corenum_allocator.new_corenum();
+    if (core_num < 0) {
+        LOG_ERROR("Out of core number to allocate, use 0");
+        core_num = 0;
+    }
+    CPUStatePtr cpu = init_cpu(cpu_opt, id, static_cast<std::size_t>(core_num), mem);
+    if (!cpu)
+        return nullptr;
+    const auto deleter = [&mem](Address address) { free(mem, address); };
+    ThreadStatePtr thread = std::make_shared<ThreadState>(id, *this, mem, std::move(cpu), name, entry_point, init_priority, affinity_mask, stack_size, attr, Block(stack, deleter), Block(tls, deleter), init_cpu_ctx);
+    add_thread(thread);
+    return thread;
+}
+
+void KernelState::add_thread(const ThreadStatePtr &thread) {
     {
         const std::lock_guard<std::mutex> lock(mutex);
         threads.emplace(thread->id, thread);
@@ -200,8 +219,6 @@ ThreadStatePtr KernelState::create_thread(MemState &mem, const char *name, Ptr<c
     SDL_DetachThread(SDL_CreateThread(&thread_function, thread->name.c_str(), &params));
     SDL_WaitSemaphore(params.host_may_destroy_params);
     SDL_DestroySemaphore(params.host_may_destroy_params);
-
-    return thread;
 }
 
 Ptr<Ptr<void>> KernelState::get_thread_tls_addr(MemState &mem, SceUID thread_id, int key) {

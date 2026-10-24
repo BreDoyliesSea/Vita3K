@@ -1070,13 +1070,21 @@ SceInt32 Condvar::wait(MemState &mem, const ThreadStatePtr &thread, SceUInt32 *t
     if (!guard)
         return lightweight() ? SCE_KERNEL_ERROR_UNKNOWN_LW_COND_ID : SCE_KERNEL_ERROR_UNKNOWN_COND_ID;
 
-    if (const SceInt32 error = associated_mutex->release(mem, thread, 1))
-        return error;
+    // A wait a snapshot stopped gave the mutex up already, and one it stopped taking the mutex back
+    // was signalled already
+    const ThreadState::ResumedWait resumed = thread->take_resumed_wait();
+    if (resumed == ThreadState::ResumedWait::none) {
+        if (const SceInt32 error = associated_mutex->release(mem, thread, 1))
+            return error;
+    }
 
     // Condition waits have nothing to take, they only wait for a signal
-    const WaitResult r = wait_loop(waiters, guard, thread, { lightweight() ? SCE_KERNEL_WAITTYPE_LW_COND_SIGNAL : SCE_KERNEL_WAITTYPE_COND_SIGNAL, uid, callbacks }, std::monostate{}, timeout, CallbacksCheck::on_delete, [](std::monostate &, SceInt32) -> std::optional<SceInt32> {
-        return std::nullopt;
-    });
+    WaitResult r = SCE_KERNEL_OK;
+    if (resumed != ThreadState::ResumedWait::relock) {
+        r = wait_loop(waiters, guard, thread, { lightweight() ? SCE_KERNEL_WAITTYPE_LW_COND_SIGNAL : SCE_KERNEL_WAITTYPE_COND_SIGNAL, uid, callbacks }, std::monostate{}, timeout, CallbacksCheck::on_delete, [](std::monostate &, SceInt32) -> std::optional<SceInt32> {
+            return std::nullopt;
+        });
+    }
     // Deleted during the wait, or while its callbacks ran
     if (r && *r == SCE_KERNEL_ERROR_WAIT_DELETE)
         return lightweight() ? SCE_KERNEL_ERROR_WAIT_DELETE_LW_COND : SCE_KERNEL_ERROR_WAIT_DELETE_COND;

@@ -112,6 +112,31 @@ ThreadState::ThreadState(SceUID id, KernelState &kernel, MemState &mem, CPUState
     }
 }
 
+ThreadState::ThreadState(SceUID id, KernelState &kernel, MemState &mem, CPUStatePtr cpu, const char *name, Address entry_point, int init_priority, SceInt32 affinity_mask, int stack_size, SceUInt32 attr, Block stack, Block tls, const CPUContext &init_cpu_ctx)
+    : id(id)
+    , name(name)
+    , entry_point(entry_point)
+    , attr(attr | THREAD_ATTR_USER)
+    , stack_size(stack_size)
+    , stack(std::move(stack))
+    , tls(std::move(tls))
+    , cpu(std::move(cpu))
+    , init_priority(init_priority)
+    , init_affinity_mask(affinity_mask)
+    , init_cpu_ctx(init_cpu_ctx)
+    , kernel(kernel)
+    , mem(mem)
+    , priority(init_priority)
+    , affinity_mask(affinity_mask) {
+    if (kernel.debugger.watch_code) {
+        set_log_code(*this->cpu, true);
+    }
+    if (kernel.debugger.watch_memory) {
+        set_log_mem(*this->cpu, true);
+    }
+    write_tpidruro(*this->cpu, this->tls.get() + KERNEL_TLS_SIZE);
+}
+
 int ThreadState::start(SceSize arglen, const Ptr<void> argp, bool run_entry_callback) {
     return start_at(entry_point, arglen, argp, run_entry_callback);
 }
@@ -200,6 +225,13 @@ void ThreadState::run_loop(bool top_level) {
         ~CpuStateGuard() { set_current_cpu_state(previous); }
     } cpu_state_guard;
     set_current_cpu_state(cpu.get());
+    // Counts the levels for call_depth()
+    struct DepthGuard {
+        std::atomic<int> &depth;
+        explicit DepthGuard(std::atomic<int> &depth)
+            : depth(depth) { ++depth; }
+        ~DepthGuard() { --depth; }
+    } depth_guard{ run_depth };
 
     std::unique_lock<std::mutex> lock(mutex);
 
@@ -572,7 +604,7 @@ WaitResult ThreadState::wait(WaitTarget target, Deadline deadline) {
     update_status(ThreadStatus::running);
     const bool callbacks_due = callback_ends_wait();
     wait_target = {};
-    if (exiting())
+    if (exiting() || wait_abandoned)
         return std::unexpected{ ThreadExiting{} };
     wake_pending = false;
     if (callbacks_due)
@@ -826,6 +858,31 @@ int ThreadState::vm_resume() {
     // The gate waits for this, and so may a suspend that waits for the thread to stop
     status_cond.notify_all();
     return 0;
+}
+
+int ThreadState::vm_suspend_count() const {
+    const std::lock_guard<std::mutex> lock(mutex);
+    return holds.vm;
+}
+
+void ThreadState::abandon_wait(bool abandon) {
+    const std::lock_guard<std::mutex> lock(mutex);
+    wait_abandoned = abandon;
+    wait_cv.notify_all();
+}
+
+void ThreadState::resume_wait(ResumedWait how) {
+    const std::lock_guard<std::mutex> lock(mutex);
+    resumed_wait = how;
+}
+
+ThreadState::ResumedWait ThreadState::take_resumed_wait() {
+    const std::lock_guard<std::mutex> lock(mutex);
+    return std::exchange(resumed_wait, ResumedWait::none);
+}
+
+int ThreadState::call_depth() const {
+    return run_depth.load();
 }
 
 std::string ThreadState::log_stack_traceback() const {
