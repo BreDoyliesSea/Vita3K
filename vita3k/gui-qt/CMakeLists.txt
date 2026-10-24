@@ -112,6 +112,7 @@ target_link_libraries(gui-qt PUBLIC
     packages
     patch
     renderer
+    savestate
     touch
     gxm
     audio
@@ -123,6 +124,7 @@ target_link_libraries(gui-qt PUBLIC
     pugixml::pugixml
     updater
     input
+    nids
 )
 
 target_include_directories(gui-qt PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)

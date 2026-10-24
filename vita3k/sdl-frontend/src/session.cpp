@@ -21,6 +21,7 @@
 
 #include <app/functions.h>
 #include <app/session_controller.h>
+#include <savestate/savestate.h>
 #include <audio/state.h>
 #include <config/state.h>
 #include <ctrl/functions.h>
@@ -350,6 +351,8 @@ int run(EmuEnvState &emuenv, app::AppSessionController &session, AppLaunchReques
 
         LOG_INFO("Game started: {} ({})", emuenv.current_app_title, launch_request.app_path);
         app::LaunchRuntimeMetrics runtime_metrics{};
+        std::atomic<bool> roundtrip_cancel{ false };
+        std::optional<std::thread> roundtrip = savestate::start_roundtrip_from_env(emuenv, session, roundtrip_cancel);
 
         bool running = !pending_launch_request.has_value();
         while (running) {
@@ -444,6 +447,9 @@ int run(EmuEnvState &emuenv, app::AppSessionController &session, AppLaunchReques
         }
 
         LOG_INFO("Shutting down game");
+        roundtrip_cancel = true;
+        if (roundtrip)
+            roundtrip->join();
 
         if (pending_launch_request && pending_launch_request->reason == AppLaunchReason::ProcessExit) {
             exit_code = pending_launch_request->exit_code;
