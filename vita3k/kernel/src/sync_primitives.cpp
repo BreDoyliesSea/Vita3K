@@ -839,6 +839,39 @@ SceInt32 Semaphore::signal(SceInt32 count) {
     return SCE_KERNEL_OK;
 }
 
+uint64_t sync_timer_clock() {
+    return get_current_time();
+}
+
+void reconcile_waiters_after_load(KernelState &kernel) {
+    // Snapshot the semaphores out of the UID table, then work without its lock, as Semaphore::signal
+    // does: waking a waiter takes the semaphore's lock and then the thread's.
+    std::vector<SceUID> semaphore_uids;
+    kernel.objects.for_each<Semaphore>([&](Semaphore &semaphore) { semaphore_uids.push_back(semaphore.uid); });
+
+    int woken = 0;
+    for (const SceUID uid : semaphore_uids) {
+        const SemaphorePtr semaphore = kernel.objects.find<Semaphore>(uid);
+        if (!semaphore)
+            continue;
+        const auto guard = semaphore->lock();
+        if (!guard)
+            continue;
+
+        // Same drain as Semaphore::signal
+        while (auto *waiter = semaphore->waiters.front()) {
+            if (semaphore->val < waiter->entry.need_count)
+                break;
+
+            semaphore->val -= waiter->entry.need_count;
+            semaphore->waiters.wake(*waiter);
+            woken++;
+        }
+    }
+
+    LOG_INFO_IF(woken > 0, "Savestate: released {} thread(s) whose semaphore was restored above their wait", woken);
+}
+
 SceInt32 Semaphore::cancel(SceInt32 set_count, SceUInt32 *num_wait_threads) {
     const auto guard = lock();
     if (!guard)
@@ -876,7 +909,8 @@ SceInt32 Condvar::wait(MemState &mem, const ThreadStatePtr &thread, SceUInt32 *t
     if (!guard)
         return lightweight() ? SCE_KERNEL_ERROR_UNKNOWN_LW_COND_ID : SCE_KERNEL_ERROR_UNKNOWN_COND_ID;
 
-    if (const SceInt32 error = associated_mutex->release(mem, thread, 1))
+    // A savestate load that made this call again from inside the wait: the mutex was given up then
+    if (const SceInt32 error = associated_mutex->release(mem, thread, 1); error && !thread->restarted_call)
         return error;
 
     const Deadline deadline = deadline_from(timeout);
@@ -887,8 +921,17 @@ SceInt32 Condvar::wait(MemState &mem, const ThreadStatePtr &thread, SceUInt32 *t
     if (!r || (*r != SCE_KERNEL_OK && !timed_out))
         return guest_result(r);
 
+    // Taken out of the wait by a savestate load: its registers are about to be replaced. Taking
+    // the mutex back now would block on whichever paused thread holds it, and leave this thread
+    // in a wait no load can restart -- measured as FIOS2's "SceFiosLibdeflt1" stuck here on the
+    // first load in four games, and every save after it refused.
+    if (thread->wait_abandoned())
+        return SCE_KERNEL_ERROR_WAIT_CANCEL;
+
     guard.unlock();
-    // Taking the mutex back is still part of the condition variable wait
+    // Taking the mutex back is still part of the condition variable wait. A savestate cannot
+    // restart that: the call would wait on the condition variable again for a signal already taken.
+    const ScopedWait scoped_wait(*thread, { [self = thread.get()] { self->wake(); }, false });
     const SceInt32 result = associated_mutex->acquire(mem, thread, 1, timed_out ? nullptr : timeout, { lightweight() ? SCE_KERNEL_WAITTYPE_LW_COND_LW_MUTEX : SCE_KERNEL_WAITTYPE_COND_MUTEX, uid }, callbacks);
     if (timed_out && result == SCE_KERNEL_OK)
         return SCE_KERNEL_ERROR_WAIT_TIMEOUT;
@@ -1266,4 +1309,22 @@ SceInt32 MsgPipe::cancel(SceUInt32 *num_send_wait_threads, SceUInt32 *num_receiv
         *num_receive_wait_threads = nb_receivers;
 
     return SCE_KERNEL_OK;
+}
+
+std::vector<uint8_t> MsgPipe::contents() const {
+    std::vector<uint8_t> bytes;
+    if (const auto guard = lock()) {
+        bytes.resize(data_buffer.Used());
+        data_buffer.Peek(bytes.data(), bytes.size());
+    }
+    return bytes;
+}
+
+void MsgPipe::set_contents(const uint8_t *bytes, std::size_t size) {
+    const auto guard = lock();
+    if (!guard)
+        return;
+    std::vector<uint8_t> discard(data_buffer.Used());
+    data_buffer.Remove(discard.data(), discard.size());
+    data_buffer.Insert(bytes, size);
 }

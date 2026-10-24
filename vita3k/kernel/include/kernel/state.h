@@ -37,6 +37,7 @@
 #include <condition_variable>
 #include <functional>
 #include <map>
+#include <chrono>
 #include <mutex>
 #include <optional>
 #include <vector>
@@ -103,6 +104,17 @@ typedef std::multimap<uint32_t, VarBindingInfo> VarBindingInfos;
 typedef std::multimap<uint32_t, FuncBindingInfo> FuncBindingInfos;
 
 typedef std::map<uint32_t, uint32_t> ModuleUidByNid;
+
+struct EmuEnvState;
+
+// Savestate support, defined in modules/SceSysmem. A memory block is two things: the pages, which
+// are guest memory and come back with the rest of it, and the kernel's registry of uid -> where and
+// how big, which is host-side and does not. A load into a session that never made a block leaves the
+// restored guest holding a uid the kernel does not know -- `ksceKernelFreeMemBlock returned
+// SCE_KERNEL_ERROR_ILLEGAL_BLOCK_ID`, and once Spelunky answering that by calling its abort handler
+// and closing. Restore returns how many it put back; data may be null for a state without the chunk.
+std::vector<uint8_t> sysmem_save_blocks(EmuEnvState &emuenv);
+size_t sysmem_recreate_missing_blocks(EmuEnvState &emuenv, const uint8_t *data, size_t size);
 
 struct KernelState {
     KernelState();
@@ -174,6 +186,12 @@ struct KernelState {
     void load_process_param(MemState &mem, Ptr<uint32_t> ptr);
     ThreadStatePtr create_thread(MemState &mem, const char *name, Ptr<const void> entry_point = Ptr<const void>(0));
     ThreadStatePtr create_thread(MemState &mem, const char *name, Ptr<const void> entry_point, int init_priority, SceInt32 affinity_mask, int stack_size, const SceKernelThreadOptParam *option);
+    // A thread recreated by a savestate load under the ID the state gave it, on the stack and TLS
+    // the state had for it. Comes up dormant; with `resume_after_load` it is held as if paused
+    // while running, so resume_threads releases it. See savestate::load.
+    ThreadStatePtr create_thread_for_savestate(MemState &mem, SceUID id, const std::string &name, Address entry_point, int priority, SceInt32 affinity_mask, Address stack, int stack_size, Address tls, const CPUContext &init_ctx, bool resume_after_load);
+    // Never hand out an ID at or below `id` again: IDs the state wrote into guest memory.
+    void ensure_next_uid_above(SceUID id);
 
     ThreadStatePtr get_thread(SceUID thread_id);
 
@@ -193,6 +211,16 @@ struct KernelState {
     void suspend_threads();
     void resume_suspended_threads();
 
+    // pause_threads() only *requests* a stop: it holds each thread and kicks the JIT out of run(),
+    // and the thread does not actually stop until its own run_loop reaches its gate -- after the
+    // current guest block finishes, and after any HLE import it is inside of returns. Anything that
+    // rewrites guest memory underneath the guest has to wait for that to have happened, or it is
+    // racing threads that are still executing. Returns false if a thread was still running when the
+    // timeout expired, in which case the caller must not proceed. Names the offending thread for
+    // the log.
+    bool wait_for_threads_paused(std::chrono::milliseconds timeout, std::string *blocker = nullptr);
+
+
     // Kill all guest threads and block until they have exited. Must only be called from a host thread.
     void process_exit();
     std::function<void(int, std::optional<AppLaunchRequest>)> process_exit_callback;
@@ -206,6 +234,8 @@ struct KernelState {
 
 private:
     std::atomic<SceUID> next_uid{ 1 };
+    // Registers the thread and gives it its host thread, which parks in run_loop until start()
+    void spawn_host_thread(const ThreadStatePtr &thread);
     bool threads_paused = false;
     bool threads_suspended = false;
 };

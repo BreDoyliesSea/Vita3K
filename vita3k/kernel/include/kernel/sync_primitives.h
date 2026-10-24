@@ -29,6 +29,7 @@
 #include <span>
 #include <string>
 #include <variant>
+#include <vector>
 
 class SyncPrimitive : public KernelObject {
 public:
@@ -336,6 +337,10 @@ public:
     std::expected<SceSize, SceInt32> send(const ThreadStatePtr &thread, MemState &mem, SceUInt32 wait_mode, std::span<const MsgPipeVector> pieces, SceUInt32 *timeout, bool callbacks);
     SceInt32 cancel(SceUInt32 *num_send_wait_threads, SceUInt32 *num_receive_wait_threads);
 
+    // Savestate support: the bytes waiting in the pipe, and replacing them with a state's.
+    std::vector<uint8_t> contents() const;
+    void set_contents(const uint8_t *bytes, std::size_t size);
+
     struct WaitEntry {
         SceSize request_size;
         // Woken to recheck the buffer and has not done so yet
@@ -353,3 +358,14 @@ private:
 };
 
 typedef std::shared_ptr<MsgPipe> MsgPipePtr;
+
+// Savestate support. Restoring a semaphore's count writes a number that the queue of threads
+// already waiting on it knows nothing about, which can leave a waiter satisfiable with nobody left
+// to wake it -- Semaphore::signal is the only thing that ever wakes one. Re-establish the invariant
+// that signal maintains: on exit, every semaphore's queue is either empty or its front waiter
+// still needs more than the count can give.
+void reconcile_waiters_after_load(KernelState &kernel);
+
+// Savestate support: the clock timers keep their deadlines on, so a state can store them relative
+// to it rather than as numbers that mean nothing to another session.
+uint64_t sync_timer_clock();

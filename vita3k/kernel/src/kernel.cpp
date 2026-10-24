@@ -30,6 +30,14 @@
 #include <util/lock_and_find.h>
 #include <util/log.h>
 
+#include <algorithm>
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
+#include <chrono>
+#include <thread>
+
 #include <SDL3/SDL_mutex.h>
 #include <SDL3/SDL_thread.h>
 
@@ -60,6 +68,19 @@ struct ThreadParams {
 
 static int SDLCALL thread_function(void *data) {
     assert(data != nullptr);
+
+#ifdef _WIN32
+    // Reserve stack for the exception handler to run in after a guard-page hit.
+    //
+    // Without it, a stack overflow on a guest thread is unreportable: the handler's own
+    // LOG_CRITICAL goes through fmt and spdlog, runs off the end of what is left, smashes the
+    // /GS cookie on the way out, and the process dies as 0xC0000409 (stack cookie failure) with
+    // nothing in the log. Five crashes were read as buffer overruns before a dump showed the
+    // handler's own frames sitting on top of an EXCEPTION_STACK_OVERFLOW.
+    ULONG guarantee = 64 * 1024;
+    SetThreadStackGuarantee(&guarantee);
+#endif
+
     ThreadParams params = *static_cast<const ThreadParams *>(data);
     SDL_SignalSemaphore(params.host_may_destroy_params);
     ThreadStatePtr thread = std::move(params.thread);
@@ -171,11 +192,7 @@ ThreadStatePtr KernelState::create_thread(MemState &mem, const char *name, Ptr<c
     return create_thread(mem, name, entry_point, SCE_KERNEL_DEFAULT_PRIORITY, SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT, SCE_KERNEL_STACK_SIZE_USER_MAIN, nullptr);
 }
 
-ThreadStatePtr KernelState::create_thread(MemState &mem, const char *name, Ptr<const void> entry_point, int init_priority, SceInt32 affinity_mask, int stack_size, const SceKernelThreadOptParam *option) {
-    ThreadStatePtr thread = std::make_shared<ThreadState>(get_next_uid(), *this, mem);
-    if (thread->init(name, entry_point, init_priority, affinity_mask, stack_size, option) < 0)
-        return nullptr;
-
+void KernelState::spawn_host_thread(const ThreadStatePtr &thread) {
     {
         const std::lock_guard<std::mutex> lock(mutex);
         threads.emplace(thread->id, thread);
@@ -193,8 +210,33 @@ ThreadStatePtr KernelState::create_thread(MemState &mem, const char *name, Ptr<c
     SDL_DetachThread(SDL_CreateThread(&thread_function, thread->name.c_str(), &params));
     SDL_WaitSemaphore(params.host_may_destroy_params);
     SDL_DestroySemaphore(params.host_may_destroy_params);
+}
 
+ThreadStatePtr KernelState::create_thread(MemState &mem, const char *name, Ptr<const void> entry_point, int init_priority, SceInt32 affinity_mask, int stack_size, const SceKernelThreadOptParam *option) {
+    ThreadStatePtr thread = std::make_shared<ThreadState>(get_next_uid(), *this, mem);
+    if (thread->init(name, entry_point, init_priority, affinity_mask, stack_size, option) < 0)
+        return nullptr;
+
+    spawn_host_thread(thread);
     return thread;
+}
+
+ThreadStatePtr KernelState::create_thread_for_savestate(MemState &mem, SceUID id, const std::string &name, Address entry_point, int priority, SceInt32 affinity_mask, Address stack, int stack_size, Address tls, const CPUContext &init_ctx, bool resume_after_load) {
+    ensure_next_uid_above(id);
+    ThreadStatePtr thread = std::make_shared<ThreadState>(id, *this, mem);
+    if (thread->adopt_for_savestate(name, entry_point, priority, affinity_mask, stack, stack_size, tls, init_ctx) < 0)
+        return nullptr;
+
+    spawn_host_thread(thread);
+    if (resume_after_load)
+        thread->hold_for_savestate_resume();
+    return thread;
+}
+
+void KernelState::ensure_next_uid_above(SceUID id) {
+    SceUID current = next_uid.load();
+    while (current <= id && !next_uid.compare_exchange_weak(current, id + 1)) {
+    }
 }
 
 Ptr<Ptr<void>> KernelState::get_thread_tls_addr(MemState &mem, SceUID thread_id, int key) {
@@ -232,6 +274,45 @@ void KernelState::pause_threads() {
     threads_paused = true;
     for (auto &[_, thread] : threads)
         thread->pause();
+}
+
+bool KernelState::wait_for_threads_paused(std::chrono::milliseconds timeout, std::string *blocker) {
+    // Poll rather than wait on a condition variable: the transition to suspend happens in
+    // ThreadState::run_loop under the *thread's* own mutex, and there is no single place that
+    // signals "all of them are now parked". A short sleep between passes is cheap next to the
+    // work the caller is about to do.
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    for (;;) {
+        std::string still_running;
+        {
+            const std::lock_guard<std::mutex> lock(mutex);
+            for (const auto &[id, thread] : threads) {
+                if (!thread)
+                    continue;
+                // A thread that is waiting or dormant runs no guest code, and the pause holds it
+                // at its gate before it can run any again.
+                if (thread->running_unheld()) {
+                    // Say which HLE call it is in, if any: a thread that will not stop is usually
+                    // one blocked in a call that does not report its wait.
+                    const uint32_t nid = thread->current_import_nid.load(std::memory_order_relaxed);
+                    still_running = nid ? fmt::format("{} \"{}\" (in import {:#010x})", id, thread->name, nid)
+                                        : fmt::format("{} \"{}\"", id, thread->name);
+                    break;
+                }
+            }
+        }
+
+        if (still_running.empty())
+            return true;
+
+        if (std::chrono::steady_clock::now() >= deadline) {
+            if (blocker)
+                *blocker = still_running;
+            return false;
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
 }
 
 void KernelState::resume_threads() {

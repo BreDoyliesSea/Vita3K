@@ -25,6 +25,7 @@
 #include <mem/ptr.h>
 
 #include <algorithm>
+#include <atomic>
 #include <condition_variable>
 #include <list>
 #include <mutex>
@@ -82,6 +83,18 @@ struct ThreadState {
     // What the thread waits on while waiting, empty otherwise
     WaitTarget wait_target;
 
+    // NID of the HLE import this thread is currently executing, 0 when it is running guest code,
+    // and the ABI argument registers it was called with. Maintained by call_import(). A thread in
+    // ThreadStatus::waiting is parked inside one of these, in a host C++ frame that no snapshot of
+    // guest memory can describe, so together these are what a restore would need in order to
+    // re-enter the call rather than reconstruct the frame.
+    //
+    // The NID is atomic because a savestate reads it from another thread that may still be
+    // running. The arguments are plain: they are only ever read for a thread already parked in
+    // ThreadStatus::waiting, which by definition is not writing them.
+    std::atomic<uint32_t> current_import_nid{ 0 };
+    uint32_t current_import_args[4]{};
+
     std::condition_variable status_cond;
     // The exit status the guest sees: DORMANT until the first start, NOT_DORMANT while the thread
     // runs, then what it returned or exited with
@@ -91,6 +104,18 @@ struct ThreadState {
     explicit ThreadState(SceUID id, KernelState &kernel, MemState &mem);
 
     int init(const char *name, Ptr<const void> entry_point, int init_priority, SceInt32 affinity_mask, int stack_size, const SceKernelThreadOptParam *option);
+    // init() for a thread recreated by a savestate load: the same set-up, but the stack and TLS are
+    // blocks the address-space reconciliation has already put back, holding the state's bytes, so
+    // they are adopted rather than allocated and cleared. `priority` is the internal one init()
+    // computed, as saved.
+    int adopt_for_savestate(const std::string &name, Address entry_point, int priority, SceInt32 affinity_mask, Address stack_addr, int stack_size, Address tls_addr, const CPUContext &init_ctx);
+    // Make a freshly created (dormant) thread running while the load's pause holds it at its gate,
+    // so that resume_threads lets it go with the others once the load has loaded its registers.
+    void hold_for_savestate_resume();
+    // The registers start() would begin from, for a savestate to record.
+    const CPUContext &initial_context() const {
+        return init_cpu_ctx;
+    }
     int start(SceSize arglen, const Ptr<void> argp, bool run_entry_callback = false);
     // Ends the thread like sceKernelExitThread: the end handler runs, then it parks dormant
     void exit(SceInt32 status);
@@ -98,6 +123,11 @@ struct ThreadState {
     void exit_delete(SceInt32 status);
     // Deletes a dormant thread, or one being torn down, without running its end handler
     void remove();
+    // A savestate load whose state has this thread finished, while this session still runs it: end
+    // it where it stands and let it park dormant, which is what the state describes. No end
+    // callback -- as far as the restored guest is concerned this run never happened. The thread
+    // object stays, so the ID the state has is still there to be waited on or deleted.
+    void end_for_savestate();
 
     void update_status(ThreadStatus status, std::optional<ThreadStatus> expected = std::nullopt);
     // Whether the thread is deleted, so guest calls can't find it
@@ -162,12 +192,74 @@ struct ThreadState {
     int vm_resume();
     // Whether vm_suspend holds the thread. Called with mutex held.
     bool vm_suspended() const { return holds.vm > 0; }
+    // The vm_suspend calls no vm_resume undid yet, for a savestate to record and put back
+    int vm_suspend_count();
+    void set_vm_suspend_count(int count);
     // Waits, with mutex held through lock, until the thread no longer runs or vm_suspend no longer holds it
     void wait_for_vm_stop(std::unique_lock<std::mutex> &lock);
     // Whether the thread is inside a kernel call: waiting, or held on its way back from one. Called
     // with mutex held.
     bool in_wait() const { return status == ThreadStatus::waiting || (status == ThreadStatus::suspended && stop_point == StopPoint::syscall); }
     std::string log_stack_traceback() const;
+
+    // --- pausing and savestates -----------------------------------------------------------------
+    // Whether the thread is running guest code or an HLE call that has not set a wait status, rather
+    // than waiting, dormant or held at its gate.
+    bool running_unheld() {
+        const std::lock_guard<std::mutex> lock(mutex);
+        return status == ThreadStatus::running && !parked;
+    }
+
+    // Set by a savestate load that points this thread back at the start of the call it was parked
+    // in, so the call is made again from inside its wait: a condition variable wait had already
+    // given up its mutex. Taken by the next call the thread makes, as restarted_call.
+    std::atomic<bool> restart_pending{ false };
+    // Whether the call this thread is making is such a restart. Only the thread itself touches it.
+    bool restarted_call = false;
+
+    // Whether something holds the thread at its gate. Called with mutex held.
+    bool held_at_gate() const { return parked; }
+
+    // Depth of run_loop frames: 1 for a thread at its top level, more inside a callback.
+    int nesting_level() const {
+        return run_loop_depth.load(std::memory_order_acquire);
+    }
+
+    // Savestate load. If the thread is still waiting inside the import `nid`, arrange that when the
+    // call returns it waits for the load to finish -- the load holds MemState::savestate_lock
+    // exclusively -- and then continues from `ctx` rather than from wherever the call left it.
+    // Returns false if it is no longer in that call.
+    bool continue_from_on_return(uint32_t nid, const CPUContext &ctx);
+
+    // True while the thread is waiting on the load after continue_from_on_return.
+    bool held_for_savestate() const {
+        return held_for_load.load(std::memory_order_acquire);
+    }
+
+    // How a savestate load takes this thread out of the HLE wait it is parked in. Every wait made
+    // through wait() has one already: once armed, wait() returns ThreadExiting, and the release
+    // only has to wake it. A call that blocks some other way registers its own for as long as it
+    // is parked (ScopedWait, below), as does one whose wait() cannot be restarted.
+    struct WaitRelease {
+        // Ends the wait without it being satisfied, and wakes the thread. Empty for a wait that
+        // cannot be woken and ends on its own (sceAudioOutOutput).
+        std::function<void()> release;
+        // Whether making the call again from its start is equivalent to staying in it. A save
+        // refuses a moment when a thread is in a wait that is not.
+        bool restartable = true;
+    };
+    void enter_wait(WaitRelease how);
+    void leave_wait();
+    // The registered release, or the one for wait() if the thread is blocked there.
+    std::optional<WaitRelease> current_wait();
+
+    // Set once a savestate load has armed this thread (continue_from_on_return) or is ending it
+    // (end_for_savestate). wait() returns ThreadExiting while it is set; a wait made any other way
+    // that would otherwise go back to sleep, or run guest callbacks, on waking checks this and
+    // returns instead.
+    bool wait_abandoned() const {
+        return abandon_wait.load(std::memory_order_acquire);
+    }
 
 private:
     // How a thread ends, each value stronger than the ones before it
@@ -223,6 +315,20 @@ private:
     bool step_requested = false;
     // Where the thread stopped the last time something held it
     StopPoint stop_point = StopPoint::guest_code;
+    // Set by continue_from_on_return(), consumed in run_loop() when the call returns.
+    std::optional<CPUContext> context_on_return;
+    std::atomic<bool> held_for_load{ false };
+    std::atomic<bool> abandon_wait{ false };
+    // Guards wait_release only, and is never held while calling anything, so a wait can register
+    // under whatever locks it already holds.
+    mutable std::mutex wait_release_mutex;
+    std::optional<WaitRelease> wait_release;
+    // Set by end_for_savestate: the ending skips the end handler
+    bool end_quietly = false;
+    // Set while wait_while_held keeps the thread at its gate
+    bool parked = false;
+    // Number of active run_loop levels: 1 at the top level, one more for each nested callback.
+    std::atomic<int> run_loop_depth{ 0 };
 
     // when calling sceKernelStartThread
     bool run_start_callback = false;
@@ -252,6 +358,22 @@ private:
     std::mutex end_waiters_mutex;
     // Threads blocked in sceKernelWaitThreadEnd on this one.
     WaitQueue<EndWaitEntry> end_waiters;
+};
+
+// Registers how to release a wait for as long as it is in scope (see ThreadState::WaitRelease).
+struct ScopedWait {
+    ScopedWait(ThreadState &thread, ThreadState::WaitRelease how)
+        : thread(thread) {
+        thread.enter_wait(std::move(how));
+    }
+    ~ScopedWait() {
+        thread.leave_wait();
+    }
+    ScopedWait(const ScopedWait &) = delete;
+    ScopedWait &operator=(const ScopedWait &) = delete;
+
+private:
+    ThreadState &thread;
 };
 
 typedef std::shared_ptr<ThreadState> ThreadStatePtr;
