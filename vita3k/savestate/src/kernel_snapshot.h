@@ -96,9 +96,10 @@ struct Snapshot {
 };
 
 // Stops every guest thread, then waits until each one is dormant, at its gate, or blocked in a call.
-// Empty once they are, or what wouldn't stop. Undone by release_threads, also when it fails.
+// Empty once they are, or what wouldn't stop. Undone by release_threads, also when it fails, while
+// the emulator pause still holds every thread; stay_paused if the game was paused before.
 std::string quiesce(EmuEnvState &emuenv, int timeout_ms);
-void release_threads(EmuEnvState &emuenv);
+void release_threads(EmuEnvState &emuenv, bool stay_paused);
 
 // Records every thread and object of a quiesced guest, or refuses a moment no load could restart,
 // retryably. After guest memory is copied: a message pipe's contents are read through guest memory.

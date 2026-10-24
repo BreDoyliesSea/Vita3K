@@ -67,9 +67,10 @@ fs::path slot_path(const EmuEnvState &emuenv, int slot);
 
 // Stops every guest thread for a save or a load, and waits until each one is dormant, at its gate,
 // or blocked in a call. Empty once they are, or what would not stop. Undone by release_threads(),
-// which the caller calls however it went.
+// which the caller calls however it went, while its pause still holds the guest; stay_paused if
+// the game was paused before.
 std::string quiesce(EmuEnvState &emuenv, int timeout_ms);
-void release_threads(EmuEnvState &emuenv);
+void release_threads(EmuEnvState &emuenv, bool stay_paused);
 
 // Both expect quiesce() to have succeeded and MemState::savestate_lock to be held exclusively. The
 // threads stay stopped until the caller releases them.

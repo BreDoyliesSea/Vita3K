@@ -118,13 +118,15 @@ ThreadStatePtr any_thread(KernelState &kernel) {
     return threads.empty() ? nullptr : threads.front();
 }
 
-bool quiet(const SceKernelThreadInfo &info) {
-    return info.status == SCE_KERNEL_THREAD_STATUS_DORMANT || info.status == SCE_KERNEL_THREAD_STATUS_SUSPENDED
-        || info.status == SCE_KERNEL_THREAD_STATUS_WAITING;
+// Stopped: dormant, or held at its gate. The pause holds a thread there with its status still running,
+// so a game sees nothing it would not see on any pause.
+bool stopped(ThreadState &thread) {
+    return thread.held_at_gate() || thread.get_status() == ThreadStatus::dormant;
 }
 
-bool stopped(const SceKernelThreadInfo &info) {
-    return info.status == SCE_KERNEL_THREAD_STATUS_DORMANT || info.status == SCE_KERNEL_THREAD_STATUS_SUSPENDED;
+// Quiet: stopped, or blocked in a call, where it stays while every other thread is stopped
+bool quiet(ThreadState &thread) {
+    return stopped(thread) || thread.info().status == SCE_KERNEL_THREAD_STATUS_WAITING;
 }
 
 // Waits until done holds for every thread, for at most timeout_ms. Returns the first thread it
@@ -135,7 +137,7 @@ ThreadStatePtr wait_for_all(KernelState &kernel, int timeout_ms, Done done) {
     while (true) {
         ThreadStatePtr blocker;
         for (const ThreadStatePtr &thread : live_threads(kernel)) {
-            if (!done(thread->info())) {
+            if (!done(*thread)) {
                 blocker = thread;
                 break;
             }
@@ -253,31 +255,33 @@ std::string why_not_at_a_call(const WordReader &read, const CPUContext &ctx) {
 }
 
 std::string quiesce(EmuEnvState &emuenv, int timeout_ms) {
-    emuenv.kernel.suspend_threads();
+    // The caller's pause holds every thread; this waits until they have stopped
     if (const ThreadStatePtr blocker = wait_for_all(emuenv.kernel, timeout_ms, quiet)) {
-        const SceKernelThreadInfo info = blocker->info();
-        return fmt::format("thread {} \"{}\" would not stop (it is {})", blocker->id, blocker->name, status_name(info.status));
+        return fmt::format("thread {} \"{}\" would not stop (it is {})", blocker->id, blocker->name, status_name(blocker->info().status));
     }
     return {};
 }
 
-void release_threads(EmuEnvState &emuenv) {
+void release_threads(EmuEnvState &emuenv, bool stay_paused) {
     KernelState &kernel = emuenv.kernel;
+    // The threads a load restarts go one at a time, each until it blocks in its call again or gets
+    // what it waits for at once, in the order they had started waiting
     for (const SceUID id : std::exchange(release_order, {})) {
         const ThreadStatePtr thread = kernel.get_thread(id);
         if (!thread)
             continue;
-        thread->resume();
-        // Until it blocks in its call again, or gets what it waits for at once
+        thread->resume_from_pause();
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(20);
         while (std::chrono::steady_clock::now() < deadline) {
             const SceUInt32 status = thread->info().status;
-            if (status != SCE_KERNEL_THREAD_STATUS_RUNNING && status != SCE_KERNEL_THREAD_STATUS_READY && status != SCE_KERNEL_THREAD_STATUS_SUSPENDED)
+            if (status != SCE_KERNEL_THREAD_STATUS_RUNNING && status != SCE_KERNEL_THREAD_STATUS_READY)
                 break;
             std::this_thread::sleep_for(std::chrono::microseconds(100));
         }
+        // The game was paused before: held again, until it is unpaused
+        if (stay_paused)
+            thread->pause();
     }
-    kernel.resume_suspended_threads();
 }
 
 Result capture(EmuEnvState &emuenv, Snapshot &snapshot) {
@@ -311,7 +315,8 @@ Result capture(EmuEnvState &emuenv, Snapshot &snapshot) {
 
         // A thread inside a callback has host frames around it that no state describes
         const bool in_callback = thread->call_depth() > 1;
-        switch (info.status) {
+        const SceUInt32 status = thread->held_at_gate() ? SCE_KERNEL_THREAD_STATUS_SUSPENDED : info.status;
+        switch (status) {
         case SCE_KERNEL_THREAD_STATUS_DORMANT:
             r.resume = Resume::dormant;
             break;
@@ -335,7 +340,7 @@ Result capture(EmuEnvState &emuenv, Snapshot &snapshot) {
             break;
         }
         default:
-            return Result::retry(fmt::format("thread {} \"{}\" is {}", r.id, r.name, status_name(info.status)));
+            return Result::retry(fmt::format("thread {} \"{}\" is {}", r.id, r.name, status_name(status)));
         }
         snapshot.threads.push_back(std::move(r));
     }

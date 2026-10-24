@@ -766,6 +766,7 @@ void ThreadState::wait_while_held(std::unique_lock<std::mutex> &lock, StopPoint 
     if (!holds.any() || exiting())
         return;
     stop_point = where;
+    parked = true;
     // The holds can change while the thread waits, and with them what its status shows
     while (holds.any() && !exiting()) {
         const ThreadStatus shown = holds.shown() ? ThreadStatus::suspended : ThreadStatus::running;
@@ -773,6 +774,7 @@ void ThreadState::wait_while_held(std::unique_lock<std::mutex> &lock, StopPoint 
             update_status(shown);
         status_cond.wait(lock);
     }
+    parked = false;
     if (status != ThreadStatus::running)
         update_status(ThreadStatus::running);
 }
@@ -909,6 +911,11 @@ ThreadState::ResumedWait ThreadState::take_resumed_wait() {
 
 int ThreadState::call_depth() const {
     return run_depth.load();
+}
+
+bool ThreadState::held_at_gate() const {
+    const std::lock_guard<std::mutex> lock(mutex);
+    return parked;
 }
 
 std::string ThreadState::log_stack_traceback() const {

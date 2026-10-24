@@ -193,8 +193,8 @@ std::string quiesce(EmuEnvState &emuenv, int timeout_ms) {
     return kernel::quiesce(emuenv, timeout_ms);
 }
 
-void release_threads(EmuEnvState &emuenv) {
-    kernel::release_threads(emuenv);
+void release_threads(EmuEnvState &emuenv, bool stay_paused) {
+    kernel::release_threads(emuenv, stay_paused);
 }
 
 fs::path slot_path(const EmuEnvState &emuenv, const int slot) {

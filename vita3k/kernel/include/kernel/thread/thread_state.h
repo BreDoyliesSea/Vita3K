@@ -223,6 +223,8 @@ struct ThreadState {
     uint64_t wait_sequence() const;
     // How many run_loop levels run on the thread: 1 at the top, 2 inside a callback
     int call_depth() const;
+    // Whether something holds the thread at its gate now, where it runs no guest code
+    bool held_at_gate() const;
 
 private:
     // How a thread ends, each value stronger than the ones before it
@@ -352,6 +354,8 @@ private:
 
     // Snapshots
     bool wait_abandoned = false;
+    // In wait_while_held, held
+    bool parked = false;
     ResumedWait resumed_wait = ResumedWait::none;
     std::optional<Deadline> resumed_deadline;
     Deadline wait_deadline = Deadline::max();

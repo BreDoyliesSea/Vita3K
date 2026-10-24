@@ -63,6 +63,7 @@ bool drain_renderer(EmuEnvState &emuenv) {
 // pause reason keeps this independent of the user's own pause, so taking a state while already
 // paused does not resume the game underneath them.
 Result run_quiesced(EmuEnvState &emuenv, app::AppSessionController &session, const std::function<Result()> &action) {
+    const bool paused_before = session.is_paused();
     session.set_pause_reason(app::AppSessionPauseReason::Savestate, true);
 
     Result result = Result::fail("did not run");
@@ -95,9 +96,8 @@ Result run_quiesced(EmuEnvState &emuenv, app::AppSessionController &session, con
     if (render_parked)
         emuenv.renderer->unpark_render_thread();
     guest_memory = {};
-    // The pause first, so the threads a load restarts can go one at a time
+    release_threads(emuenv, paused_before);
     session.set_pause_reason(app::AppSessionPauseReason::Savestate, false);
-    release_threads(emuenv);
     return result;
 }
 
