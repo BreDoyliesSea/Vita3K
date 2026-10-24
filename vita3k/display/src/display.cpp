@@ -24,6 +24,7 @@
 #include <renderer/state.h>
 
 #include <chrono>
+#include <iterator>
 #include <motion/functions.h>
 #include <touch/functions.h>
 
@@ -67,10 +68,35 @@ static void vblank_sync_thread(EmuEnvState &emuenv) {
                 return waiter.entry.target_vcount <= display.vblank_count;
             });
         }
+        // Fast-forward divides the vblank period. Everything the guest paces off vblank -- its
+        // frame loop, sceDisplayWait, sceTouchRead -- speeds up together.
+        const int64_t speed = std::max<uint32_t>(1, display.speed_multiplier.load(std::memory_order_relaxed));
+        const int64_t period = std::max<int64_t>(1, TARGET_MICRO_PER_FRAME / speed);
         const auto time_ms = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-        const auto time_left = TARGET_MICRO_PER_FRAME - (time_ms % TARGET_MICRO_PER_FRAME);
+        const auto time_left = period - (time_ms % period);
         std::this_thread::sleep_for(std::chrono::microseconds(time_left));
     }
+}
+
+// Speeds the hotkey steps through. The vblank period is divided by this, so 8x is already about
+// a 2 ms frame budget; beyond that the guest is bounded by how fast it can actually render.
+static constexpr uint32_t speed_ladder[] = { 1, 2, 4, 8 };
+
+uint32_t cycle_speed_multiplier(DisplayState &display) {
+    const uint32_t current = display.speed_multiplier.load(std::memory_order_relaxed);
+
+    // fast-forward-speed accepts any value, so a configured speed can sit off the ladder. Land on
+    // the first rung in that case rather than leaving the hotkey with nowhere to go.
+    uint32_t next = speed_ladder[0];
+    for (size_t i = 0; i < std::size(speed_ladder); i++) {
+        if (speed_ladder[i] == current) {
+            next = speed_ladder[(i + 1) % std::size(speed_ladder)];
+            break;
+        }
+    }
+
+    display.speed_multiplier.store(next, std::memory_order_relaxed);
+    return next;
 }
 
 void start_sync_thread(EmuEnvState &emuenv) {
@@ -219,6 +245,7 @@ void DisplayState::deinit() {
     last_setframe_vblank_count = 0;
 
     fps_hack = false;
+    speed_multiplier.store(1);
     // pretty sure we set this on game boot
     fullscreen = false;
 }

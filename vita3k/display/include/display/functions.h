@@ -25,6 +25,10 @@ struct DisplayState;
 struct EmuEnvState;
 struct DisplayFrameInfo;
 
+// Step the fast-forward speed to the next rung and return it. Safe to call from any thread: the
+// vblank generator reloads the multiplier once per frame and nothing else depends on its value.
+uint32_t cycle_speed_multiplier(DisplayState &display);
+
 void start_sync_thread(EmuEnvState &emuenv);
 void wait_vblank(DisplayState &display, const ThreadStatePtr &wait_thread, const uint64_t target_vcount, const bool is_cb);
 // if the result is not nullptr, contain the predicted frame (pointer needs to be freed later)

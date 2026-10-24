@@ -95,6 +95,7 @@ using PhysicalKeyCode = input::PhysicalKeyCode;
     code(PhysicalKeyCode, "keyboard-alternate-pinch-in", PhysicalKeyCode::Unbound, keyboard_alternate_pinch_in)                        \
     code(PhysicalKeyCode, "keyboard-alternate-pinch-out", PhysicalKeyCode::Unbound, keyboard_alternate_pinch_out)                      \
     code(PhysicalKeyCode, "keyboard-gui-exit", PhysicalKeyCode::Unbound, keyboard_gui_exit)                                            \
+    code(PhysicalKeyCode, "keyboard-fast-forward", PhysicalKeyCode::F6, keyboard_fast_forward)                                          \
     code(PhysicalKeyCode, "keyboard-button-select-alt", PhysicalKeyCode::Unbound, keyboard_button_select_alt)                          \
     code(PhysicalKeyCode, "keyboard-button-start-alt", PhysicalKeyCode::Unbound, keyboard_button_start_alt)                            \
     code(PhysicalKeyCode, "keyboard-button-up-alt", PhysicalKeyCode::Unbound, keyboard_button_up_alt)                                  \
@@ -127,7 +128,8 @@ using PhysicalKeyCode = input::PhysicalKeyCode;
     code(PhysicalKeyCode, "keyboard-pinch-modifier-alt", PhysicalKeyCode::Unbound, keyboard_pinch_modifier_alt)                        \
     code(PhysicalKeyCode, "keyboard-alternate-pinch-in-alt", PhysicalKeyCode::Unbound, keyboard_alternate_pinch_in_alt)                \
     code(PhysicalKeyCode, "keyboard-alternate-pinch-out-alt", PhysicalKeyCode::Unbound, keyboard_alternate_pinch_out_alt)              \
-    code(PhysicalKeyCode, "keyboard-gui-exit-alt", PhysicalKeyCode::Unbound, keyboard_gui_exit_alt)
+    code(PhysicalKeyCode, "keyboard-gui-exit-alt", PhysicalKeyCode::Unbound, keyboard_gui_exit_alt)                                    \
+    code(PhysicalKeyCode, "keyboard-fast-forward-alt", PhysicalKeyCode::Unbound, keyboard_fast_forward_alt)
 
 #define CONFIG_INDIVIDUAL(code)                                                                         \
     code(bool, "initial-setup", false, initial_setup)                                                   \
@@ -146,6 +148,7 @@ using PhysicalKeyCode = input::PhysicalKeyCode;
     code(std::string, "backend-renderer", "Vulkan", backend_renderer)                                   \
     code(std::string, "custom-driver-name", "", custom_driver_name)                                     \
     code(bool, "turbo-mode", false, turbo_mode)                                                         \
+    code(int, "fast-forward-speed", 1, fast_forward_speed)                                            \
     code(int, "gpu-idx", 0, gpu_idx)                                                                    \
     code(bool, "high-accuracy", false, high_accuracy)                                                   \
     code(float, "resolution-multiplier", 1.0f, resolution_multiplier)                                   \

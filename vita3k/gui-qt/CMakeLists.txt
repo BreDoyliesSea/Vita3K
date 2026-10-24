@@ -102,6 +102,7 @@ target_link_libraries(gui-qt PUBLIC
     config
     ctrl
     dialog
+    display
     emuenv
     app
     compat
