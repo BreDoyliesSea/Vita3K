@@ -43,6 +43,10 @@ void create(SceGxmSyncObject *sync, State &state);
 void destroy(SceGxmSyncObject *sync, State &state);
 void finish(State &state, Context *context);
 
+// Savestate support: wait up to timeout_ms for every GPU result already submitted to be written
+// back into guest memory (notifications, sync objects, buffer syncs). False on a timeout.
+bool wait_gpu_idle(State &state, int timeout_ms);
+
 enum class SyncWaitResult {
     Ready,
     TimedOut,
@@ -106,6 +110,19 @@ void destroy_context_during_shutdown(State &state, std::unique_ptr<Context> &con
 bool create_render_target(State &state, std::unique_ptr<RenderTarget> &rt, const SceGxmRenderTargetParams *params);
 void destroy_render_target(State &state, std::unique_ptr<RenderTarget> &rt);
 void destroy_render_target_during_shutdown(State &state, std::unique_ptr<RenderTarget> &rt);
+// For a savestate load, which runs with the render thread parked: a command sent to it would never
+// be picked up, so these do on the calling thread what CreateRenderTarget and DestroyRenderTarget
+// do on the render thread. Safe there because nothing else touches the device meanwhile (the same
+// footing as map_memory called directly from a load). Creation refuses on OpenGL, whose context is
+// current on the render thread only. forget_render_target drops a context's pointers to a render
+// target about to be destroyed (its current target, and the surface cache's on Vulkan).
+bool create_render_target_while_parked(State &state, std::unique_ptr<RenderTarget> &rt, const SceGxmRenderTargetParams *params);
+
+// Also for a savestate, at both ends: see VKSurfaceCache::reset_sync_state_after_savestate. Nothing
+// to do on OpenGL, which does not trap surfaces.
+void reset_surface_sync_after_savestate(State &state, MemState &mem);
+void destroy_render_target_while_parked(State &state, std::unique_ptr<RenderTarget> &rt);
+void forget_render_target(State &state, Context &context, const RenderTarget *rt);
 
 Command *generic_command_allocate();
 void generic_command_free(Command *cmd);
