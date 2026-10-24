@@ -23,6 +23,8 @@
 #include <util/lock_and_find.h>
 #include <util/tracy.h>
 
+#include <shared_mutex>
+
 TRACY_MODULE_NAME(SceAudio);
 
 enum SceAudioOutMode {
@@ -205,10 +207,42 @@ EXPORT(int, sceAudioOutOutput, int port, const void *buf) {
     if (!thread) {
         return RET_ERROR(SCE_AUDIO_OUT_ERROR_INVALID_PORT);
     }
+    // The port's length is host state, set when the port was opened, and a savestate does not
+    // rewind it. The buffer address comes from the restored guest. If the two disagree -- the
+    // state was taken with the port configured differently -- the backend reads past the end of
+    // the guest's buffer, which faults if the next page is not mapped. Measured as a read
+    // violation in memmove on this thread a few tens of milliseconds after a load. Dropping the
+    // frame costs one period of audio; reading off the end costs the session.
+    // buf reaches us as a host pointer, so check it as one first. Converting an address that is
+    // not inside the guest reservation to a guest address wraps to 32 bits and can land on an
+    // unrelated mapped page, which makes the range check below agree to something that is not
+    // the buffer at all -- that is why an earlier version of this guard passed and the read
+    // faulted anyway.
+    const uint8_t *const guest_base = emuenv.mem.memory.get();
+    const auto *const bytes = static_cast<const uint8_t *>(buf);
+    const bool inside_guest = guest_base && bytes >= guest_base
+        && bytes + prt->len_bytes <= guest_base + GiB(4);
+
+    const Address buffer = inside_guest ? static_cast<Address>(bytes - guest_base) : 0;
+    if (!inside_guest || !is_valid_addr_range(emuenv.mem, buffer, buffer + prt->len_bytes)) {
+        LOG_WARN_ONCE("sceAudioOutOutput: {} + {} bytes is not a mapped guest buffer ({}), dropping the frame",
+            fmt::ptr(buf), prt->len_bytes, inside_guest ? "unmapped" : "outside guest memory");
+        return prt->len;
+    }
+
     // is it really useful to update the thread status?
-    thread->begin_host_wait();
-    emuenv.audio.audio_output(*prt, buf);
-    thread->end_host_wait();
+    {
+        // audio_output reads the guest buffer directly -- cubeb memcpy's it into its own ring,
+        // SDL hands it to SDL_PutAudioStreamData. A savestate can be rewriting guest memory while
+        // this read is in flight, which faulted here reliably, in memmove, on this thread. Take the
+        // barrier so a savestate waits for this to finish, and so this waits for one in progress.
+        // Taken before the thread shows waiting, so a thread a savestate holds up here shows
+        // running and is waited for, instead of seeming stopped in a call it never gets through.
+        const std::shared_lock<std::shared_timed_mutex> guest_memory(emuenv.mem.savestate_lock);
+        thread->begin_host_wait();
+        emuenv.audio.audio_output(*prt, buf);
+        thread->end_host_wait();
+    }
 
     return prt->len;
 }

@@ -30,6 +30,7 @@ extern "C" {
 #include <util/log.h>
 
 #include <algorithm>
+#include <cstring>
 
 struct FFMPEGAtrac9Info {
     uint32_t version;
@@ -84,6 +85,76 @@ void Atrac9DecoderState::load_state(const Atrac9DecoderSavedState *src) {
         std::copy_n(src->prev_values[0], 256, frame.Channels[0]->Mdct.ImdctPrevious);
     if (frame.Channels[1])
         std::copy_n(src->prev_values[1], 256, frame.Channels[1]->Mdct.ImdctPrevious);
+}
+
+namespace {
+// The blob: this header, then every Block of the frame verbatim. A Block holds all a frame hands
+// to the next -- scale factors, band parameters, the IMDCT overlap, the noise generator -- plus
+// pointers into its own decoder, which restore_position puts back from the live one.
+struct Atrac9PositionHeader {
+    uint32_t block_size;
+    uint32_t config_data;
+    int32_t superframe_frame_idx;
+    int32_t superframe_data_left;
+    int32_t index_in_superframe;
+};
+} // namespace
+
+std::vector<uint8_t> Atrac9DecoderState::save_position() const {
+    const Atrac9Handle *const handle = static_cast<Atrac9Handle *>(decoder_handle);
+    const Atrac9PositionHeader header{ static_cast<uint32_t>(sizeof(Block)), config_data, superframe_frame_idx,
+        superframe_data_left, handle->Frame.IndexInSuperframe };
+    std::vector<uint8_t> out(sizeof(header) + sizeof(handle->Frame.Blocks));
+    std::memcpy(out.data(), &header, sizeof(header));
+    std::memcpy(out.data() + sizeof(header), handle->Frame.Blocks, sizeof(handle->Frame.Blocks));
+    return out;
+}
+
+bool Atrac9DecoderState::restore_position(const std::vector<uint8_t> &saved) {
+    Atrac9Handle *const handle = static_cast<Atrac9Handle *>(decoder_handle);
+    Frame &frame = handle->Frame;
+    Atrac9PositionHeader header;
+    if (saved.size() != sizeof(header) + sizeof(frame.Blocks))
+        return false;
+    std::memcpy(&header, saved.data(), sizeof(header));
+    if (header.block_size != sizeof(Block) || header.config_data != config_data)
+        return false;
+
+    for (int b = 0; b < MAX_BLOCK_COUNT; b++) {
+        Block &block = frame.Blocks[b];
+        const Frame *const block_frame = block.Frame;
+        const ConfigData *const block_config = block.Config;
+        struct {
+            Frame *frame;
+            Block *block;
+            ConfigData *config;
+            double *window;
+            double *sin_table;
+            double *cos_table;
+        } live[MAX_BLOCK_CHANNEL_COUNT];
+        for (int c = 0; c < MAX_BLOCK_CHANNEL_COUNT; c++) {
+            const Channel &channel = block.Channels[c];
+            live[c] = { channel.Frame, channel.Block, channel.Config, channel.Mdct.Window, channel.Mdct.SinTable, channel.Mdct.CosTable };
+        }
+
+        std::memcpy(&block, saved.data() + sizeof(header) + b * sizeof(Block), sizeof(Block));
+
+        block.Frame = const_cast<Frame *>(block_frame);
+        block.Config = const_cast<ConfigData *>(block_config);
+        for (int c = 0; c < MAX_BLOCK_CHANNEL_COUNT; c++) {
+            Channel &channel = block.Channels[c];
+            channel.Frame = live[c].frame;
+            channel.Block = live[c].block;
+            channel.Config = live[c].config;
+            channel.Mdct.Window = live[c].window;
+            channel.Mdct.SinTable = live[c].sin_table;
+            channel.Mdct.CosTable = live[c].cos_table;
+        }
+    }
+    frame.IndexInSuperframe = header.index_in_superframe;
+    superframe_frame_idx = header.superframe_frame_idx;
+    superframe_data_left = header.superframe_data_left;
+    return true;
 }
 
 bool Atrac9DecoderState::send(const uint8_t *data, uint32_t size) {
