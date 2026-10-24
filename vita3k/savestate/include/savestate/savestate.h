@@ -19,11 +19,18 @@
 
 #include <util/fs.h>
 
+#include <atomic>
 #include <cstdint>
+#include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 struct EmuEnvState;
+
+namespace app {
+class AppSessionController;
+}
 
 namespace savestate {
 
@@ -68,5 +75,16 @@ void release_threads(EmuEnvState &emuenv);
 // threads stay stopped until the caller releases them.
 Result save(EmuEnvState &emuenv, const fs::path &path);
 Result load(EmuEnvState &emuenv, const fs::path &path);
+
+// The whole of a quicksave or a quickload, the way a frontend runs one: catches a frame boundary,
+// stops the guest and the renderer, and tries again while the moment can't be taken, up to 60
+// times. cancel stops it between attempts.
+Result quicksave(EmuEnvState &emuenv, app::AppSessionController &session, int slot, const std::atomic<bool> &cancel);
+Result quickload(EmuEnvState &emuenv, app::AppSessionController &session, int slot, const std::atomic<bool> &cancel);
+
+// For tests: with VITA3K_SNAPSHOT_ROUNDTRIP=<seconds> set, a thread that quicksaves and then
+// quickloads that state that long after now, so a run shows whether the guest goes on as if nothing
+// had happened. Nothing without it. The caller sets cancel and joins the thread before the session ends.
+std::optional<std::thread> start_roundtrip_from_env(EmuEnvState &emuenv, app::AppSessionController &session, const std::atomic<bool> &cancel);
 
 } // namespace savestate
