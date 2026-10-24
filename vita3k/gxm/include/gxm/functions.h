@@ -17,16 +17,151 @@
 
 #pragma once
 
+#include <gxm/state.h>
 #include <gxm/types.h>
 
 #include <array>
 #include <bitset>
 #include <string>
+#include <utility>
+#include <vector>
 
 struct EmuEnvState;
 struct GxmState;
 
+namespace renderer {
+struct State;
+}
+
 namespace gxm {
+// Guest byte ranges that hold host objects.
+//
+// SceGxmSyncObject carries a std::mutex and a condition_variable; SceGxmContext and
+// SceGxmRenderTarget carry std::unique_ptrs to renderer objects. All three are constructed into
+// *guest* memory, so their bytes end up in a savestate, and restoring a state taken by a
+// different process installs that process's host pointers. Callers leave these ranges alone.
+// Collect before guest memory is overwritten. See ngs::collect_host_owned_memspaces for the
+// same problem in NGS.
+void collect_host_owned_ranges(GxmState &gxm, const MemState &mem,
+    std::vector<std::pair<Address, uint32_t>> &out);
+
+// Where every GXM host object was when a savestate was taken, by kind, each list sorted.
+//
+// These objects are not moved by a load (unlike the NGS ones), so a state is only safe to load if
+// every object it refers to is still at the same address in this session. When the game's heap is
+// laid out differently they are not: measured by pushing the heap up 16 MiB before loading a state
+// from a normal session, which moved the immediate context and the shader patcher by exactly that,
+// and the first sceGxmBeginScene after the load followed the saved context's dead renderer pointer.
+struct HostObjectLayout {
+    std::vector<Address> contexts;
+    std::vector<Address> render_targets;
+    std::vector<Address> sync_objects;
+    std::vector<Address> shader_patchers;
+    std::vector<Address> vertex_programs;
+    std::vector<Address> fragment_programs;
+};
+
+HostObjectLayout capture_layout(GxmState &gxm, const MemState &mem);
+
+// Empty if every object in `saved` is a live object of the same kind at the same address here,
+// otherwise which one is not. Extra live objects are not fine -- see rollback_to_layout.
+std::string check_layout(GxmState &gxm, const MemState &mem, const HostObjectLayout &saved, bool render_targets_handled = false, bool programs_handled = false);
+
+// How one of a shader patcher's programs was made: which patcher cached it, which SceGxmProgram it
+// compiles, and the rest of what sceGxmShaderPatcherCreate{Vertex,Fragment}Program was given. A
+// savestate records these so a load can make again the programs a session has not created yet -- a
+// state taken in gameplay names every program the game has compiled so far, and a session still on
+// its title screen has almost none of them (Gravity Rush: 56 vertex and 51 fragment programs in the
+// state, 5 and 5 in the session; every load of such a state was refused).
+//
+// Mask-update fragment programs are not here: sceGxmShaderPatcherCreateMaskUpdateFragmentProgram
+// never puts one in the cache, so neither the layout nor this sees them. See MaskProgramIdentity.
+struct ProgramIdentity {
+    Address address = 0;
+    Address patcher = 0;
+    Address program = 0; // the SceGxmProgram the registered program pointed at
+    bool fragment = false;
+    uint32_t reference_count = 1;
+    // Vertex programs only.
+    uint32_t key_hash = 0;
+    std::vector<SceGxmVertexStream> streams;
+    std::vector<SceGxmVertexAttribute> attributes;
+    // Fragment programs only. has_blend_info is false when the cache key holds the default, which
+    // is what the patcher stores for a guest that passed none; the renderer is given none again.
+    bool has_blend_info = false;
+    SceGxmBlendInfo blend_info{};
+};
+std::vector<ProgramIdentity> capture_program_identities(GxmState &gxm, const MemState &mem);
+
+// Make again the programs the state has and the session lacks, at their addresses, after the memory
+// restore. Like the render targets: the bytes are back but the host members in them (the renderer
+// program, and the attribute and stream vectors) belong to the saved session, so each is rebuilt
+// from its identity and put back in its patcher's cache. Vulkan only, for the same reason.
+std::string recreate_programs(GxmState &gxm, const MemState &mem, renderer::State &renderer, const std::vector<ProgramIdentity> &missing, uint32_t &recreated);
+
+// Mask-update fragment programs. A restored one carries the renderer program pointer of the process
+// that saved it, and the first draw with it after a load into another process faulted in
+// gxmSetUniformBuffers (Oddworld, backlog 26). A load destroys the session's before the restore and
+// makes each one the state names again after it, at its address. Vulkan only, like the others.
+struct MaskProgramIdentity {
+    Address address = 0;
+    Address patcher = 0;
+};
+std::vector<MaskProgramIdentity> capture_mask_programs(GxmState &gxm);
+uint32_t destroy_mask_programs(GxmState &gxm, const MemState &mem);
+std::string recreate_mask_programs(GxmState &gxm, const MemState &mem, renderer::State &renderer, const std::vector<MaskProgramIdentity> &saved, uint32_t &recreated);
+
+// Destroy the host half of every object that is live here but not in `saved`: the ones the guest
+// created after the state was taken. Their guest memory came from the guest's own heap (shader
+// patchers, programs) or from the allocator a load reconciles (sync objects), and a load rewinds
+// both to a moment when that memory was free. Keeping the host half alive across that is what
+// made a quickload of Oddworld die a few seconds later: the rewound guest reused the bytes of a
+// vertex program it had made after the save, the patcher's cache still handed that program out on
+// the next key hit, and the draw read its renderer_data as guest data (measured: refcount
+// 2409865712, renderer_data 0x3f800000 -- the float 1.0 -- program 0x1; then a fault in
+// gxmSetUniformBuffers at 0x290000002C, or a hang). Programs are taken out of their patcher's
+// cache and destructed in place, patchers likewise, sync objects dropped from the registry; the
+// bytes are left for the restore to overwrite with what the guest had there. Nothing is handed
+// back to the guest heap: the load is about to put that heap back as it was.
+//
+// Render targets and contexts are destroyed through the render thread, which is parked for the
+// whole load, so a state that has extras of those kinds is refused (non-empty return, nothing
+// touched) rather than left half-handled. Counts of what was destroyed come back in `out`.
+struct RollbackCounts {
+    uint32_t vertex_programs = 0;
+    uint32_t fragment_programs = 0;
+    uint32_t shader_patchers = 0;
+    uint32_t sync_objects = 0;
+    uint32_t render_targets = 0;
+    uint32_t total() const {
+        return vertex_programs + fragment_programs + shader_patchers + sync_objects + render_targets;
+    }
+};
+
+// How a render target was created: the SceGxmRenderTargetParams the guest gave, kept in the
+// wrapper. A savestate records these so a load can make again a render target the session has
+// since destroyed. Measured (Borderlands 2, 30 cycles): the game makes a 512x512 target 46 s
+// after boot and destroys it 63 s later for good, so every state taken in that minute names a
+// render target the session lacks once it is gone; the load 130 ms after the destroy was refused.
+struct RenderTargetIdentity {
+    Address address = 0;
+    SceGxmRenderTargetParams params{};
+};
+std::vector<RenderTargetIdentity> capture_render_target_identities(GxmState &gxm, const MemState &mem);
+
+// Recreate render targets the state has and the session lacks, at their addresses, after the
+// memory restore (their wrappers' bytes are back; the renderer pointer in them belongs to the
+// saved session and is not trusted). Backend objects are made on the backend directly, because
+// the render thread is parked for the whole load: see renderer::create_render_target_while_parked,
+// which refuses on OpenGL. Returns why on failure.
+std::string recreate_render_targets(GxmState &gxm, const MemState &mem, renderer::State &renderer, const std::vector<RenderTargetIdentity> &missing, uint32_t &recreated);
+std::string rollback_to_layout(GxmState &gxm, const MemState &mem, renderer::State &renderer, const HostObjectLayout &saved, RollbackCounts &out);
+
+// Whether the guest is between sceGxmBeginScene and sceGxmEndScene on its immediate context. The
+// renderer mirrors this once it has run everything submitted, so a savestate taken or loaded at
+// such a moment leaves the renderer recording a scene the restored guest knows nothing about.
+bool scene_in_progress(GxmState &gxm, const MemState &mem);
+
 // Color.
 SceGxmColorBaseFormat get_base_format(SceGxmColorFormat src);
 size_t bits_per_pixel(SceGxmColorBaseFormat base_format);

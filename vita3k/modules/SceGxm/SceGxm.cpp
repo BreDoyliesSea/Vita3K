@@ -19,6 +19,7 @@
 
 #include <modules/module_parent.h>
 
+#include <new>
 #include <span>
 #include <stack>
 #if defined(__x86_64__) && !defined(__APPLE__)
@@ -46,6 +47,8 @@
 #include <util/log.h>
 
 #include <util/tracy.h>
+#include <algorithm>
+#include <tuple>
 TRACY_MODULE_NAME(SceGxm);
 
 template <>
@@ -893,6 +896,7 @@ std::string to_debug_str<SceGxmTransferFlags>(const MemState &mem, SceGxmTransfe
 }
 
 static void display_entry_thread(EmuEnvState &emuenv) {
+    logging::name_this_thread("gxm display queue");
     auto &display_queue = emuenv.gxm.display_queue;
     const Address callback_address = emuenv.gxm.params.displayQueueCallback.address();
     const ThreadStatePtr display_thread = emuenv.kernel.get_thread(emuenv.gxm.display_queue_thread);
@@ -1359,7 +1363,12 @@ struct SceGxmRenderTarget {
     std::uint16_t height;
     std::uint16_t scenesPerFrame;
     SceUID driverMemBlock;
+    // Everything sceGxmCreateRenderTarget was given, so a savestate can record how this one was
+    // made and a load can make it again in a session that has since destroyed it.
+    SceGxmRenderTargetParams params;
 };
+
+
 
 static int destroy_gxm_render_target(EmuEnvState &emuenv, SceGxmRenderTarget *render_target, const Address render_target_addr, const bool force_backend_destroy) {
     if (!render_target) {
@@ -1427,6 +1436,304 @@ struct SceGxmShaderPatcher {
     SceGxmShaderPatcherParams params;
 };
 
+// See the declaration in gxm/functions.h. Defined here because SceGxmContext and
+// SceGxmRenderTarget are only complete in this translation unit.
+void gxm::collect_host_owned_ranges(GxmState &gxm, const MemState &mem,
+    std::vector<std::pair<Address, uint32_t>> &out) {
+    {
+        const std::lock_guard<std::mutex> lock(gxm.sync_objects_mutex);
+        for (SceGxmSyncObject *sync_object : gxm.sync_objects) {
+            if (!sync_object)
+                continue;
+            out.emplace_back(Ptr<SceGxmSyncObject>(sync_object, mem).address(),
+                static_cast<uint32_t>(sizeof(SceGxmSyncObject)));
+        }
+    }
+
+    // A context is preserved only from its host members onward. Everything before that is
+    // GxmContextState -- the surfaces, viewports, vertex streams and uniform buffer pointers the
+    // guest set -- and those are guest addresses that the load moves. Preserving them whole meant
+    // the first draw after a load followed a uniform buffer pointer into memory that had been
+    // rewound out from under it, and faulted in gxmSetUniformBuffers. They have to come back with
+    // the rest of guest memory; the guest sets them again every frame anyway.
+    const auto preserve_context_tail = [&](Address address) {
+        const SceGxmContext *context = Ptr<SceGxmContext>(address).get(mem);
+        if (!context) {
+            out.emplace_back(address, static_cast<uint32_t>(sizeof(SceGxmContext)));
+            return;
+        }
+        // Taken from the live object rather than offsetof, which is only conditionally supported
+        // on a type like this one.
+        const auto host_offset = static_cast<uint32_t>(
+            reinterpret_cast<const char *>(&context->renderer) - reinterpret_cast<const char *>(context));
+        out.emplace_back(address + host_offset, static_cast<uint32_t>(sizeof(SceGxmContext)) - host_offset);
+    };
+
+    for (const auto &[_, address] : gxm.immediate_contexts)
+        preserve_context_tail(address);
+    for (const auto &[_, address] : gxm.deferred_contexts)
+        preserve_context_tail(address);
+
+    // An immediate context's commands live in guest memory as well: allocate_new_command
+    // constructs each renderer::Command inside the VDM ring buffer the guest gave
+    // sceGxmCreateContext. A command is all host state -- an opcode, a next pointer, pointers to
+    // payloads the host allocated -- and the allocator's positions are host members in the context
+    // tail kept above. Restoring the slots while keeping the positions puts commands from the moment
+    // of the save back under a live command list. On Project DIVA f that was a batch starting with
+    // a Draw that no scene had begun ("already recording" after about a third of loads) and heap
+    // corruption in cmd_handle_set_context, which frees a SetContext's payload.
+    for (const auto &[_, address] : gxm.immediate_contexts) {
+        const SceGxmContext *const context = Ptr<SceGxmContext>(address).get(mem);
+        if (context && context->alloc_space && context->command_allocator_size > 0)
+            out.emplace_back(context->alloc_space.address(),
+                static_cast<uint32_t>(context->command_allocator_size * sizeof(renderer::Command)));
+    }
+
+    // A render target is host-owned all the way through: a unique_ptr and four values the guest
+    // gave us once at creation and never revisits.
+    for (const auto &[_, address] : gxm.render_targets)
+        out.emplace_back(address, static_cast<uint32_t>(sizeof(SceGxmRenderTarget)));
+
+    // And the shader patchers, with every program they have handed out. A patcher is two
+    // std::maps; a program is a unique_ptr to a compiled renderer program plus, for vertex
+    // programs, two std::vectors. Restoring their bytes from another process installs that
+    // process's pointers, and the first draw after the load dereferences one -- measured as a
+    // fault in gxmSetUniformBuffers reading uniform_buffer_sizes through a stale renderer_data.
+    {
+        const std::lock_guard<std::mutex> lock(gxm.shader_patcher_mutex);
+        for (const Address address : gxm.shader_patchers) {
+            SceGxmShaderPatcher *patcher = Ptr<SceGxmShaderPatcher>(address).get(mem);
+            if (!patcher)
+                continue;
+            out.emplace_back(address, static_cast<uint32_t>(sizeof(SceGxmShaderPatcher)));
+            for (const auto &[_, program] : patcher->vertex_program_cache) {
+                if (program)
+                    out.emplace_back(program.address(), static_cast<uint32_t>(sizeof(SceGxmVertexProgram)));
+            }
+            for (const auto &[_, program] : patcher->fragment_program_cache) {
+                if (program)
+                    out.emplace_back(program.address(), static_cast<uint32_t>(sizeof(SceGxmFragmentProgram)));
+            }
+        }
+    }
+}
+
+gxm::HostObjectLayout gxm::capture_layout(GxmState &gxm, const MemState &mem) {
+    HostObjectLayout layout;
+    for (const auto &[_, address] : gxm.immediate_contexts)
+        layout.contexts.push_back(address);
+    for (const auto &[_, address] : gxm.deferred_contexts)
+        layout.contexts.push_back(address);
+    for (const auto &[_, address] : gxm.render_targets)
+        layout.render_targets.push_back(address);
+    {
+        const std::lock_guard<std::mutex> lock(gxm.sync_objects_mutex);
+        for (SceGxmSyncObject *sync_object : gxm.sync_objects) {
+            if (sync_object)
+                layout.sync_objects.push_back(Ptr<SceGxmSyncObject>(sync_object, mem).address());
+        }
+    }
+    {
+        const std::lock_guard<std::mutex> lock(gxm.shader_patcher_mutex);
+        for (const Address address : gxm.shader_patchers) {
+            layout.shader_patchers.push_back(address);
+            const SceGxmShaderPatcher *patcher = Ptr<SceGxmShaderPatcher>(address).get(mem);
+            if (!patcher)
+                continue;
+            for (const auto &[_, program] : patcher->vertex_program_cache) {
+                if (program)
+                    layout.vertex_programs.push_back(program.address());
+            }
+            for (const auto &[_, program] : patcher->fragment_program_cache) {
+                if (program)
+                    layout.fragment_programs.push_back(program.address());
+            }
+        }
+    }
+    for (auto *list : { &layout.contexts, &layout.render_targets, &layout.sync_objects, &layout.shader_patchers,
+             &layout.vertex_programs, &layout.fragment_programs })
+        std::sort(list->begin(), list->end());
+    return layout;
+}
+
+std::string gxm::rollback_to_layout(GxmState &gxm, const MemState &mem, renderer::State &renderer, const HostObjectLayout &saved, RollbackCounts &out) {
+    const HostObjectLayout live = capture_layout(gxm, mem);
+    const auto extras = [](const std::vector<Address> &saved_list, const std::vector<Address> &live_list) {
+        std::vector<Address> result;
+        for (const Address address : live_list) {
+            if (!std::binary_search(saved_list.begin(), saved_list.end(), address))
+                result.push_back(address);
+        }
+        return result;
+    };
+
+    // Decided before anything is touched.
+    const std::vector<Address> extra_contexts = extras(saved.contexts, live.contexts);
+    if (!extra_contexts.empty()) {
+        return fmt::format("{} context(s) were created after the state was taken, and those cannot be destroyed while the render thread is parked",
+            extra_contexts.size());
+    }
+    const std::vector<Address> extra_render_targets = extras(saved.render_targets, live.render_targets);
+
+    const std::vector<Address> extra_vertex = extras(saved.vertex_programs, live.vertex_programs);
+    const std::vector<Address> extra_fragment = extras(saved.fragment_programs, live.fragment_programs);
+    const std::vector<Address> extra_patchers = extras(saved.shader_patchers, live.shader_patchers);
+    const std::vector<Address> extra_sync = extras(saved.sync_objects, live.sync_objects);
+
+    {
+        const std::lock_guard<std::mutex> lock(gxm.shader_patcher_mutex);
+        // Programs first, while the patcher that caches them is still whole. The same steps as
+        // sceGxmShaderPatcherRelease{Vertex,Fragment}Program minus the guest's free callback.
+        for (const Address address : extra_vertex) {
+            SceGxmVertexProgram *const vp = Ptr<SceGxmVertexProgram>(address).get(mem);
+            while (vp->compile_threads_on.load(std::memory_order_acquire) > 0)
+                std::this_thread::yield();
+            for (const Address patcher_address : gxm.shader_patchers) {
+                SceGxmShaderPatcher *const patcher = Ptr<SceGxmShaderPatcher>(patcher_address).get(mem);
+                if (!patcher)
+                    continue;
+                for (auto it = patcher->vertex_program_cache.begin(); it != patcher->vertex_program_cache.end(); ++it) {
+                    if (it->second.address() == address) {
+                        patcher->vertex_program_cache.erase(it);
+                        break;
+                    }
+                }
+            }
+            vp->~SceGxmVertexProgram();
+            out.vertex_programs++;
+        }
+        for (const Address address : extra_fragment) {
+            SceGxmFragmentProgram *const fp = Ptr<SceGxmFragmentProgram>(address).get(mem);
+            while (fp->compile_threads_on.load(std::memory_order_acquire) > 0)
+                std::this_thread::yield();
+            for (const Address patcher_address : gxm.shader_patchers) {
+                SceGxmShaderPatcher *const patcher = Ptr<SceGxmShaderPatcher>(patcher_address).get(mem);
+                if (!patcher)
+                    continue;
+                for (auto it = patcher->fragment_program_cache.begin(); it != patcher->fragment_program_cache.end(); ++it) {
+                    if (it->second.address() == address) {
+                        patcher->fragment_program_cache.erase(it);
+                        break;
+                    }
+                }
+            }
+            fp->~SceGxmFragmentProgram();
+            out.fragment_programs++;
+        }
+        for (const Address address : extra_patchers) {
+            SceGxmShaderPatcher *const patcher = Ptr<SceGxmShaderPatcher>(address).get(mem);
+            if (patcher)
+                patcher->~SceGxmShaderPatcher();
+            gxm.shader_patchers.erase(address);
+            std::erase_if(gxm.mask_update_programs, [&](const auto &entry) { return entry.second == address; });
+            out.shader_patchers++;
+        }
+    }
+    {
+        // The registry entry only. A sync object's host members are a mutex and a condition
+        // variable, which own nothing, and a guest thread still parked on one is released by the
+        // load's restart before the bytes are overwritten.
+        const std::lock_guard<std::mutex> lock(gxm.sync_objects_mutex);
+        for (const Address address : extra_sync) {
+            gxm.sync_objects.erase(Ptr<SceGxmSyncObject>(address).get(mem));
+            out.sync_objects++;
+        }
+    }
+    // Render targets. The backend object goes the way sceGxmDestroyRenderTarget sends it, but on
+    // the backend directly, since the render thread is parked (Vulkan queues its images and
+    // fences for a deferred destroy; the thread that would drain that queue is the parked one,
+    // and picks it up when it resumes). Every context that still points at it forgets it first,
+    // so nothing dangles until the guest's next sceGxmBeginScene sets a target again. The
+    // wrapper leaves the registry; its guest memory is left to the restore, like the programs.
+    for (const Address address : extra_render_targets) {
+        SceGxmRenderTarget *const rt = Ptr<SceGxmRenderTarget>(address).get(mem);
+        if (!rt)
+            continue;
+        for (const Address context_address : live.contexts) {
+            SceGxmContext *const context = Ptr<SceGxmContext>(context_address).get(mem);
+            if (context && context->renderer)
+                renderer::forget_render_target(renderer, *context->renderer, rt->renderer.get());
+        }
+        renderer::destroy_render_target_while_parked(renderer, rt->renderer);
+        gxm.render_targets.erase(rt);
+        out.render_targets++;
+    }
+    return {};
+}
+
+std::vector<gxm::RenderTargetIdentity> gxm::capture_render_target_identities(GxmState &gxm, const MemState &mem) {
+    std::vector<RenderTargetIdentity> out;
+    for (const auto &[rt, address] : gxm.render_targets) {
+        if (rt)
+            out.push_back({ address, rt->params });
+    }
+    std::sort(out.begin(), out.end(), [](const RenderTargetIdentity &a, const RenderTargetIdentity &b) { return a.address < b.address; });
+    return out;
+}
+
+std::string gxm::recreate_render_targets(GxmState &gxm, const MemState &mem, renderer::State &renderer, const std::vector<RenderTargetIdentity> &missing, uint32_t &recreated) {
+    for (const RenderTargetIdentity &identity : missing) {
+        SceGxmRenderTarget *const rt = Ptr<SceGxmRenderTarget>(identity.address).get(mem);
+        if (!rt)
+            return fmt::format("render target {} is not in mapped memory", log_hex(identity.address));
+        // The restore put the saved session's bytes here, a renderer pointer that session owned
+        // among them. A fresh wrapper over them, then the same steps as sceGxmCreateRenderTarget.
+        new (rt) SceGxmRenderTarget{};
+        if (!renderer::create_render_target_while_parked(renderer, rt->renderer, &identity.params))
+            return fmt::format("render target {} ({}x{}) cannot be made while the render thread is parked on this backend", log_hex(identity.address), identity.params.width, identity.params.height);
+        rt->width = identity.params.width;
+        rt->height = identity.params.height;
+        rt->scenesPerFrame = identity.params.scenesPerFrame;
+        rt->driverMemBlock = identity.params.driverMemBlock;
+        rt->params = identity.params;
+        gxm.render_targets.emplace(rt, identity.address);
+        recreated++;
+    }
+    return {};
+}
+
+bool gxm::scene_in_progress(GxmState &gxm, const MemState &mem) {
+    // Any of them: a scene on one immediate context is as much a reason to wait as a scene on
+    // another (a game can hold several since upstream's multiple immediate contexts).
+    for (const auto &[_, address] : gxm.immediate_contexts) {
+        const SceGxmContext *const context = Ptr<const SceGxmContext>(address).get(mem);
+        if (context && context->state.active)
+            return true;
+    }
+    return false;
+}
+
+std::string gxm::check_layout(GxmState &gxm, const MemState &mem, const HostObjectLayout &saved, const bool render_targets_handled, const bool programs_handled) {
+    const HostObjectLayout live = capture_layout(gxm, mem);
+    const auto check = [](const char *kind, const std::vector<Address> &saved_list, const std::vector<Address> &live_list) -> std::string {
+        for (const Address address : saved_list) {
+            if (!std::binary_search(live_list.begin(), live_list.end(), address)) {
+                return fmt::format("the state has a {} at {}, and this session has none there ({} {}(s) here, first at {})",
+                    kind, log_hex(address), live_list.size(), kind, live_list.empty() ? std::string("-") : log_hex(live_list.front()));
+            }
+        }
+        return {};
+    };
+    for (const auto &[kind, saved_list, live_list] : {
+             std::tuple{ "context", &saved.contexts, &live.contexts },
+             std::tuple{ "render target", &saved.render_targets, &live.render_targets },
+             std::tuple{ "sync object", &saved.sync_objects, &live.sync_objects },
+             std::tuple{ "shader patcher", &saved.shader_patchers, &live.shader_patchers },
+             std::tuple{ "vertex program", &saved.vertex_programs, &live.vertex_programs },
+             std::tuple{ "fragment program", &saved.fragment_programs, &live.fragment_programs } }) {
+        // Missing render targets are the caller's, when it has what it takes to make them again.
+        if (render_targets_handled && saved_list == &saved.render_targets)
+            continue;
+        // And the same for programs, from GXPG.
+        if (programs_handled && (saved_list == &saved.vertex_programs || saved_list == &saved.fragment_programs))
+            continue;
+        std::string why = check(kind, *saved_list, *live_list);
+        if (!why.empty())
+            return why;
+    }
+    return {};
+}
+
 // clang-format off
 static const size_t size_mask_gxp = 228;
 static const uint8_t mask_gxp[] = {
@@ -1481,6 +1788,155 @@ static bool operator<(const FragmentProgramCacheKey &a, const FragmentProgramCac
         return false;
     }
     return b.blend_info < a.blend_info;
+}
+
+// See the declarations in gxm/functions.h. Here because SceGxmShaderPatcher and the cache keys are
+// only complete in this translation unit.
+static const SceGxmBlendInfo savestate_default_blend_info = {
+    SCE_GXM_COLOR_MASK_ALL,
+    SCE_GXM_BLEND_FUNC_NONE,
+    SCE_GXM_BLEND_FUNC_NONE,
+    SCE_GXM_BLEND_FACTOR_ONE,
+    SCE_GXM_BLEND_FACTOR_ZERO,
+    SCE_GXM_BLEND_FACTOR_ONE,
+    SCE_GXM_BLEND_FACTOR_ZERO
+};
+
+std::vector<gxm::ProgramIdentity> gxm::capture_program_identities(GxmState &gxm, const MemState &mem) {
+    std::vector<ProgramIdentity> out;
+    const std::lock_guard<std::mutex> lock(gxm.shader_patcher_mutex);
+    for (const Address patcher_address : gxm.shader_patchers) {
+        const SceGxmShaderPatcher *const patcher = Ptr<SceGxmShaderPatcher>(patcher_address).get(mem);
+        if (!patcher)
+            continue;
+        for (const auto &[key, program] : patcher->vertex_program_cache) {
+            const SceGxmVertexProgram *const vp = program.get(mem);
+            if (!vp)
+                continue;
+            ProgramIdentity identity;
+            identity.address = program.address();
+            identity.patcher = patcher_address;
+            identity.program = key.vertex_program.program.address();
+            identity.reference_count = vp->reference_count.load(std::memory_order_relaxed);
+            identity.key_hash = key.hash;
+            identity.streams = vp->streams;
+            identity.attributes = vp->attributes;
+            out.push_back(std::move(identity));
+        }
+        for (const auto &[key, program] : patcher->fragment_program_cache) {
+            const SceGxmFragmentProgram *const fp = program.get(mem);
+            if (!fp)
+                continue;
+            ProgramIdentity identity;
+            identity.address = program.address();
+            identity.patcher = patcher_address;
+            identity.program = key.fragment_program.program.address();
+            identity.fragment = true;
+            identity.reference_count = fp->reference_count.load(std::memory_order_relaxed);
+            identity.has_blend_info = memcmp(&key.blend_info, &savestate_default_blend_info, sizeof(SceGxmBlendInfo)) != 0;
+            identity.blend_info = key.blend_info;
+            out.push_back(std::move(identity));
+        }
+    }
+    return out;
+}
+
+std::string gxm::recreate_programs(GxmState &gxm, const MemState &mem, renderer::State &renderer, const std::vector<ProgramIdentity> &missing, uint32_t &recreated) {
+    const std::lock_guard<std::mutex> lock(gxm.shader_patcher_mutex);
+    for (const ProgramIdentity &identity : missing) {
+        SceGxmShaderPatcher *const patcher = Ptr<SceGxmShaderPatcher>(identity.patcher).get(mem);
+        if (!patcher)
+            return fmt::format("the shader patcher {} that made program {} is not in mapped memory", log_hex(identity.patcher), log_hex(identity.address));
+        const SceGxmProgram *const program = Ptr<const SceGxmProgram>(identity.program).get(mem);
+        if (!program)
+            return fmt::format("the shader program {} behind {} is not in mapped memory", log_hex(identity.program), log_hex(identity.address));
+
+        if (identity.fragment) {
+            SceGxmFragmentProgram *const fp = Ptr<SceGxmFragmentProgram>(identity.address).get(mem);
+            if (!fp)
+                return fmt::format("fragment program {} is not in mapped memory", log_hex(identity.address));
+            // A fresh wrapper over the restored bytes, then the same steps as
+            // sceGxmShaderPatcherCreateFragmentProgram.
+            new (fp) SceGxmFragmentProgram{};
+            fp->is_maskupdate = false;
+            fp->program = Ptr<const SceGxmProgram>(identity.program);
+            if (!renderer::create(fp->renderer_data, renderer, *program, identity.has_blend_info ? &identity.blend_info : nullptr, renderer.gxp_ptr_map))
+                return fmt::format("fragment program {} cannot be made again", log_hex(identity.address));
+            fp->reference_count = identity.reference_count;
+            patcher->fragment_program_cache.emplace(
+                FragmentProgramCacheKey{ SceGxmRegisteredProgram{ Ptr<const SceGxmProgram>(identity.program) }, identity.blend_info },
+                Ptr<SceGxmFragmentProgram>(identity.address));
+        } else {
+            SceGxmVertexProgram *const vp = Ptr<SceGxmVertexProgram>(identity.address).get(mem);
+            if (!vp)
+                return fmt::format("vertex program {} is not in mapped memory", log_hex(identity.address));
+            new (vp) SceGxmVertexProgram{};
+            vp->program = Ptr<const SceGxmProgram>(identity.program);
+            vp->key_hash = identity.key_hash;
+            vp->streams = identity.streams;
+            vp->attributes = identity.attributes;
+            if (!renderer::create(vp->renderer_data, renderer, *program, renderer.gxp_ptr_map, vp->attributes))
+                return fmt::format("vertex program {} cannot be made again", log_hex(identity.address));
+            vp->reference_count = identity.reference_count;
+            patcher->vertex_program_cache.emplace(
+                VertexProgramCacheKey{ SceGxmRegisteredProgram{ Ptr<const SceGxmProgram>(identity.program) }, static_cast<VertexCacheHash>(identity.key_hash) },
+                Ptr<SceGxmVertexProgram>(identity.address));
+        }
+        recreated++;
+    }
+    return {};
+}
+
+std::vector<gxm::MaskProgramIdentity> gxm::capture_mask_programs(GxmState &gxm) {
+    std::vector<MaskProgramIdentity> out;
+    const std::lock_guard<std::mutex> lock(gxm.shader_patcher_mutex);
+    for (const auto &[address, patcher] : gxm.mask_update_programs) {
+        MaskProgramIdentity identity;
+        identity.address = address;
+        identity.patcher = patcher;
+        out.push_back(identity);
+    }
+    return out;
+}
+
+uint32_t gxm::destroy_mask_programs(GxmState &gxm, const MemState &mem) {
+    const std::lock_guard<std::mutex> lock(gxm.shader_patcher_mutex);
+    uint32_t destroyed = 0;
+    for (const auto &[address, _] : gxm.mask_update_programs) {
+        SceGxmFragmentProgram *const fp = Ptr<SceGxmFragmentProgram>(address).get(mem);
+        if (!fp)
+            continue;
+        while (fp->compile_threads_on.load(std::memory_order_acquire) > 0)
+            std::this_thread::yield();
+        fp->~SceGxmFragmentProgram();
+        destroyed++;
+    }
+    gxm.mask_update_programs.clear();
+    return destroyed;
+}
+
+std::string gxm::recreate_mask_programs(GxmState &gxm, const MemState &mem, renderer::State &renderer, const std::vector<MaskProgramIdentity> &saved, uint32_t &recreated) {
+    const std::lock_guard<std::mutex> lock(gxm.shader_patcher_mutex);
+    for (const MaskProgramIdentity &identity : saved) {
+        SceGxmFragmentProgram *const fp = Ptr<SceGxmFragmentProgram>(identity.address).get(mem);
+        if (!fp)
+            return fmt::format("mask update program {} is not in mapped memory", log_hex(identity.address));
+        // The program pointer comes back with the restored bytes, as the guest's copy of mask_gxp.
+        const Ptr<const SceGxmProgram> program_ptr = fp->program;
+        const uint32_t reference_count = fp->reference_count.load(std::memory_order_relaxed);
+        const SceGxmProgram *const program = program_ptr.get(mem);
+        if (!program)
+            return fmt::format("the shader program behind mask update program {} is not in mapped memory", log_hex(identity.address));
+        new (fp) SceGxmFragmentProgram{};
+        fp->is_maskupdate = true;
+        fp->program = program_ptr;
+        fp->reference_count = reference_count;
+        if (!renderer::create(fp->renderer_data, renderer, *program, nullptr, renderer.gxp_ptr_map))
+            return fmt::format("mask update program {} cannot be made again", log_hex(identity.address));
+        gxm.mask_update_programs[identity.address] = identity.patcher;
+        recreated++;
+    }
+    return {};
 }
 
 static int init_texture_base(const char *export_name, SceGxmTexture *texture, Ptr<const void> data, SceGxmTextureFormat tex_format, uint32_t width, uint32_t height, uint32_t mipCount,
@@ -2081,6 +2537,7 @@ EXPORT(int, sceGxmCreateRenderTarget, const SceGxmRenderTargetParams *params, Pt
     rt->height = params->height;
     rt->scenesPerFrame = params->scenesPerFrame;
     rt->driverMemBlock = params->driverMemBlock;
+    rt->params = *params;
     emuenv.gxm.render_targets.emplace(rt, renderTarget->address());
 
     return 0;
@@ -2243,6 +2700,47 @@ EXPORT(int, sceGxmDisplayQueueAddEntry, Ptr<SceGxmSyncObject> oldBuffer, Ptr<Sce
     if (!oldBuffer || !newBuffer)
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
 
+    // A savestate holds the display queue empty while it stops the guest, because the empty moment
+    // is otherwise the same moment this call is released in: pop() notifies one condition variable,
+    // which wakes both the savestate waiting for the gap and the frame waiting for the slot, and
+    // when a game keeps its queue full the frame usually wins. Measured on Gravity Rush, where the
+    // queue is occupied nearly all the time: 289 of 289 quickload attempts found an entry again
+    // 24-38 ms after catching it empty, and 3 loads in 10 gave up after 60 attempts.
+    //
+    // The wait for a free slot belongs here, at the top, rather than inside push() further down.
+    // Past this point the call has allocated the callback data and moved both sync objects'
+    // timestamps on, and a load can only put a thread back at the *start* of the call it is parked
+    // in, which would move them a second time; stopped here it has done nothing yet. It is also the
+    // only placement a hold can act on - a thread already blocked in push() is past every gate, and
+    // is woken by the very pop() that hands the savestate its gap. Measured: gating the top alone,
+    // while push() still blocked, left 258 of 295 attempts finding an entry again, no better than
+    // the 289 before it. The pacing the guest sees is unchanged: it waits for the same slot, a few
+    // microseconds earlier in the same call.
+    {
+        const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
+        auto *const queue = &emuenv.gxm.display_queue;
+
+        const auto abandoned = [&]() { return emuenv.gxm.savestate_abandon.load(); };
+
+        // Frame pacing, as push() did it: block for a free slot, reporting nothing. This runs every
+        // frame, and a status change on every frame would make every pause wait for it.
+        queue->wait_for_space(abandoned);
+
+        // A hold is different: it is kept while the guest is stopped, so a thread waiting on one
+        // has to say it is waiting, or the quiesce waits out a thread that cannot move.
+        if (queue->is_held()) {
+            thread->begin_host_wait();
+            queue->wait_while_held(abandoned);
+            thread->end_host_wait();
+        }
+
+        // Taken out of either wait by a savestate load: its registers are about to be replaced, so
+        // the call must not go on. Queued now, the entry would outlive the load, and the display
+        // thread would free callback data that the load has handed to the state's own allocations.
+        if (abandoned())
+            return 0;
+    }
+
     const Address address = alloc(emuenv.mem, emuenv.gxm.params.displayQueueCallbackDataSize, __FUNCTION__);
     const Ptr<void> ptr(address);
     memcpy(ptr.get(emuenv.mem), callbackData.get(emuenv.mem), emuenv.gxm.params.displayQueueCallbackDataSize);
@@ -2282,9 +2780,25 @@ EXPORT(int, sceGxmDisplayQueueAddEntry, Ptr<SceGxmSyncObject> oldBuffer, Ptr<Sce
 
     renderer::send_single_command(*emuenv.renderer, nullptr, renderer::CommandOpcode::NewFrame, false, frame, &emuenv.display, active_renderer_context);
 
-    if (emuenv.gxm.params.displayQueueMaxPendingCount == 1)
-        // double buffering, not handled by the queue configuration
-        emuenv.gxm.display_queue.wait_empty();
+    if (emuenv.gxm.params.displayQueueMaxPendingCount == 1) {
+        // Double buffering, not handled by the queue configuration: the guest waits here for the
+        // frame it has just queued to be taken. Say that it is waiting. A thread blocked here used
+        // to report that it was running, and that costs twice over. A savestate pause waits it out
+        // and gives up -- "8390B5B0 UnityGfxDeviceWorker would not stop", 97 times in one Oddworld
+        // session, every quicksave after the first load refused. And when a pause does land on it,
+        // it is suspended *inside* this host call, which a snapshot cannot describe: the load then
+        // restores its guest context underneath a live host frame, and the thread faulted reading
+        // 0x8FCD1940 a quarter of a second after the load, taking the process with it.
+        //
+        // Not restartable, unlike the wait at the top of this call. By here the entry is pushed and
+        // both sync objects' timestamps have moved on, so making the call again would move them a
+        // second time. A save refuses, retryably, while a thread sits here -- which is the point:
+        // this is a moment no state can describe, and refusing it costs a frame.
+        const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
+        thread->begin_host_wait();
+        emuenv.gxm.display_queue.wait_empty_or_abandoned([&]() { return emuenv.gxm.savestate_abandon.load(); });
+        thread->end_host_wait();
+    }
 
     return 0;
 }
@@ -2879,6 +3393,12 @@ EXPORT(int, sceGxmInitialize, const SceGxmInitializeParams *params) {
     }
 
     emuenv.gxm.params = *params;
+    // Worth having in the log. This governs how the guest is paced between frames, which is what
+    // a savestate needs to know: at 1 the game is double buffered and sceGxmDisplayQueueAddEntry
+    // blocks on wait_empty(); above that the pacing comes from the queue filling up and push()
+    // blocking. Disgaea 3 reports 2, which ruled out a theory that it was vblank-paced.
+    LOG_INFO("GXM init: displayQueueMaxPendingCount={} callbackDataSize={}",
+        params->displayQueueMaxPendingCount, params->displayQueueCallbackDataSize);
     // hack, limit the number of frame rendering at the same time to at most 3
     // also, the last frame won't be in the queue so decrease the count by 1
     // the case where displayQueueMaxPendingCount is 1 handled in sceGxmDisplayQueueAddEntry
@@ -3016,7 +3536,13 @@ EXPORT(int, sceGxmNotificationWait, const SceGxmNotification *notification) {
 
     std::unique_lock<std::mutex> lock(emuenv.renderer->notification_mutex);
     if (*value != target_value) {
-        emuenv.renderer->notification_ready.wait(lock, [&]() { return *value == target_value || emuenv.display.abort.load(); });
+        // Say so while waiting, so a pause doesn't wait for a thread that cannot move
+        const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
+        thread->begin_host_wait();
+        emuenv.renderer->notification_ready.wait(lock, [&]() {
+            return *value == target_value || emuenv.display.abort.load() || emuenv.gxm.savestate_abandon.load();
+        });
+        thread->end_host_wait();
     }
 
     return 0;
@@ -4543,6 +5069,10 @@ EXPORT(int, sceGxmShaderPatcherCreate, const SceGxmShaderPatcherParams *params, 
         return RET_ERROR(SCE_GXM_ERROR_OUT_OF_MEMORY);
     }
     shaderPatcher->get(emuenv.mem)->params = *params;
+    {
+        const std::lock_guard<std::mutex> lock(emuenv.gxm.shader_patcher_mutex);
+        emuenv.gxm.shader_patchers.insert(shaderPatcher->address());
+    }
     return 0;
 }
 
@@ -4614,6 +5144,10 @@ EXPORT(int, sceGxmShaderPatcherCreateMaskUpdateFragmentProgram, SceGxmShaderPatc
         return RET_ERROR(SCE_GXM_ERROR_DRIVER);
     }
 
+    {
+        const std::lock_guard<std::mutex> lock(emuenv.gxm.shader_patcher_mutex);
+        emuenv.gxm.mask_update_programs[fragmentProgram->address()] = Ptr<SceGxmShaderPatcher>(shaderPatcher, mem).address();
+    }
     return 0;
 }
 
@@ -4676,6 +5210,11 @@ EXPORT(int, sceGxmShaderPatcherDestroy, Ptr<SceGxmShaderPatcher> shaderPatcher) 
     if (!shaderPatcher)
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
 
+    {
+        const std::lock_guard<std::mutex> lock(emuenv.gxm.shader_patcher_mutex);
+        emuenv.gxm.shader_patchers.erase(shaderPatcher.address());
+        std::erase_if(emuenv.gxm.mask_update_programs, [&](const auto &entry) { return entry.second == shaderPatcher.address(); });
+    }
     free_callbacked(emuenv, thread_id, shaderPatcher.get(emuenv.mem), shaderPatcher);
 
     return 0;
@@ -4814,6 +5353,10 @@ EXPORT(int, sceGxmShaderPatcherReleaseFragmentProgram, SceGxmShaderPatcher *shad
                 shaderPatcher->fragment_program_cache.erase(it);
                 break;
             }
+        }
+        if (fp->is_maskupdate) {
+            const std::lock_guard<std::mutex> lock(emuenv.gxm.shader_patcher_mutex);
+            emuenv.gxm.mask_update_programs.erase(fragmentProgram.address());
         }
         free_callbacked(emuenv, thread_id, shaderPatcher, fragmentProgram);
     }

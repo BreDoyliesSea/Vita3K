@@ -21,7 +21,11 @@
 #include <mem/ptr.h>
 #include <threads/queue.h>
 
+#include <atomic>
+#include <chrono>
 #include <map>
+#include <set>
+#include <condition_variable>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
@@ -59,6 +63,9 @@ struct GxmState {
 
     Queue<DisplayCallback> display_queue;
     SceUID display_queue_thread;
+    // Set by a savestate load to take threads out of the display queue and notification waits, so
+    // they return to their gate and make the call again from the state
+    std::atomic<bool> savestate_abandon{ false };
     std::thread display_host_thread;
 
     // global timestamp used by sync objects
@@ -77,6 +84,15 @@ struct GxmState {
     Address last_immediate_context = 0;
     std::unordered_map<SceGxmContext *, Address> deferred_contexts;
     std::unordered_map<SceGxmRenderTarget *, Address> render_targets;
+    // Shader patchers, by guest address. A patcher and every program it creates are host objects
+    // -- std::maps, std::vectors, unique_ptrs to renderer objects -- constructed into guest
+    // memory, so a savestate load has to leave their bytes alone. Nothing else needed to know
+    // where they were until then. See gxm::collect_host_owned_ranges.
+    std::mutex shader_patcher_mutex;
+    std::set<Address> shader_patchers;
+    // Mask-update fragment programs, which no patcher caches: program -> the patcher that made it.
+    std::map<Address, Address> mask_update_programs;
+
 
     void deinit() {
         if (display_host_thread.joinable())
