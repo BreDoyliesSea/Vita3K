@@ -56,8 +56,11 @@
 #include <config/settings.h>
 #include <config/state.h>
 #include <config/version.h>
+#include <cpu/functions.h>
+#include <nids/functions.h>
 #include <ctrl/functions.h>
 #include <display/state.h>
+#include <gxm/functions.h>
 #include <gxm/state.h>
 #include <interface.h>
 #include <io/state.h>
@@ -108,7 +111,15 @@
 #include <QWidgetAction>
 #include <QtResource>
 
+#include <algorithm>
+#include <chrono>
+#include <shared_mutex>
+#include <limits>
+#include <map>
 #include <optional>
+#include <string>
+#include <thread>
+#include <vector>
 
 #if defined(HAVE_X11) || defined(HAVE_WAYLAND)
 #include <qpa/qplatformnativeinterface.h>
@@ -163,6 +174,7 @@ MainWindow::MainWindow(EmuEnvState &emuenv,
 }
 
 MainWindow::~MainWindow() {
+    stop_savestate_task();
     shutdown_discord();
 }
 
@@ -1051,6 +1063,15 @@ std::optional<AppLaunchRequest> MainWindow::boot_game_once(const AppLaunchReques
     connect(m_kb_filter, &CtrlKeyboardFilter::exit_requested,
         m_game_window, &QWindow::close, Qt::QueuedConnection);
 
+    connect(m_kb_filter, &CtrlKeyboardFilter::quicksave_requested,
+        this, [this]() { on_quicksave_triggered(); });
+
+    connect(m_kb_filter, &CtrlKeyboardFilter::quickload_requested,
+        this, [this]() { on_quickload_triggered(); });
+
+    connect(m_kb_filter, &CtrlKeyboardFilter::thread_dump_requested,
+        this, [this]() { on_thread_dump_requested(); });
+
     if (auto next_request = take_pending_app_launch_request()) {
         on_game_closed();
         return next_request;
@@ -1075,6 +1096,7 @@ void MainWindow::on_game_closed() {
     if (!m_game_window)
         return;
 
+    stop_savestate_task();
     LOG_INFO("Game closed: {}", emuenv.current_app_title);
 
     m_game_window->stop_ui_updates();
@@ -1372,6 +1394,417 @@ void MainWindow::on_pause_triggered() {
     const bool is_paused = m_app_session.is_paused();
     m_app_session.set_pause_reason(app::AppSessionPauseReason::User, !is_paused);
     refresh_emulation_actions();
+}
+
+// Let the renderer finish what it already has before a save or load. With the guest stopped nothing
+// new arrives. A batch left in the queue would run after a load against guest memory the load has
+// rewritten -- measured as a crash in the texture upload path on Disgaea 4's second load -- and
+// run_with_guest_quiesced refuses, retryably, if any are still there. And the GPU has to finish too:
+// the thread that waits for it writes notification values, sync timestamps and buffer syncs into
+// guest memory as work completes, and nothing stops it for a load. A write landing after the
+// restore overwrote the restored guest's GPU notification counter, measured as Gravity Rush falling
+// to 2 fps for good after a load. False if the GPU did not finish in time.
+static bool drain_renderer(renderer::State &renderer) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+    while (renderer.command_buffer_queue.size() > 0 && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    return renderer::wait_gpu_idle(renderer, 500);
+}
+
+// Quicksave and quickload both need the guest fully stopped. pause_threads() parks every
+// guest thread outside the JIT, which is exactly the quiescence a consistent snapshot needs.
+// A dedicated pause reason keeps this independent of the user's own pause, so taking a state
+// while already paused does not resume the game underneath them.
+bool MainWindow::run_with_guest_quiesced(const char *what, const std::function<savestate::Result()> &action) {
+    m_app_session.set_pause_reason(app::AppSessionPauseReason::Savestate, true);
+
+    // set_pause_reason only asks the threads to stop. Wait until they actually have: the load
+    // path rewrites every byte of guest memory, and a thread still inside a guest block or an
+    // HLE import while that happens is reading a heap that is changing under it. This was
+    // measured as an access violation on an unrelated guest thread microseconds before the
+    // restore finished, plus a second one in memmove just after.
+    savestate::Result result = savestate::Result::fail("did not run");
+    std::string blocker;
+    bool render_parked = false;
+    std::unique_lock<std::shared_timed_mutex> guest_memory;
+    if (!emuenv.kernel.wait_for_threads_paused(std::chrono::milliseconds(2000), &blocker)) {
+        result = savestate::Result::fail(fmt::format("thread {} would not stop", blocker));
+    } else if (!drain_renderer(*emuenv.renderer)) {
+        result = savestate::Result::retry("the GPU still has work in flight");
+    } else if (!(render_parked = emuenv.renderer->park_render_thread(std::chrono::milliseconds(2000)))) {
+        // Stopping the guest is not enough: the render thread is ours, not the guest's, and it
+        // reads guest memory continuously. Refuse rather than rewrite the heap under it.
+        result = savestate::Result::fail("the render thread would not stop");
+    } else if (const size_t batches = emuenv.renderer->command_buffer_queue.size(); batches > 0) {
+        // Work built against guest memory as it is now. A state saved with it in flight expects
+        // the renderer to finish it; a load would have it run against rewritten memory.
+        result = savestate::Result::retry(fmt::format("the renderer still has {} batch(es) queued", batches));
+    } else if (!(guest_memory = std::unique_lock<std::shared_timed_mutex>(
+                     emuenv.mem.savestate_lock, std::chrono::milliseconds(2000)))
+                    .owns_lock()) {
+        // And the HLE calls that read guest memory while their thread reports 'wait', which
+        // pause_threads() therefore never suspends. See MemState::savestate_lock.
+        result = savestate::Result::fail("guest memory is still in use by an HLE call");
+    } else {
+        try {
+            result = action();
+        } catch (const std::exception &e) {
+            result = savestate::Result::fail(e.what());
+        }
+    }
+    // Get what just happened onto disk before the guest is let go. A load that goes wrong takes
+    // the process with it a second or two later, and the async sink loses the last of the log.
+    logging::flush();
+
+    if (render_parked)
+        emuenv.renderer->unpark_render_thread();
+    m_app_session.set_pause_reason(app::AppSessionPauseReason::Savestate, false);
+
+    if (result) {
+        show_status_message(tr("%1 complete").arg(QString::fromUtf8(what)), 4000);
+        return true;
+    }
+
+    LOG_ERROR("{} failed: {}", what, result.reason);
+    show_status_message(tr("%1 failed: %2").arg(QString::fromUtf8(what), QString::fromStdString(result.reason)),
+        8000);
+    return false;
+}
+
+// Saving and loading run off the GUI thread: one attempt can take seconds, and a refused one is
+// retried up to 60 times, which kept the window from answering for minutes.
+void MainWindow::start_savestate_task(const char *what, void (MainWindow::*task)()) {
+    if (!m_game_window) {
+        statusBar()->showMessage(tr("%1: no game is running").arg(QString::fromUtf8(what)), 4000);
+        return;
+    }
+    if (m_savestate_busy.exchange(true)) {
+        statusBar()->showMessage(tr("%1: a quicksave or quickload is still running").arg(QString::fromUtf8(what)), 4000);
+        return;
+    }
+    if (m_savestate_thread.joinable())
+        m_savestate_thread.join();
+    m_savestate_cancel = false;
+    m_savestate_thread = std::thread([this, task] {
+        logging::name_this_thread("savestate");
+        (this->*task)();
+        m_savestate_busy = false;
+    });
+}
+
+// Lets the attempt in progress finish and starts no other. Called before the session is torn down.
+void MainWindow::stop_savestate_task() {
+    m_savestate_cancel = true;
+    if (m_savestate_thread.joinable())
+        m_savestate_thread.join();
+}
+
+void MainWindow::show_status_message(const QString &message, const int timeout) {
+    QMetaObject::invokeMethod(this, [this, message, timeout] { statusBar()->showMessage(message, timeout); }, Qt::QueuedConnection);
+}
+
+void MainWindow::on_thread_dump_requested() {
+    // A snapshot of what every guest thread is doing right now. Built for diagnosing a guest that
+    // has stopped making progress, where the useful question is not "which threads are waiting"
+    // -- that distribution looks normal even when nothing is advancing -- but "what is the one
+    // that is still running actually doing".
+    //
+    // Running threads get their PC sampled twice, because a thread spinning on a flag that will
+    // never be set and a thread making slow progress are indistinguishable from one sample. The PC
+    // of a running thread is only written back when the JIT returns, so an unchanged one does not
+    // mean the thread is stuck on that instruction: it can be anywhere in the code since.
+    if (!m_game_window) {
+        statusBar()->showMessage(tr("Thread dump: no game is running"), 4000);
+        return;
+    }
+    if (m_savestate_busy) {
+        statusBar()->showMessage(tr("Thread dump: a quicksave or quickload is running"), 4000);
+        return;
+    }
+
+    struct Sample {
+        SceUID id;
+        ThreadStatePtr thread;
+        std::string name;
+        ThreadStatus status;
+        uint32_t nid;
+        uint32_t args[3];
+        uint32_t pc, lr, sp;
+        std::string traceback;
+    };
+    std::vector<Sample> samples;
+    std::map<SceUID, uint32_t> first_pc;
+
+    // Everything that reads kernel state happens under the kernel lock and nothing else does.
+    // log_stack_traceback() in particular must NOT be called from here: it resolves addresses via
+    // KernelState::find_module_by_addr, which takes the same non-recursive mutex, and locking it
+    // twice on one thread terminates the process outright.
+    const auto collect = [&](std::map<SceUID, uint32_t> *pc_only) {
+        const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
+        for (const auto &pair : emuenv.kernel.threads) {
+            const auto &thread = pair.second;
+            if (!thread || !thread->cpu)
+                continue;
+            if (pc_only) {
+                (*pc_only)[pair.first] = read_pc(*thread->cpu);
+                continue;
+            }
+            Sample s{};
+            s.id = pair.first;
+            s.thread = thread; // keeps it alive once the lock is gone
+            s.name = thread->name;
+            s.status = thread->status;
+            s.nid = thread->current_import_nid.load(std::memory_order_relaxed);
+            for (int i = 0; i < 3; i++)
+                s.args[i] = thread->current_import_args[i];
+            s.pc = read_pc(*thread->cpu);
+            s.lr = read_lr(*thread->cpu);
+            s.sp = read_sp(*thread->cpu);
+            samples.push_back(std::move(s));
+        }
+    };
+
+    collect(&first_pc);
+    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    collect(nullptr);
+
+    for (Sample &s : samples) {
+        if (s.status == ThreadStatus::running && s.thread)
+            s.traceback = s.thread->log_stack_traceback();
+    }
+
+    const auto status_name = [](ThreadStatus s) {
+        switch (s) {
+        case ThreadStatus::running: return "run ";
+        case ThreadStatus::dormant: return "dorm";
+        case ThreadStatus::waiting: return "wait";
+        case ThreadStatus::suspended: return "susp";
+        }
+        return "????";
+    };
+
+    LOG_INFO("=== thread dump: {} thread(s) ===", samples.size());
+    for (const Sample &s : samples) {
+        const char *const import = s.nid ? import_name(s.nid) : nullptr;
+        const auto before = first_pc.find(s.id);
+        const bool moved = before != first_pc.end() && before->second != s.pc;
+        LOG_INFO("  [{}] id={} \"{}\" pc={}{} lr={} sp={} in {}({}, {}, {})",
+            status_name(s.status), s.id, s.name, log_hex(s.pc),
+            (s.status == ThreadStatus::running) ? (moved ? " (advancing)" : " (same saved PC after 250ms, maybe still inside the JIT)") : "",
+            log_hex(s.lr), log_hex(s.sp), import ? import : "-",
+            log_hex(s.args[0]), log_hex(s.args[1]), log_hex(s.args[2]));
+        if (!s.traceback.empty())
+            LOG_INFO("{}", s.traceback);
+    }
+    LOG_INFO("=== end thread dump ===");
+    statusBar()->showMessage(tr("Thread dump written to the log (%1 threads)").arg(samples.size()), 4000);
+}
+
+// Wait for the GXM display queue to empty. Must happen *before* the guest is quiesced, not after:
+// the queue is drained by a host thread that runs a guest callback, so a paused guest can never
+// drain it and waiting under the pause would hang instead of settling.
+//
+// An empty queue means no display callback is part-way through, which is what makes a snapshot
+// restorable -- see the matching check in savestate::save for why.
+// Catch the moment the GXM display queue is empty, which is when no display callback is part-way
+// through -- the queue thread pops an entry only after its callback has completed. That matters
+// because a callback in flight has its progress in renderer-side timestamps while the
+// SceGxmSyncObject those are checked against lives in guest memory, and a load rewinds one and not
+// the other, leaving the queue thread waiting on a timestamp that will never arrive.
+//
+// Four approaches were tried. Blocking sceGxmDisplayQueueAddEntry, stopping the vblank clock, and
+// parking the display queue thread after its pop all reach a boundary quickly and reliably -- and
+// every one of them produces a state that loads and then hangs. The only load that has ever
+// worked was taken at a moment nothing was held and the queue simply happened to be empty. A
+// thread stopped by us is host-side wait state the snapshot cannot describe, wherever we stop it.
+//
+// So: hold nothing, and wait on the queue's own condition variable rather than polling for the
+// gap. It is notified on every pop, so this wakes inside a window that can be well under a
+// millisecond -- the window 1 ms polling kept missing. savestate::save re-checks under the pause,
+// because the guest can push the next frame between this returning and the guest being quiesced.
+// Catching the queue empty and holding it are one step: see Queue::wait_empty_and_hold. The hold
+// must be released however the attempt ends, so it is owned by a guard rather than by the code
+// path -- one left in place would block the guest in sceGxmDisplayQueueAddEntry for good.
+struct DisplayQueueHold {
+    EmuEnvState *emuenv = nullptr;
+
+    // Explicit, because an attempt that is going to be retried has to let the guest render again
+    // before it asks for the next gap: the retry is only worth anything if the guest moves on.
+    void release() {
+        if (emuenv) {
+            emuenv->gxm.display_queue.release_hold();
+            emuenv = nullptr;
+        }
+    }
+
+    ~DisplayQueueHold() {
+        release();
+    }
+};
+
+bool wait_for_display_queue_gap(EmuEnvState &emuenv, int timeout_ms, DisplayQueueHold &hold, const std::atomic<bool> &cancel) {
+    GxmState &gxm = emuenv.gxm;
+    const auto started = std::chrono::steady_clock::now();
+    const auto deadline = started + std::chrono::milliseconds(timeout_ms);
+    bool empty = false;
+    while (!(empty = gxm.display_queue.wait_empty_and_hold(std::chrono::milliseconds(100)))
+        && !cancel && std::chrono::steady_clock::now() < deadline) {
+    }
+    if (!empty && cancel)
+        return false;
+    const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - started);
+
+    if (empty) {
+        hold.emuenv = &emuenv;
+        // With the queue held the game finishes the scene it is drawing and stops at the queue's
+        // gate in sceGxmDisplayQueueAddEntry, which is the moment a save or load can take. Pausing
+        // straight away, attempts a frame apart kept landing inside the scene: Disgaea 4 refused 60
+        // in a row, five times running.
+        const auto scene_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
+        while (gxm::scene_in_progress(gxm, emuenv.mem) && std::chrono::steady_clock::now() < scene_deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        LOG_INFO("Savestate: caught the display queue empty after {} ms and held it", waited.count());
+        return true;
+    }
+
+    LOG_WARN("Savestate: display queue did not empty within {} ms", timeout_ms);
+    // A queue that never empties is a display callback that never finishes. Say where the thread
+    // running it is, so the log answers what it is stuck on.
+    if (const ThreadStatePtr thread = emuenv.kernel.get_thread(gxm.display_queue_thread)) {
+        const char *status = "?";
+        switch (thread->status) {
+        case ThreadStatus::running: status = "running"; break;
+        case ThreadStatus::dormant: status = "dormant"; break;
+        case ThreadStatus::suspended: status = "suspended"; break;
+        case ThreadStatus::waiting: status = "waiting"; break;
+        }
+        const uint32_t nid = thread->current_import_nid.load(std::memory_order_relaxed);
+        const char *const call = nid ? import_name(nid) : nullptr;
+        LOG_WARN("Savestate: display queue thread {} \"{}\" is {} at pc {} in {}", thread->id, thread->name, status,
+            log_hex(read_pc(*thread->cpu)), call ? call : (nid ? "an unnamed import" : "guest code"));
+    }
+    return false;
+}
+
+void MainWindow::on_quicksave_triggered() {
+    start_savestate_task("Quicksave", &MainWindow::quicksave);
+}
+
+void MainWindow::quicksave() {
+    // Generous, because the gap is the game's to give: its depth was seen sitting at 1 for two
+    // full seconds under load, and taken after 644 ms and 19 ms in others.
+    // Retry: catching the queue empty and quiescing the guest are not one atomic step, so the
+    // guest can push the next frame in between and savestate::save rightly refuses. The window is
+    // small and the boundary comes round every frame, so trying again lands almost immediately --
+    // and this is cheap to retry because a refused save has written nothing.
+    //
+    // 60 attempts: a save also refuses a moment a load could not restart (see savestate::save).
+    // Measured over 30 saves in battle, about four attempts in five were refused while the display
+    // queue thread's vblank wait could not be restarted, and about one in two since, all of them a
+    // frame in flight. At four in five, 30 attempts would give up about once in a thousand saves
+    // and 60 about once in a million. A refused attempt costs a frame or two.
+    constexpr int max_attempts = 60;
+    savestate::Result last = savestate::Result::fail("did not run");
+    int attempts = 0;
+    for (int attempt = 1; attempt <= max_attempts; attempt++) {
+        attempts = attempt;
+        if (m_savestate_cancel)
+            return;
+        DisplayQueueHold hold;
+        if (!wait_for_display_queue_gap(emuenv, 10000, hold, m_savestate_cancel)) {
+            if (!m_savestate_cancel)
+                show_status_message(tr("Quicksave: a frame is still in flight, try again"), 6000);
+            return;
+        }
+
+        // Stays this if the guest could not be quiesced and the save never ran.
+        last = savestate::Result::retry("the guest could not be stopped");
+        bool succeeded = false;
+        run_with_guest_quiesced("Quicksave", [&] {
+            last = savestate::save(emuenv, savestate::slot_path(emuenv, 0));
+            succeeded = static_cast<bool>(last);
+            return last;
+        });
+        hold.release();
+        if (succeeded)
+            return;
+        if (!last.retryable)
+            break;
+
+        LOG_INFO("Savestate: quicksave attempt {}/{} refused ({})", attempt, max_attempts, last.reason);
+        // Let the guest move on a frame; with the queue already empty the next attempt would
+        // otherwise land in the same moment and be refused for the same reason.
+        std::this_thread::sleep_for(std::chrono::milliseconds(16));
+    }
+
+    LOG_ERROR("Quicksave gave up after {} attempt(s): {}", attempts, last.reason);
+    show_status_message(tr("Quicksave failed, the previous quicksave is kept: %1").arg(QString::fromStdString(last.reason)), 8000);
+}
+
+void MainWindow::on_quickload_triggered() {
+    start_savestate_task("Quickload", &MainWindow::quickload);
+}
+
+void MainWindow::quickload() {
+    // Load at a frame boundary, the same kind of moment the save was taken at: with the display
+    // queue empty no display callback is part-way through (see savestate::load).
+    //
+    // The threads do not have to be parked the way the state had them. The load takes every
+    // thread that is waiting out of its call and puts every thread the state had parked back at
+    // the start of its own, so it makes the call again. What can still refuse, retryably, is what
+    // a restart cannot change -- a thread that has finished now but had not then, or is inside a
+    // callback -- and a thread in a call the load cannot interrupt. Those pass within a frame or
+    // two, and a refused load has changed nothing, so trying again costs only the wait for the
+    // next boundary. The last refusal is what gets reported.
+    //
+    // 60 attempts, as for quicksave: Gravity Rush keeps a frame queued nearly all the time, and
+    // every one of its loads gave up after 8 on "a frame is still in flight" while its saves,
+    // allowed 60, got through.
+    constexpr int max_attempts = 60;
+    savestate::Result last = savestate::Result::fail("did not run");
+    int attempts = 0;
+    for (int attempt = 1; attempt <= max_attempts; attempt++) {
+        attempts = attempt;
+        if (m_savestate_cancel)
+            return;
+        DisplayQueueHold hold;
+        if (!wait_for_display_queue_gap(emuenv, 10000, hold, m_savestate_cancel)) {
+            if (!m_savestate_cancel)
+                show_status_message(tr("Quickload: could not catch a frame boundary, try again"), 6000);
+            return;
+        }
+
+        // Stays this if the guest could not be quiesced -- a thread would not stop, or the renderer
+        // still had work queued -- and the load never ran. Both pass within a frame or two.
+        last = savestate::Result::retry("the guest could not be stopped with nothing in flight");
+        bool succeeded = false;
+        run_with_guest_quiesced("Quickload", [&] {
+            last = savestate::load(emuenv, savestate::slot_path(emuenv, 0));
+            succeeded = static_cast<bool>(last);
+            return last;
+        });
+        hold.release();
+        if (succeeded)
+            return; // run_with_guest_quiesced has already said so
+
+        if (!last.retryable) {
+            // Nothing about the guest will make this state loadable -- a different build, a
+            // different game. Retrying costs a quiesce cycle per attempt and the guest feels it.
+            break;
+        }
+
+        LOG_INFO("Savestate: quickload attempt {}/{} refused ({})", attempt, max_attempts, last.reason);
+
+        // Let the guest actually run before asking again. Retrying is only worth anything because
+        // the threads drift back into their idle waits a frame or two later; with the display queue
+        // already empty the next attempt otherwise follows within the same millisecond, and all
+        // eight were measured landing in one. Two frames at 60 fps.
+        std::this_thread::sleep_for(std::chrono::milliseconds(33));
+    }
+
+    LOG_ERROR("Quickload gave up after {} attempt(s): {}", attempts, last.reason);
+    show_status_message(tr("Quickload failed: %1").arg(QString::fromStdString(last.reason)), 8000);
 }
 
 void MainWindow::on_stop_triggered() {
