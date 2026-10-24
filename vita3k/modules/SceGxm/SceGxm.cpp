@@ -2720,44 +2720,24 @@ EXPORT(int, sceGxmDisplayQueueAddEntry, Ptr<SceGxmSyncObject> oldBuffer, Ptr<Sce
         const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
         auto *const queue = &emuenv.gxm.display_queue;
 
+        const auto abandoned = [&]() { return emuenv.gxm.savestate_abandon.load(); };
+
         // Frame pacing, as push() did it: block for a free slot, reporting nothing. This runs every
-        // frame, and a status change that runs every frame is a status change racing every pause.
-        {
-            const ScopedWait scoped_wait(*thread, { [queue] { queue->wake_holders(); } });
-            queue->wait_for_space([&]() { return thread->wait_abandoned(); });
-        }
+        // frame, and a status change on every frame would make every pause wait for it.
+        queue->wait_for_space(abandoned);
 
         // A hold is different: it is kept while the guest is stopped, so a thread waiting on one
-        // has to say it is waiting, or the quiesce waits out a thread that cannot move and gives
-        // up. Only from run, and only back from wait: update_status() assigns unconditionally, so
-        // writing 'wait' over the 'suspend' pause_threads has just recorded loses that suspend and
-        // the thread is never resumed again. Measured: doing this dance on every frame instead of
-        // only here left SceGxmDisplayQueue suspended in guest code in Disgaea 4, 0 saves in 7
-        // cycles, against 10 of 10 on the same build without it.
+        // has to say it is waiting, or the quiesce waits out a thread that cannot move.
         if (queue->is_held()) {
-            bool reported = false;
-            {
-                const std::lock_guard<std::mutex> thread_lock(thread->mutex);
-                if (thread->status == ThreadStatus::running) {
-                    thread->update_status(ThreadStatus::waiting, ThreadStatus::running);
-                    reported = true;
-                }
-            }
-            {
-                const ScopedWait scoped_wait(*thread, { [queue] { queue->wake_holders(); } });
-                queue->wait_while_held([&]() { return thread->wait_abandoned(); });
-            }
-            if (reported) {
-                const std::lock_guard<std::mutex> thread_lock(thread->mutex);
-                if (thread->status == ThreadStatus::waiting)
-                    thread->update_status(ThreadStatus::running, ThreadStatus::waiting);
-            }
+            thread->begin_host_wait();
+            queue->wait_while_held(abandoned);
+            thread->end_host_wait();
         }
 
         // Taken out of either wait by a savestate load: its registers are about to be replaced, so
         // the call must not go on. Queued now, the entry would outlive the load, and the display
         // thread would free callback data that the load has handed to the state's own allocations.
-        if (thread->wait_abandoned())
+        if (abandoned())
             return 0;
     }
 
@@ -2815,24 +2795,9 @@ EXPORT(int, sceGxmDisplayQueueAddEntry, Ptr<SceGxmSyncObject> oldBuffer, Ptr<Sce
         // second time. A save refuses, retryably, while a thread sits here -- which is the point:
         // this is a moment no state can describe, and refusing it costs a frame.
         const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
-        auto *const queue = &emuenv.gxm.display_queue;
-        bool reported = false;
-        {
-            const std::lock_guard<std::mutex> thread_lock(thread->mutex);
-            if (thread->status == ThreadStatus::running) {
-                thread->update_status(ThreadStatus::waiting, ThreadStatus::running);
-                reported = true;
-            }
-        }
-        {
-            const ScopedWait scoped_wait(*thread, { [queue] { queue->wake_holders(); }, false });
-            queue->wait_empty_or_abandoned([&]() { return thread->wait_abandoned(); });
-        }
-        if (reported) {
-            const std::lock_guard<std::mutex> thread_lock(thread->mutex);
-            if (thread->status == ThreadStatus::waiting)
-                thread->update_status(ThreadStatus::running, ThreadStatus::waiting);
-        }
+        thread->begin_host_wait();
+        emuenv.gxm.display_queue.wait_empty_or_abandoned([&]() { return emuenv.gxm.savestate_abandon.load(); });
+        thread->end_host_wait();
     }
 
     return 0;
@@ -3571,26 +3536,13 @@ EXPORT(int, sceGxmNotificationWait, const SceGxmNotification *notification) {
 
     std::unique_lock<std::mutex> lock(emuenv.renderer->notification_mutex);
     if (*value != target_value) {
-        // Say so while waiting. A thread blocked here used to report that it was running, so a
-        // pause waited for it to stop and gave up, and a savestate could not take it out.
+        // Say so while waiting, so a pause doesn't wait for a thread that cannot move
         const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
-        auto *const renderer = emuenv.renderer.get();
-        {
-            const std::lock_guard<std::mutex> thread_lock(thread->mutex);
-            thread->update_status(ThreadStatus::waiting);
-        }
-        {
-            const ScopedWait scoped_wait(*thread, { [renderer] {
-                const std::lock_guard<std::mutex> notification_lock(renderer->notification_mutex);
-                renderer->notification_ready.notify_all();
-            } });
-            renderer->notification_ready.wait(lock, [&]() {
-                return *value == target_value || emuenv.display.abort.load() || thread->wait_abandoned();
-            });
-        }
-        const std::lock_guard<std::mutex> thread_lock(thread->mutex);
-        if (thread->status == ThreadStatus::waiting)
-            thread->update_status(ThreadStatus::running);
+        thread->begin_host_wait();
+        emuenv.renderer->notification_ready.wait(lock, [&]() {
+            return *value == target_value || emuenv.display.abort.load() || emuenv.gxm.savestate_abandon.load();
+        });
+        thread->end_host_wait();
     }
 
     return 0;

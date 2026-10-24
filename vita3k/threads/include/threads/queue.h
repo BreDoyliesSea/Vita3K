@@ -191,7 +191,7 @@ public:
         cond_.wait(mlock, [&]() { return aborted || !held_ || (abandoned && abandoned()); });
     }
 
-    // For a waiter's WaitRelease: ends wait_while_held without releasing the hold itself.
+    // For a savestate load: ends wait_while_held without releasing the hold itself.
     void wake_holders() {
         cond_.notify_all();
     }

@@ -63,6 +63,9 @@ struct GxmState {
 
     Queue<DisplayCallback> display_queue;
     SceUID display_queue_thread;
+    // Set by a savestate load to take threads out of the display queue and notification waits, so
+    // they return to their gate and make the call again from the state
+    std::atomic<bool> savestate_abandon{ false };
     std::thread display_host_thread;
 
     // global timestamp used by sync objects
