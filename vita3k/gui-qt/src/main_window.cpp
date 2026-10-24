@@ -1085,6 +1085,13 @@ std::optional<AppLaunchRequest> MainWindow::boot_game_once(const AppLaunchReques
 
     LOG_INFO("Game started: {} ({})", emuenv.current_app_title, launch_request.app_path);
 
+    // For tests: VITA3K_SNAPSHOT_ROUNDTRIP=<seconds> quicksaves, then quickloads that state, that long
+    // after the game starts, so a test run checks that the guest goes on as if nothing had happened
+    if (const char *const roundtrip = std::getenv("VITA3K_SNAPSHOT_ROUNDTRIP")) {
+        const int delay_ms = static_cast<int>(std::atof(roundtrip) * 1000);
+        QTimer::singleShot(delay_ms, this, [this]() { start_savestate_task("Snapshot round trip", &MainWindow::snapshot_roundtrip); });
+    }
+
     if (m_settings_dialog)
         m_settings_dialog->set_storage_path_locked(true);
     refresh_emulation_actions();
@@ -1427,8 +1434,8 @@ bool MainWindow::run_with_guest_quiesced(const char *what, const std::function<s
     std::string blocker;
     bool render_parked = false;
     std::unique_lock<std::shared_timed_mutex> guest_memory;
-    if (!emuenv.kernel.wait_for_threads_paused(std::chrono::milliseconds(2000), &blocker)) {
-        result = savestate::Result::fail(fmt::format("thread {} would not stop", blocker));
+    if (blocker = savestate::quiesce(emuenv, 2000); !blocker.empty()) {
+        result = savestate::Result::retry(blocker);
     } else if (!drain_renderer(*emuenv.renderer)) {
         result = savestate::Result::retry("the GPU still has work in flight");
     } else if (!(render_parked = emuenv.renderer->park_render_thread(std::chrono::milliseconds(2000)))) {
@@ -1458,6 +1465,8 @@ bool MainWindow::run_with_guest_quiesced(const char *what, const std::function<s
 
     if (render_parked)
         emuenv.renderer->unpark_render_thread();
+    guest_memory = {};
+    savestate::release_threads(emuenv);
     m_app_session.set_pause_reason(app::AppSessionPauseReason::Savestate, false);
 
     if (result) {
@@ -1553,11 +1562,13 @@ void MainWindow::on_thread_dump_requested() {
             s.id = pair.first;
             s.thread = thread; // keeps it alive once the lock is gone
             s.name = thread->name;
-            s.status = thread->status;
-            s.nid = thread->current_import_nid.load(std::memory_order_relaxed);
-            for (int i = 0; i < 3; i++)
-                s.args[i] = thread->current_import_args[i];
+            s.status = thread->get_status();
             s.pc = read_pc(*thread->cpu);
+            // A thread in a call is just past its import stub's svc, and the NID follows
+            if (s.status == ThreadStatus::waiting && Ptr<uint32_t>(s.pc + 4).valid(emuenv.mem))
+                s.nid = *Ptr<uint32_t>(s.pc + 4).get(emuenv.mem);
+            for (int i = 0; i < 3; i++)
+                s.args[i] = read_reg(*thread->cpu, i);
             s.lr = read_lr(*thread->cpu);
             s.sp = read_sp(*thread->cpu);
             samples.push_back(std::move(s));
@@ -1579,6 +1590,7 @@ void MainWindow::on_thread_dump_requested() {
         case ThreadStatus::dormant: return "dorm";
         case ThreadStatus::waiting: return "wait";
         case ThreadStatus::suspended: return "susp";
+        case ThreadStatus::deleted: return "dele";
         }
         return "????";
     };
@@ -1673,13 +1685,15 @@ bool wait_for_display_queue_gap(EmuEnvState &emuenv, int timeout_ms, DisplayQueu
     // running it is, so the log answers what it is stuck on.
     if (const ThreadStatePtr thread = emuenv.kernel.get_thread(gxm.display_queue_thread)) {
         const char *status = "?";
-        switch (thread->status) {
+        switch (thread->get_status()) {
         case ThreadStatus::running: status = "running"; break;
         case ThreadStatus::dormant: status = "dormant"; break;
         case ThreadStatus::suspended: status = "suspended"; break;
         case ThreadStatus::waiting: status = "waiting"; break;
+        case ThreadStatus::deleted: status = "deleted"; break;
         }
-        const uint32_t nid = thread->current_import_nid.load(std::memory_order_relaxed);
+        const uint32_t pc = read_pc(*thread->cpu);
+        const uint32_t nid = Ptr<uint32_t>(pc + 4).valid(emuenv.mem) ? *Ptr<uint32_t>(pc + 4).get(emuenv.mem) : 0;
         const char *const call = nid ? import_name(nid) : nullptr;
         LOG_WARN("Savestate: display queue thread {} \"{}\" is {} at pc {} in {}", thread->id, thread->name, status,
             log_hex(read_pc(*thread->cpu)), call ? call : (nid ? "an unnamed import" : "guest code"));
@@ -1740,6 +1754,13 @@ void MainWindow::quicksave() {
 
     LOG_ERROR("Quicksave gave up after {} attempt(s): {}", attempts, last.reason);
     show_status_message(tr("Quicksave failed, the previous quicksave is kept: %1").arg(QString::fromStdString(last.reason)), 8000);
+}
+
+void MainWindow::snapshot_roundtrip() {
+    LOG_INFO("Savestate: round trip starts");
+    quicksave();
+    quickload();
+    LOG_INFO("Savestate: round trip done");
 }
 
 void MainWindow::on_quickload_triggered() {

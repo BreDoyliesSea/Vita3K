@@ -291,7 +291,8 @@ size_t audiodec_recreate_missing(EmuEnvState &emuenv, const uint8_t *data, size_
         state->decoders[handle] = decoder;
         state->codecs[static_cast<SceAudiodecCodec>(codec)].insert(handle);
         // So this session does not hand the same number out again.
-        emuenv.kernel.ensure_next_uid_above(handle);
+        while (emuenv.kernel.get_next_uid() < static_cast<SceUID>(handle)) {
+        }
         recreated++;
     }
     return recreated;

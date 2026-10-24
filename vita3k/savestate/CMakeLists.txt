@@ -2,6 +2,8 @@ add_library(
 	savestate
 	STATIC
 	include/savestate/savestate.h
+	src/kernel_snapshot.cpp
+	src/kernel_snapshot.h
 	src/savestate.cpp
 )
 

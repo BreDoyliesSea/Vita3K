@@ -27,11 +27,9 @@ struct EmuEnvState;
 
 namespace savestate {
 
-// What a state file currently covers. Guest RAM and CPU register state are captured; the
-// kernel object graph, GPU state, open file handles and the audio graph are not. A state is
-// therefore only meaningful to the same running process that produced it -- reloading one
-// after restarting the emulator will not work, and the header records enough to refuse it.
-inline constexpr uint32_t FORMAT_VERSION = 3;
+// The layout of a state file. 4 keeps the kernel's threads and objects as recipes (THR, OBJ) instead
+// of copies of their fields.
+inline constexpr uint32_t FORMAT_VERSION = 4;
 
 struct Result {
     bool success = false;
@@ -60,10 +58,14 @@ struct Result {
 // <pref-path>/savestates/<TITLEID>/slot<N>.vst
 fs::path slot_path(const EmuEnvState &emuenv, int slot);
 
-// Both expect the guest to already be quiesced by the caller (see AppSessionPauseReason) and
-// MemState::savestate_lock to be held exclusively. Neither pauses or resumes on its own. load()
-// relies on the lock beyond its own return: the threads it takes out of their calls wait on it
-// before they continue, so they start when the caller lets go of it.
+// Stops every guest thread for a save or a load, and waits until each one is dormant, at its gate,
+// or blocked in a call. Empty once they are, or what would not stop. Undone by release_threads(),
+// which the caller calls however it went.
+std::string quiesce(EmuEnvState &emuenv, int timeout_ms);
+void release_threads(EmuEnvState &emuenv);
+
+// Both expect quiesce() to have succeeded and MemState::savestate_lock to be held exclusively. The
+// threads stay stopped until the caller releases them.
 Result save(EmuEnvState &emuenv, const fs::path &path);
 Result load(EmuEnvState &emuenv, const fs::path &path);
 

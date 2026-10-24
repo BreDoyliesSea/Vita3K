@@ -131,6 +131,7 @@ private slots:
 private:
     void quicksave();
     void quickload();
+    void snapshot_roundtrip();
     void start_savestate_task(const char *what, void (MainWindow::*task)());
     void stop_savestate_task();
     void show_status_message(const QString &message, int timeout);

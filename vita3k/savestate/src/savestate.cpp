@@ -17,6 +17,8 @@
 
 #include <savestate/savestate.h>
 
+#include "kernel_snapshot.h"
+
 #include <audio/state.h>
 #include <codec/state.h>
 #include <config/version.h>
@@ -55,6 +57,10 @@
 #include <type_traits>
 #include <vector>
 
+// The guest's memory blocks, in SceSysmem
+std::vector<uint8_t> sysmem_save_blocks(EmuEnvState &emuenv);
+size_t sysmem_recreate_missing_blocks(EmuEnvState &emuenv, const uint8_t *data, size_t size);
+
 namespace savestate {
 
 namespace {
@@ -64,12 +70,10 @@ constexpr uint8_t MAGIC[8] = { 0x56, 0x49, 0x54, 0x41, 0x33, 0x4B, 0x53, 0x53 };
 // Chunk tags. Order in the file is not significant; the reader dispatches on the tag, and
 // skips anything it does not recognise so a newer state stays partially readable.
 constexpr uint32_t TAG_MEM = 0x204D454DU; // "MEM "
-constexpr uint32_t TAG_CPU = 0x20555043U; // "CPU "
-constexpr uint32_t TAG_WAIT = 0x54494157U; // "WAIT" - which HLE wait each parked thread is in
-constexpr uint32_t TAG_SYNC = 0x434E5953U; // "SYNC" - scalar state of the kernel sync primitives
 constexpr uint32_t TAG_FILE = 0x454C4946U; // "FILE" - read position of every open read-only file
-// "STK " - where each thread's guest stack was. Optional, so states written before it still load.
-constexpr uint32_t TAG_STACK = 0x204B5453U;
+// "THR " and "OBJ " - the kernel's threads and objects, as recipes (kernel_snapshot.h)
+constexpr uint32_t TAG_THR = 0x20524854U;
+constexpr uint32_t TAG_OBJ = 0x204A424FU;
 // "FTBL" - what file each open read-only descriptor refers to. Optional, so older states still load.
 constexpr uint32_t TAG_FTBL = 0x4C425446U;
 // "NGSL" - where each NGS system, rack and voice was. Optional, so older states still load.
@@ -82,19 +86,8 @@ constexpr uint32_t TAG_GXML = 0x4C4D5847U;
 constexpr uint32_t TAG_GXRT = 0x54525847U;
 // "GXPG" - how each shader-patcher program was made. Optional, so older states still load.
 constexpr uint32_t TAG_GXPG = 0x47505847U;
-// "THRD" - each thread's status and callback depth. A load needs it to restart waits.
-constexpr uint32_t TAG_THRD = 0x44524854U;
-// "THRI" - what each thread is made of (name, entry, priority, affinity, stack, TLS, initial
-// registers), so a thread the session no longer has can be recreated under its ID. Optional, so
-// older states still load -- into a session that still has every thread they need.
-constexpr uint32_t TAG_THRI = 0x49524854U;
-// "SYNI" - what each kernel sync object was made of (kind, name, attr, initial values), so one the
-// session has deleted can be put back under its UID. Optional, so older states still load.
-constexpr uint32_t TAG_SYNI = 0x494E5953U;
-// "AUDP" - each audio out port's configuration, likewise. Optional.
+// "AUDP" - each audio out port's configuration, so a load can open one the session lacks.
 constexpr uint32_t TAG_AUDP = 0x50445541U;
-// "SYN2" - rwlock owners, message pipe contents, timers. Optional, so older states still load.
-constexpr uint32_t TAG_SYN2 = 0x324E5953U;
 // "GXMM" - which GPU memory regions were mapped. Optional, so older states still load.
 constexpr uint32_t TAG_GXMM = 0x4D4D5847U;
 // "CLCK" - how far the guest's own clock had run. Optional, so older states still load.
@@ -110,41 +103,6 @@ constexpr uint32_t TAG_MBLK = 0x4B4C424DU;
 constexpr uint32_t TAG_GXMK = 0x4B4D5847U;
 // "NGSV" - each NGS voice's playback: state, and per module its position and loop count. Optional.
 constexpr uint32_t TAG_NGSV = 0x5653474EU;
-
-// Point a context saved inside an HLE call back at the call itself, so the thread makes it again
-// when it resumes. Import stubs are ARM -- `svc #0`, `mov pc, lr`, then the NID -- and a thread
-// inside the call has its PC just past the svc (run_loop reads the NID at pc + 4). Its argument
-// registers are untouched until the call returns, so they are still the ones it was made with.
-// Checked rather than assumed: why such a context cannot be pointed back at its call, empty when
-// it can. The save asks this too, so that it never writes a state whose threads no load could
-// restart.
-// Reads a 32-bit word of guest memory, or nothing if the address is not mapped.
-using WordReader = std::function<std::optional<uint32_t>(Address)>;
-
-static std::string why_not_at_a_call(const WordReader &read, const CPUContext &ctx) {
-    const uint32_t pc = ctx.get_pc();
-    if (ctx.cpsr & 0x20)
-        return fmt::format("its PC {} is in Thumb code, not an import stub", log_hex(pc));
-    const std::optional<uint32_t> before = pc < 4 ? std::nullopt : read(pc - 4);
-    const std::optional<uint32_t> at = read(pc);
-    if (!before || !at)
-        return fmt::format("its PC {} is not in mapped memory", log_hex(pc));
-    constexpr uint32_t SVC_0 = 0xEF000000U;
-    constexpr uint32_t MOV_PC_LR = 0xE1A0F00EU;
-    if (*before != SVC_0 || *at != MOV_PC_LR)
-        return fmt::format("its PC {} is not just past an import stub's svc ({} at PC-4, {} at PC)",
-            log_hex(pc), log_hex(*before), log_hex(*at));
-    return {};
-}
-
-std::string why_not_at_a_call(const MemState &mem, const CPUContext &ctx) {
-    return why_not_at_a_call([&mem](Address address) -> std::optional<uint32_t> {
-        if (!Ptr<uint32_t>(address).valid(mem))
-            return std::nullopt;
-        return *Ptr<uint32_t>(address).get(mem);
-    },
-        ctx);
-}
 
 // A state records the emulator build that produced it. Guest memory is full of pointers into
 // host-side structures whose layout this binary fixes, so a state from a different build is
@@ -169,53 +127,6 @@ void put(std::vector<uint8_t> &out, const T &value) {
 void put_string(std::vector<uint8_t> &out, const std::string &s) {
     put<uint32_t>(out, static_cast<uint32_t>(s.size()));
     out.insert(out.end(), s.begin(), s.end());
-}
-
-// Every T in the kernel's UID table, in UID order, as the per-type maps used to hold them. The
-// UIDs are gathered under the table's lock and looked up after it, since find takes it too. Each
-// object's fields are guarded by its own lock (KernelObject::lock), which the readers take.
-template <KernelObjectClass T, typename As = T>
-std::vector<std::pair<SceUID, std::shared_ptr<As>>> kernel_table(const KernelState &kernel) {
-    std::vector<SceUID> uids;
-    kernel.objects.for_each<T>([&](T &obj) { uids.push_back(obj.uid); });
-    std::vector<std::pair<SceUID, std::shared_ptr<As>>> table;
-    table.reserve(uids.size());
-    for (const SceUID uid : uids) {
-        if (std::shared_ptr<As> obj = kernel.objects.find<T>(uid))
-            table.emplace_back(uid, std::move(obj));
-    }
-    return table;
-}
-
-using MutexTable = std::vector<std::pair<SceUID, MutexPtr>>;
-using CondvarTable = std::vector<std::pair<SceUID, CondvarPtr>>;
-
-// The UIDs of the Ts the session holds that keep does not list.
-template <KernelObjectClass T>
-std::vector<SceUID> kernel_uids_not_in(const KernelState &kernel, const std::set<SceUID> &keep) {
-    std::vector<SceUID> extra;
-    kernel.objects.for_each<T>([&](T &obj) {
-        if (!keep.contains(obj.uid))
-            extra.push_back(obj.uid);
-    });
-    return extra;
-}
-
-// Deletes the T with this UID as the guest's delete call does, which leaves an object that threads
-// still wait on alone. False if it was not deleted.
-template <KernelObjectClass T>
-bool delete_kernel_object(KernelState &kernel, SceUID uid) {
-    const std::shared_ptr<T> obj = kernel.objects.find<T>(uid);
-    if (!obj)
-        return false;
-    {
-        const auto guard = obj->lock();
-        if (guard && !obj->waiters.empty()) {
-            LOG_WARN("Savestate: \"{}\" ({}) is not in the state but has waiting threads; keeping it", obj->name, uid);
-            return false;
-        }
-    }
-    return kernel.objects.remove<T>(uid);
 }
 
 struct Reader {
@@ -278,6 +189,14 @@ bool inflate_to(const uint8_t *in, size_t in_size, std::vector<uint8_t> &out, si
 
 } // namespace
 
+std::string quiesce(EmuEnvState &emuenv, int timeout_ms) {
+    return kernel::quiesce(emuenv, timeout_ms);
+}
+
+void release_threads(EmuEnvState &emuenv) {
+    kernel::release_threads(emuenv);
+}
+
 fs::path slot_path(const EmuEnvState &emuenv, const int slot) {
     return emuenv.vita_fs_path / "savestates" / emuenv.io.title_id / fmt::format("slot{}.vst", slot);
 }
@@ -286,53 +205,12 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
     if (emuenv.io.title_id.empty())
         return Result::fail("no application is running");
 
-    // --- is every thread one a load can restart? ------------------------------------------------
-    // A load puts each thread the state has parked back at the start of its call (see "restart" in
-    // load()). That is only the same as leaving it parked if the call says so -- every blocking
-    // call registers how it is released and whether it can be made again (ThreadState::
-    // WaitRelease) -- and only at a thread's top level: inside a callback, the host frames around
-    // the call are gone. A state with a thread anywhere else would be refused by every load, so do
-    // not write one. Retryable, because such moments pass.
-    //
-    // That holds for a thread merely *running* inside a callback too: the load wants every thread
-    // exactly as deep as the state had it, and a session is stopped inside the same callback again
-    // next to never. Measured on Project DIVA f (run 33): a state with NGS's update thread one
-    // callback deep, and 59 loads of it refused before the quickload gave up.
-    {
-        const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
-        for (const auto &[uid, thread] : emuenv.kernel.threads) {
-            if (thread && thread->nesting_level() > 1 && thread->status != ThreadStatus::waiting)
-                return Result::retry(fmt::format("thread {} \"{}\" is running inside a callback, which a load would have to catch again",
-                    uid, thread->name));
-            if (!thread || thread->status != ThreadStatus::waiting)
-                continue;
-            const std::optional<ThreadState::WaitRelease> wait = thread->current_wait();
-            if (!wait || !wait->restartable) {
-                const uint32_t nid = thread->current_import_nid.load(std::memory_order_relaxed);
-                const char *const call = nid ? import_name(nid) : nullptr;
-                return Result::retry(fmt::format("thread {} \"{}\" is parked in {}, which a load could not restart",
-                    uid, thread->name, call ? call : fmt::format("{}", log_hex(nid))));
-            }
-            if (thread->nesting_level() > 1)
-                return Result::retry(fmt::format("thread {} \"{}\" is waiting inside a callback, where a load could not restart it",
-                    uid, thread->name));
-            // And it has to be restartable from where it actually stands: a load points the saved
-            // context back at the svc that made the call, which only works if the context is just
-            // past one. Asking at the save is what keeps an unloadable state off the disk --
-            // Oddworld wrote three whose "AK::IOThread" was parked with its PC elsewhere, and no
-            // load, in any session, could take them (notes/19, gap C).
-            if (thread->cpu) {
-                const CPUContext ctx = save_context(*thread->cpu);
-                const std::string why = why_not_at_a_call(emuenv.mem, ctx);
-                if (!why.empty()) {
-                    const uint32_t nid = thread->current_import_nid.load(std::memory_order_relaxed);
-                    const char *const call = nid ? import_name(nid) : nullptr;
-                    return Result::retry(fmt::format("thread {} \"{}\" is parked in {} but {}, so no load could restart it",
-                        uid, thread->name, call ? call : fmt::format("{}", log_hex(nid)), why));
-                }
-            }
-        }
-    }
+    // --- the kernel: every thread and object, as recipes ----------------------------------------
+    // See kernel_snapshot.h. It refuses a moment no load could restart, retryably, so it goes before
+    // the memory copy, which takes about a second the guest stays paused for.
+    kernel::Snapshot kernel_state;
+    if (const Result refused = kernel::capture(emuenv, kernel_state); !refused)
+        return refused;
 
     // --- refuse if a frame is in flight --------------------------------------------------------
     // The display queue thread peeks the front entry, runs the guest's display callback, and only
@@ -398,248 +276,6 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
     if (!deflate_to(mem_raw, mem_packed))
         return Result::fail("failed to compress guest memory");
 
-    // --- CPU: one register context per live thread -----------------------------------------
-    std::vector<uint8_t> cpu_raw;
-    uint32_t thread_count = 0;
-    {
-        const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
-        std::vector<std::pair<SceUID, CPUContext>> contexts;
-        for (const auto &pair : emuenv.kernel.threads) {
-            if (!pair.second || !pair.second->cpu)
-                continue;
-            contexts.emplace_back(pair.first, save_context(*pair.second->cpu));
-        }
-        thread_count = static_cast<uint32_t>(contexts.size());
-        put(cpu_raw, thread_count);
-        for (const auto &entry : contexts) {
-            put(cpu_raw, entry.first);
-            put(cpu_raw, entry.second);
-        }
-
-        // A thread in ThreadStatus::waiting is blocked inside a host C++ frame in one of the
-        // sync primitive helpers, and WaitingThreadData holds raw pointers into that frame's
-        // locals (was_canceled, outBits, result_pattern...). None of that lives in guest
-        // memory or registers, so a load does not restore it: it makes the call again (see
-        // "restart" in load()). Report how many there are.
-        int running = 0, dormant = 0, waiting = 0, suspended = 0;
-        for (const auto &pair : emuenv.kernel.threads) {
-            if (!pair.second)
-                continue;
-            switch (pair.second->status) {
-            case ThreadStatus::running: running++; break;
-            case ThreadStatus::dormant: dormant++; break;
-            case ThreadStatus::waiting: waiting++; break;
-            case ThreadStatus::suspended: suspended++; break;
-            }
-        }
-        LOG_INFO("Savestate: thread status at snapshot - run {}, dormant {}, wait {}, suspend {}",
-            running, dormant, waiting, suspended);
-        LOG_INFO_IF(waiting > 0,
-            "Savestate: {} thread(s) are parked inside an HLE call; a load puts each back at the start of it",
-            waiting);
-
-        // Which calls, specifically. Restoring a blocked thread means re-entering the import it
-        // is parked in, so the shape of this histogram decides how big that job actually is: a
-        // long tail means every wait helper needs its own restore path, while a handful of
-        // repeated NIDs means a few do. Logged at save time because it is the only moment the
-        // guest is quiesced with the waits still in place.
-        if (waiting > 0) {
-            std::map<uint32_t, int> parked_in;
-            for (const auto &pair : emuenv.kernel.threads) {
-                if (!pair.second || pair.second->status != ThreadStatus::waiting)
-                    continue;
-                parked_in[pair.second->current_import_nid.load(std::memory_order_relaxed)]++;
-            }
-            for (const auto &[nid, count] : parked_in) {
-                const char *const name = nid ? import_name(nid) : nullptr;
-                LOG_INFO("Savestate:   {} thread(s) parked in {} ({})", count,
-                    name ? name : "no import in flight", log_hex(nid));
-            }
-
-            // And the arguments each one was called with. A restore re-enters the call rather
-            // than rebuilding its host frame, so these values are the whole input to that -- for
-            // sceKernelWaitSema they are semaId, needCount and a guest pointer to the timeout.
-            // Logged so the design can be checked against real values before anything relies on
-            // them.
-            //
-            // LOG_INFO, not LOG_DEBUG: spdlog's compile-time SPDLOG_ACTIVE_LEVEL defaults to INFO,
-            // so LOG_DEBUG is not merely filtered at runtime, it is compiled out. No log-level
-            // setting brings it back, which makes a debug line here look like "no threads found"
-            // rather than "this code cannot emit". This runs once per savestate, on user request.
-            for (const auto &pair : emuenv.kernel.threads) {
-                const auto &thread = pair.second;
-                if (!thread || thread->status != ThreadStatus::waiting)
-                    continue;
-                const uint32_t nid = thread->current_import_nid.load(std::memory_order_relaxed);
-                const char *const name = nid ? import_name(nid) : nullptr;
-                LOG_INFO("Savestate:     thread {} \"{}\" in {} args {} {} {} {}", pair.first,
-                    thread->name, name ? name : "-", log_hex(thread->current_import_args[0]),
-                    log_hex(thread->current_import_args[1]), log_hex(thread->current_import_args[2]),
-                    log_hex(thread->current_import_args[3]));
-            }
-        }
-    }
-
-    // --- WAIT: what each parked thread is blocked in ------------------------------------------
-    // A thread in ThreadStatus::waiting is inside a host C++ frame that no snapshot can describe.
-    // Rather than try to rebuild that frame on load, record what the wait *is*, so the load can
-    // check the guest is still parked the same way and refuse if it is not.
-    std::vector<uint8_t> wait_raw;
-    {
-        const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
-        std::vector<std::pair<SceUID, const ThreadState *>> parked;
-        for (const auto &pair : emuenv.kernel.threads) {
-            if (pair.second && pair.second->status == ThreadStatus::waiting)
-                parked.emplace_back(pair.first, pair.second.get());
-        }
-        put<uint32_t>(wait_raw, static_cast<uint32_t>(parked.size()));
-        for (const auto &[uid, thread] : parked) {
-            put(wait_raw, uid);
-            put<uint32_t>(wait_raw, thread->current_import_nid.load(std::memory_order_relaxed));
-            for (int i = 0; i < 4; i++)
-                put<uint32_t>(wait_raw, thread->current_import_args[i]);
-        }
-    }
-
-    // --- THRD: each thread's status and callback depth ------------------------------------------
-    // A load restarts waits rather than matching them, and needs to know what a restart cannot
-    // change: which threads had finished, and how deep in callbacks each one was.
-    std::vector<uint8_t> thrd_raw;
-    {
-        const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
-        std::vector<std::tuple<SceUID, uint32_t, int32_t>> threads;
-        for (const auto &[uid, thread] : emuenv.kernel.threads) {
-            if (thread && thread->cpu)
-                threads.emplace_back(uid, static_cast<uint32_t>(thread->status), thread->nesting_level());
-        }
-        put<uint32_t>(thrd_raw, static_cast<uint32_t>(threads.size()));
-        for (const auto &[uid, status, level] : threads) {
-            put(thrd_raw, uid);
-            put(thrd_raw, status);
-            put(thrd_raw, level);
-        }
-        // How many sceKernelSuspendThreadForVM calls hold each thread, after the threads, so a state
-        // without it still reads. The hold is host-side: a load must put back the state's, or a
-        // thread the session's garbage collector had stopped stays stopped for good.
-        put<uint32_t>(thrd_raw, static_cast<uint32_t>(threads.size()));
-        for (const auto &[uid, status, level] : threads) {
-            const ThreadStatePtr thread = emuenv.kernel.threads.at(uid);
-            put(thrd_raw, uid);
-            put<int32_t>(thrd_raw, thread->vm_suspend_count());
-        }
-    }
-
-    // --- SYNC: scalar state of the kernel sync primitives --------------------------------------
-    // These objects live on the host, not in guest memory, so nothing above captures them. A
-    // semaphore's count is exactly the kind of thing the guest's own bookkeeping (which *is* in
-    // the snapshot) expects to agree with.
-    //
-    // Only the scalars are recorded, not the objects themselves: this restores into the same
-    // running session, where every object still exists under the same uid. Loading a state into a
-    // fresh session would need the objects constructed, which is a different and much larger job.
-    const auto semaphores = kernel_table<Semaphore>(emuenv.kernel);
-    const auto eventflags = kernel_table<EventFlag>(emuenv.kernel);
-    const auto simple_events = kernel_table<SimpleEvent>(emuenv.kernel);
-    const auto heavy_mutexes = kernel_table<HeavyMutex, Mutex>(emuenv.kernel);
-    const auto lw_mutexes = kernel_table<LwMutex, Mutex>(emuenv.kernel);
-    const auto heavy_condvars = kernel_table<HeavyCond, Condvar>(emuenv.kernel);
-    const auto lw_condvars = kernel_table<LwCond, Condvar>(emuenv.kernel);
-    const auto rwlocks = kernel_table<RWLock>(emuenv.kernel);
-    const auto msgpipes = kernel_table<MsgPipe>(emuenv.kernel);
-    const auto timers = kernel_table<Timer>(emuenv.kernel);
-    std::vector<uint8_t> sync_raw;
-    {
-        put<uint32_t>(sync_raw, static_cast<uint32_t>(semaphores.size()));
-        for (const auto &[uid, sema] : semaphores) {
-            const auto guard = sema->lock();
-            put(sync_raw, uid);
-            put<int32_t>(sync_raw, guard ? sema->val : 0);
-        }
-
-        put<uint32_t>(sync_raw, static_cast<uint32_t>(eventflags.size()));
-        for (const auto &[uid, ef] : eventflags) {
-            const auto guard = ef->lock();
-            put(sync_raw, uid);
-            put<int32_t>(sync_raw, guard ? ef->flags : 0);
-        }
-
-        put<uint32_t>(sync_raw, static_cast<uint32_t>(simple_events.size()));
-        for (const auto &[uid, ev] : simple_events) {
-            const auto guard = ev->lock();
-            put(sync_raw, uid);
-            put<uint32_t>(sync_raw, guard ? ev->pattern : 0);
-            put<uint64_t>(sync_raw, guard ? ev->last_user_data : 0);
-        }
-
-        // Mutexes and lwmutexes share a type. The owner is a ThreadStatePtr; record its uid,
-        // which is what a restore can look back up.
-        const auto put_mutexes = [&sync_raw](const MutexTable &mutexes) {
-            put<uint32_t>(sync_raw, static_cast<uint32_t>(mutexes.size()));
-            for (const auto &[uid, mutex] : mutexes) {
-                const auto guard = mutex->lock();
-                put(sync_raw, uid);
-                put<int32_t>(sync_raw, guard ? mutex->lock_count : 0);
-                put<SceUID>(sync_raw, (guard && mutex->owner) ? mutex->owner->id : 0);
-            }
-        };
-        put_mutexes(heavy_mutexes);
-        put_mutexes(lw_mutexes);
-    }
-
-    // --- SYN2: the rest of the sync primitives ---------------------------------------------------
-    // What SYNC leaves out: which threads hold each rwlock, what is sitting in each message pipe,
-    // and where each timer is. Condition variables have nothing but their queue, which a load
-    // rebuilds by restarting the waits. Timer deadlines are kept on a host clock that means nothing
-    // to another session, so they are stored relative to now.
-    std::vector<uint8_t> syn2_raw;
-    {
-        put<uint32_t>(syn2_raw, static_cast<uint32_t>(rwlocks.size()));
-        for (const auto &[uid, rwlock] : rwlocks) {
-            const auto guard = rwlock->lock();
-            put(syn2_raw, uid);
-            put<uint32_t>(syn2_raw, guard ? static_cast<uint32_t>(rwlock->state) : 0);
-            put<uint32_t>(syn2_raw, guard ? static_cast<uint32_t>(rwlock->owners.size()) : 0);
-            if (guard) {
-                for (const auto &[owner, count] : rwlock->owners) {
-                    put<SceUID>(syn2_raw, owner ? owner->id : 0);
-                    put<int32_t>(syn2_raw, count);
-                }
-            }
-        }
-
-        put<uint32_t>(syn2_raw, static_cast<uint32_t>(msgpipes.size()));
-        for (const auto &[uid, pipe] : msgpipes) {
-            put(syn2_raw, uid);
-            const std::vector<uint8_t> bytes = pipe->contents();
-            put<uint32_t>(syn2_raw, static_cast<uint32_t>(bytes.size()));
-            syn2_raw.insert(syn2_raw.end(), bytes.begin(), bytes.end());
-        }
-
-        const uint64_t now = sync_timer_clock();
-        const auto relative = [now](uint64_t when) {
-            return when == std::numeric_limits<uint64_t>::max() ? std::numeric_limits<int64_t>::max() : static_cast<int64_t>(when - now);
-        };
-        put<uint32_t>(syn2_raw, static_cast<uint32_t>(timers.size()));
-        for (const auto &[uid, timer] : timers) {
-            const auto guard = timer->lock();
-            put(syn2_raw, uid);
-            const uint8_t flags = guard
-                ? static_cast<uint8_t>((timer->is_started ? 1 : 0) | (timer->is_repeat ? 2 : 0) | (timer->is_pulse ? 4 : 0) | (timer->event_set ? 8 : 0))
-                : 0;
-            put<uint8_t>(syn2_raw, flags);
-            put<uint64_t>(syn2_raw, guard ? timer->event_interval : 0);
-            put<int64_t>(syn2_raw, guard ? relative(timer->next_event) : 0);
-            put<int64_t>(syn2_raw, guard && timer->base != 0 ? static_cast<int64_t>(timer->base - now) : std::numeric_limits<int64_t>::min());
-        }
-        // The count a stopped timer holds, after the timers, so a state without it still reads
-        put<uint32_t>(syn2_raw, static_cast<uint32_t>(timers.size()));
-        for (const auto &[uid, timer] : timers) {
-            const auto guard = timer->lock();
-            put(syn2_raw, uid);
-            put<uint64_t>(syn2_raw, guard ? timer->stopped_count : 0);
-        }
-    }
-
     // --- FILE: where each open read-only file is positioned -------------------------------------
     // The offset of an open file lives in the host FILE*, not in guest memory, so nothing above
     // captures it. A load rewinds the guest's idea of how far through a file it is while the host
@@ -703,23 +339,6 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
             put(ftbl_raw, flags);
             put(ftbl_raw, at);
             put_string(ftbl_raw, path);
-        }
-    }
-
-    // --- where each thread's stack is ---------------------------------------------------------
-    // The two sessions' guest allocations diverge -- a single differently sized allocation early
-    // on shifts every thread stack after it by a page -- and the load re-lays-out the address
-    // space to match the state. ThreadState::stack is host-side and is not part of that, so
-    // without this it keeps pointing at where the stack used to be, and the next thread to be
-    // started resets its stack pointer into what is now a *different* thread's stack.
-    std::vector<uint8_t> stack_raw;
-    {
-        const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
-        put<uint32_t>(stack_raw, static_cast<uint32_t>(emuenv.kernel.threads.size()));
-        for (const auto &[id, thread] : emuenv.kernel.threads) {
-            put(stack_raw, id);
-            put<uint32_t>(stack_raw, thread ? thread->stack.get() : 0);
-            put<int32_t>(stack_raw, thread ? thread->stack_size : 0);
         }
     }
 
@@ -884,30 +503,19 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
     put<uint64_t>(file, static_cast<uint64_t>(mem_raw.size()));
     file.insert(file.end(), mem_packed.begin(), mem_packed.end());
 
-    put<uint32_t>(file, TAG_CPU);
-    put<uint64_t>(file, static_cast<uint64_t>(cpu_raw.size()));
-    put<uint64_t>(file, static_cast<uint64_t>(cpu_raw.size()));
-    file.insert(file.end(), cpu_raw.begin(), cpu_raw.end());
-
-    put(file, TAG_WAIT);
-    put<uint64_t>(file, wait_raw.size());
-    put<uint64_t>(file, wait_raw.size());
-    file.insert(file.end(), wait_raw.begin(), wait_raw.end());
-
-    put(file, TAG_SYNC);
-    put<uint64_t>(file, sync_raw.size());
-    put<uint64_t>(file, sync_raw.size());
-    file.insert(file.end(), sync_raw.begin(), sync_raw.end());
+    std::vector<uint8_t> thr_raw, obj_raw;
+    kernel::write(kernel_state, thr_raw, obj_raw);
+    for (const auto &[tag, raw] : { std::pair{ TAG_THR, &thr_raw }, std::pair{ TAG_OBJ, &obj_raw } }) {
+        put(file, tag);
+        put<uint64_t>(file, raw->size());
+        put<uint64_t>(file, raw->size());
+        file.insert(file.end(), raw->begin(), raw->end());
+    }
 
     put(file, TAG_FILE);
     put<uint64_t>(file, file_raw.size());
     put<uint64_t>(file, file_raw.size());
     file.insert(file.end(), file_raw.begin(), file_raw.end());
-
-    put(file, TAG_STACK);
-    put<uint64_t>(file, stack_raw.size());
-    put<uint64_t>(file, stack_raw.size());
-    file.insert(file.end(), stack_raw.begin(), stack_raw.end());
 
     put(file, TAG_FTBL);
     put<uint64_t>(file, ftbl_raw.size());
@@ -944,84 +552,6 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
     put<uint64_t>(file, ngsv_raw.size());
     file.insert(file.end(), ngsv_raw.begin(), ngsv_raw.end());
 
-    // --- THRI: what each thread is made of -----------------------------------------------------
-    // Enough to recreate one the session has since deleted: see savestate::load. Its TLS block is
-    // KERNEL_TLS_SIZE plus the module's TLS, both guest memory that comes back with the restore.
-    std::vector<uint8_t> thri_raw;
-    {
-        const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
-        uint32_t count = 0;
-        for (const auto &[uid, thread] : emuenv.kernel.threads)
-            if (thread && thread->cpu)
-                count++;
-        put<uint32_t>(thri_raw, count);
-        for (const auto &[uid, thread] : emuenv.kernel.threads) {
-            if (!thread || !thread->cpu)
-                continue;
-            put(thri_raw, uid);
-            put_string(thri_raw, thread->name);
-            put<uint32_t>(thri_raw, thread->entry_point);
-            put<int32_t>(thri_raw, thread->priority);
-            put<int32_t>(thri_raw, thread->affinity_mask);
-            put<uint32_t>(thri_raw, thread->stack.get());
-            put<int32_t>(thri_raw, thread->stack_size);
-            put<uint32_t>(thri_raw, thread->tls.get());
-            put(thri_raw, thread->initial_context());
-        }
-    }
-
-    put(file, TAG_THRD);
-    put<uint64_t>(file, thrd_raw.size());
-    put<uint64_t>(file, thrd_raw.size());
-    file.insert(file.end(), thrd_raw.begin(), thrd_raw.end());
-
-    // --- SYNI: what each sync object is made of -------------------------------------------------
-    // For the ones the session deletes between a save and a load: a worker thread's mutex goes
-    // with the worker. See savestate::load.
-    std::vector<uint8_t> syni_raw;
-    {
-        // Names, attributes and initial values never change; only the flags need the lock.
-        put<uint32_t>(syni_raw, static_cast<uint32_t>(semaphores.size()));
-        for (const auto &[uid, sema] : semaphores) {
-            put(syni_raw, uid);
-            put_string(syni_raw, sema->name);
-            put<uint32_t>(syni_raw, sema->attr);
-            put<int32_t>(syni_raw, sema->init_val);
-            put<int32_t>(syni_raw, sema->max);
-        }
-        put<uint32_t>(syni_raw, static_cast<uint32_t>(eventflags.size()));
-        for (const auto &[uid, ef] : eventflags) {
-            const auto guard = ef->lock();
-            put(syni_raw, uid);
-            put_string(syni_raw, ef->name);
-            put<uint32_t>(syni_raw, ef->attr);
-            put<uint32_t>(syni_raw, guard ? static_cast<uint32_t>(ef->flags) : 0);
-        }
-        const auto put_mutexes = [&syni_raw](const MutexTable &mutexes) {
-            put<uint32_t>(syni_raw, static_cast<uint32_t>(mutexes.size()));
-            for (const auto &[uid, mutex] : mutexes) {
-                put(syni_raw, uid);
-                put_string(syni_raw, mutex->name);
-                put<uint32_t>(syni_raw, mutex->attr);
-                put<int32_t>(syni_raw, mutex->init_count);
-                put<uint32_t>(syni_raw, mutex->workarea.address());
-            }
-        };
-        put_mutexes(heavy_mutexes);
-        put_mutexes(lw_mutexes);
-        const auto put_condvars = [&syni_raw](const CondvarTable &condvars) {
-            put<uint32_t>(syni_raw, static_cast<uint32_t>(condvars.size()));
-            for (const auto &[uid, cv] : condvars) {
-                put(syni_raw, uid);
-                put_string(syni_raw, cv->name);
-                put<uint32_t>(syni_raw, cv->attr);
-                put<SceUID>(syni_raw, cv->associated_mutex ? cv->associated_mutex->uid : 0);
-            }
-        };
-        put_condvars(heavy_condvars);
-        put_condvars(lw_condvars);
-    }
-
     // --- AUDP: each audio out port's configuration ---------------------------------------------
     std::vector<uint8_t> audp_raw;
     {
@@ -1039,25 +569,10 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
         }
     }
 
-    put(file, TAG_THRI);
-    put<uint64_t>(file, thri_raw.size());
-    put<uint64_t>(file, thri_raw.size());
-    file.insert(file.end(), thri_raw.begin(), thri_raw.end());
-
-    put(file, TAG_SYNI);
-    put<uint64_t>(file, syni_raw.size());
-    put<uint64_t>(file, syni_raw.size());
-    file.insert(file.end(), syni_raw.begin(), syni_raw.end());
-
     put(file, TAG_AUDP);
     put<uint64_t>(file, audp_raw.size());
     put<uint64_t>(file, audp_raw.size());
     file.insert(file.end(), audp_raw.begin(), audp_raw.end());
-
-    put(file, TAG_SYN2);
-    put<uint64_t>(file, syn2_raw.size());
-    put<uint64_t>(file, syn2_raw.size());
-    file.insert(file.end(), syn2_raw.begin(), syn2_raw.end());
 
     put(file, TAG_GXMM);
     put<uint64_t>(file, gxmm_raw.size());
@@ -1086,7 +601,7 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
 
     // Write to a temporary and rename into place, so an interrupted save cannot destroy the
     // previous good state.
-    boost::system::error_code err;
+    std::error_code err;
     fs::create_directories(path.parent_path(), err);
     const fs::path tmp = path.string() + ".tmp";
     {
@@ -1108,7 +623,7 @@ Result save(EmuEnvState &emuenv, const fs::path &path) {
     renderer::reset_surface_sync_after_savestate(*emuenv.renderer, emuenv.mem);
 
     LOG_INFO("Savestate written: {} ({} regions, {} threads, {:.1f} MiB raw -> {:.1f} MiB on disk)",
-        path.string(), region_count, thread_count,
+        path.string(), region_count, kernel_state.threads.size(),
         static_cast<double>(mem_raw.size()) / (1024.0 * 1024.0),
         static_cast<double>(file.size()) / (1024.0 * 1024.0));
     return Result::ok();
@@ -1164,16 +679,12 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
     const uint8_t *mem_packed = nullptr;
     size_t mem_packed_size = 0;
     size_t mem_raw_size = 0;
-    const uint8_t *cpu_data = nullptr;
-    size_t cpu_size = 0;
-    const uint8_t *wait_data = nullptr;
-    size_t wait_size = 0;
-    const uint8_t *sync_data = nullptr;
-    size_t sync_size = 0;
+    const uint8_t *thr_data = nullptr;
+    size_t thr_size = 0;
+    const uint8_t *obj_data = nullptr;
+    size_t obj_size = 0;
     const uint8_t *file_data = nullptr;
     size_t file_size = 0;
-    const uint8_t *stack_data = nullptr;
-    size_t stack_size = 0;
     const uint8_t *ftbl_data = nullptr;
     size_t ftbl_size = 0;
     const uint8_t *ngsl_data = nullptr;
@@ -1188,16 +699,8 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
     size_t gxmk_size = 0;
     const uint8_t *ngsv_data = nullptr;
     size_t ngsv_size = 0;
-    const uint8_t *thrd_data = nullptr;
-    size_t thrd_size = 0;
-    const uint8_t *thri_data = nullptr;
-    size_t thri_size = 0;
-    const uint8_t *syni_data = nullptr;
-    size_t syni_size = 0;
     const uint8_t *audp_data = nullptr;
     size_t audp_size = 0;
-    const uint8_t *syn2_data = nullptr;
-    size_t syn2_size = 0;
     const uint8_t *gxmm_data = nullptr;
     size_t gxmm_size = 0;
     const uint8_t *clck_data = nullptr;
@@ -1226,25 +729,17 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
             mem_packed_size = static_cast<size_t>(stored);
             mem_raw_size = static_cast<size_t>(raw);
             break;
-        case TAG_CPU:
-            cpu_data = payload;
-            cpu_size = static_cast<size_t>(stored);
+        case TAG_THR:
+            thr_data = payload;
+            thr_size = static_cast<size_t>(stored);
             break;
-        case TAG_WAIT:
-            wait_data = payload;
-            wait_size = static_cast<size_t>(stored);
-            break;
-        case TAG_SYNC:
-            sync_data = payload;
-            sync_size = static_cast<size_t>(stored);
+        case TAG_OBJ:
+            obj_data = payload;
+            obj_size = static_cast<size_t>(stored);
             break;
         case TAG_FILE:
             file_data = payload;
             file_size = static_cast<size_t>(stored);
-            break;
-        case TAG_STACK:
-            stack_data = payload;
-            stack_size = static_cast<size_t>(stored);
             break;
         case TAG_FTBL:
             ftbl_data = payload;
@@ -1274,25 +769,9 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
             ngsv_data = payload;
             ngsv_size = static_cast<size_t>(stored);
             break;
-        case TAG_THRD:
-            thrd_data = payload;
-            thrd_size = static_cast<size_t>(stored);
-            break;
-        case TAG_THRI:
-            thri_data = payload;
-            thri_size = static_cast<size_t>(stored);
-            break;
-        case TAG_SYNI:
-            syni_data = payload;
-            syni_size = static_cast<size_t>(stored);
-            break;
         case TAG_AUDP:
             audp_data = payload;
             audp_size = static_cast<size_t>(stored);
-            break;
-        case TAG_SYN2:
-            syn2_data = payload;
-            syn2_size = static_cast<size_t>(stored);
             break;
         case TAG_GXMM:
             gxmm_data = payload;
@@ -1320,10 +799,11 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
         }
     }
 
-    if (!mem_packed || !cpu_data || !wait_data || !sync_data || !file_data)
+    if (!mem_packed || !thr_data || !obj_data || !file_data)
         return Result::fail("state is missing a required chunk");
-    if (!thrd_data)
-        return Result::fail("state predates restarting waits on load; take a new one");
+    kernel::Snapshot kernel_state;
+    if (!kernel::read(thr_data, thr_size, obj_data, obj_size, kernel_state))
+        return Result::fail("corrupt kernel chunk");
 
     std::optional<std::vector<ngs::SavedVoice>> saved_voices;
     if (ngsv_data) {
@@ -1393,218 +873,6 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
     // in the driver. Measured on Disgaea 4 and Project DIVA f, about 40 ms after a load.
     if (gxm::scene_in_progress(emuenv.gxm, emuenv.mem))
         return Result::retry("a scene is still being drawn");
-
-    // --- which threads the load has to restart --------------------------------------------------
-    // A thread parked in an HLE call is inside a host C++ frame that no snapshot describes. Rather
-    // than require this session's threads to be parked exactly as the state's were, every thread
-    // waiting now is taken out of its call, and every thread the state had parked is put back at
-    // the start of its call so that it makes it again ("restart", below). What still has to agree
-    // is what a restart cannot change: which threads exist, which have finished, and how deep in
-    // callbacks each one is.
-    struct ParkedWait {
-        uint32_t nid;
-        uint32_t args[4];
-    };
-    std::map<SceUID, ParkedWait> parked;
-    {
-        Reader wr{ wait_data, wait_size, 0 };
-        uint32_t count = 0;
-        if (!wr.get(count))
-            return Result::fail("corrupt wait chunk");
-        for (uint32_t i = 0; i < count; i++) {
-            SceUID id = 0;
-            ParkedWait w{};
-            if (!wr.get(id) || !wr.get(w.nid))
-                return Result::fail("corrupt wait chunk");
-            for (uint32_t &arg : w.args) {
-                if (!wr.get(arg))
-                    return Result::fail("corrupt wait chunk");
-            }
-            parked[id] = w;
-        }
-    }
-
-    struct SavedThread {
-        ThreadStatus status;
-        int32_t level;
-    };
-    std::map<SceUID, SavedThread> saved_threads;
-    std::map<SceUID, int32_t> saved_vm_suspends;
-    {
-        Reader tr{ thrd_data, thrd_size, 0 };
-        uint32_t count = 0;
-        if (!tr.get(count))
-            return Result::fail("corrupt thread chunk");
-        for (uint32_t i = 0; i < count; i++) {
-            SceUID id = 0;
-            uint32_t status = 0;
-            int32_t level = 0;
-            if (!tr.get(id) || !tr.get(status) || !tr.get(level))
-                return Result::fail("corrupt thread chunk");
-            saved_threads[id] = { static_cast<ThreadStatus>(status), level };
-        }
-        if (tr.get(count)) {
-            for (uint32_t i = 0; i < count; i++) {
-                SceUID id = 0;
-                int32_t vm_count = 0;
-                if (!tr.get(id) || !tr.get(vm_count))
-                    return Result::fail("corrupt thread chunk");
-                saved_vm_suspends[id] = vm_count;
-            }
-        }
-    }
-
-    // What each thread was made of, for the ones the session has since deleted.
-    struct SavedIdentity {
-        std::string name;
-        Address entry_point;
-        int32_t priority;
-        int32_t affinity_mask;
-        Address stack;
-        int32_t stack_size;
-        Address tls;
-        CPUContext init_ctx;
-    };
-    std::map<SceUID, SavedIdentity> identities;
-    if (thri_data) {
-        Reader ir{ thri_data, thri_size, 0 };
-        uint32_t count = 0;
-        if (!ir.get(count))
-            return Result::fail("corrupt thread identity chunk");
-        for (uint32_t i = 0; i < count; i++) {
-            SceUID id = 0;
-            SavedIdentity identity;
-            if (!ir.get(id) || !ir.get_string(identity.name) || !ir.get(identity.entry_point) || !ir.get(identity.priority) || !ir.get(identity.affinity_mask)
-                || !ir.get(identity.stack) || !ir.get(identity.stack_size) || !ir.get(identity.tls) || !ir.get(identity.init_ctx))
-                return Result::fail("corrupt thread identity chunk");
-            identities[id] = std::move(identity);
-        }
-    }
-
-    std::map<SceUID, CPUContext> contexts;
-    {
-        Reader cr{ cpu_data, cpu_size, 0 };
-        uint32_t count = 0;
-        if (!cr.get(count))
-            return Result::fail("corrupt cpu chunk");
-        for (uint32_t i = 0; i < count; i++) {
-            SceUID id = 0;
-            CPUContext ctx;
-            if (!cr.get(id) || !cr.get(ctx))
-                return Result::fail("corrupt cpu chunk");
-            contexts[id] = ctx;
-        }
-    }
-
-    // A thread waiting now, and how to end its call.
-    struct Release {
-        ThreadStatePtr thread;
-        uint32_t nid;
-        std::function<void()> release; // empty: ends on its own
-    };
-    std::vector<Release> releases;
-    uint32_t restarts = 0;
-    uint32_t differed = 0;
-    // Threads the state has and the session does not: deleted by the guest since the save (a game
-    // that starts and ends workers does this every few seconds -- Borderlands 2's "RADSS Thread"
-    // pair lives about 18 s and is deleted by the rendering thread the moment it finishes). They
-    // are recreated under their IDs once memory is back, from THRI. Threads the session has and
-    // the state does not are the guest's newer ones; they are ended at the end of the load.
-    std::vector<std::pair<SceUID, ThreadStatus>> to_recreate;
-    std::vector<ThreadStatePtr> session_only;
-    // Threads both sides have, that the state has already finished and this session is still
-    // running. Ended at the end of the load, like the session-only ones, except that these park
-    // dormant instead of being deleted: the state has them, dormant, and the guest can still wait
-    // on or delete the ID.
-    std::vector<ThreadStatePtr> to_end;
-    // Threads the state has parked in a call, to be pointed back at it (see "rewind" below).
-    std::vector<SceUID> to_rewind;
-    {
-        const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
-        for (const auto &[id, thread] : emuenv.kernel.threads) {
-            if (thread && thread->cpu && !contexts.contains(id))
-                session_only.push_back(thread);
-        }
-        for (auto &[id, ctx] : contexts) {
-            const auto saved = saved_threads.find(id);
-            if (saved == saved_threads.end())
-                return Result::fail(fmt::format("the state has registers for thread {} but no status", id));
-            const auto it = emuenv.kernel.threads.find(id);
-            if (it == emuenv.kernel.threads.end() || !it->second || !it->second->cpu) {
-                if (!identities.contains(id))
-                    return Result::fail(fmt::format("thread {} from the state no longer exists, and the state does not say what it was", id));
-                if (saved->second.level != 1)
-                    return Result::fail(fmt::format("thread {} from the state no longer exists and was inside a callback", id));
-                // Parked in a call at the save: it goes back to the start of it, like a live one.
-                const auto p = parked.find(id);
-                if (p != parked.end()) {
-                    if (p->second.nid == 0)
-                        return Result::fail(fmt::format("thread {} was parked outside any call", id));
-                    to_rewind.push_back(id);
-                    restarts++;
-                }
-                to_recreate.emplace_back(id, saved->second.status);
-                continue;
-            }
-            const ThreadStatePtr &thread = it->second;
-
-            // What a restart cannot change has to agree already. Retryable: a thread that has just
-            // finished, or is in a callback, is usually back where it was a frame or two later.
-            const bool finished_now = thread->status == ThreadStatus::dormant;
-            const bool finished_then = saved->second.status == ThreadStatus::dormant;
-            // Still running what the state had already finished: end it rather than wait for it to
-            // finish by itself. The retry was written for a thread that is a frame or two from
-            // ending; a load into a fresh boot is not that -- Borderlands 2's "NxThread" is doing
-            // boot work that the state, taken 25 minutes in, had long since seen the end of, and
-            // all 60 attempts were refused over it (notes/19, gap B).
-            if (finished_then && !finished_now) {
-                to_end.push_back(thread);
-                continue;
-            }
-            if (finished_now != finished_then)
-                return Result::retry(fmt::format("thread {} \"{}\" {} now but {} when the state was taken", id, thread->name,
-                    finished_now ? "has finished" : "is running", finished_then ? "had finished" : "was running"));
-            if (thread->nesting_level() != saved->second.level)
-                return Result::retry(fmt::format("thread {} \"{}\" is {} callback(s) deep now but was {} when the state was taken",
-                    id, thread->name, thread->nesting_level() - 1, saved->second.level - 1));
-
-            // The state's side: a thread parked in a call goes back to the start of it.
-            const auto p = parked.find(id);
-            if (p != parked.end()) {
-                // The save only writes a state whose parked threads are all in calls that can be made
-                // again (see the check at the top of save()).
-                if (p->second.nid == 0)
-                    return Result::fail(fmt::format("thread {} was parked outside any call", id));
-                if (saved->second.level != 1)
-                    return Result::fail(fmt::format("thread {} was parked inside a callback, where a load cannot restart it", id));
-                to_rewind.push_back(id);
-                restarts++;
-            }
-
-            // This session's side: a thread waiting now is taken out of its call.
-            if (thread->status == ThreadStatus::waiting) {
-                const uint32_t nid = thread->current_import_nid.load(std::memory_order_relaxed);
-                const char *const name = nid ? import_name(nid) : nullptr;
-                const std::string call = name ? name : fmt::format("{}", log_hex(nid));
-                if (thread->nesting_level() != 1)
-                    return Result::retry(fmt::format("thread {} \"{}\" is in {} inside a callback", id, thread->name, call));
-                const std::optional<ThreadState::WaitRelease> wait = thread->current_wait();
-                if (!wait)
-                    return Result::retry(fmt::format("thread {} \"{}\" is in {}, which a load cannot interrupt", id, thread->name, call));
-                releases.push_back({ thread, nid, wait->release });
-            }
-
-            // For the log only: how many threads the all-or-nothing match this replaced would have
-            // refused the load over.
-            const bool parked_then = p != parked.end();
-            const bool parked_now = thread->status == ThreadStatus::waiting;
-            if (parked_then != parked_now
-                || (parked_now
-                    && (p->second.nid != thread->current_import_nid.load(std::memory_order_relaxed)
-                        || !std::equal(p->second.args, p->second.args + 3, thread->current_import_args))))
-                differed++;
-        }
-    }
 
     // --- are the GXM objects the state refers to still where it had them? ---------------------
     // They are not moved by a load, so if the game's heap put them elsewhere in this session the
@@ -1816,6 +1084,51 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
     if (!inflate_to(mem_packed, mem_packed_size, mem_raw, mem_raw_size))
         return Result::fail("guest memory chunk is corrupt");
 
+    // --- reconcile the address space --------------------------------------------------------
+    // Restoring page contents is only meaningful if the same pages are allocated. Allocations
+    // made since the save must go, and allocations freed since must come back, or the guest
+    // resumes against an address space that does not match its own pointers. Doing this
+    // through the allocator rather than by restoring the allocation table directly keeps the
+    // host commit state correct: alloc/free commit and decommit pages as they go.
+    Reader mr{ mem_raw.data(), mem_raw.size(), 0 };
+    uint32_t region_count = 0;
+    if (!mr.get(region_count))
+        return Result::fail("corrupt memory chunk");
+
+    struct SavedRegion {
+        Address addr;
+        uint32_t size;
+        size_t offset; // into mem_raw, where this region's bytes start
+    };
+    std::vector<SavedRegion> saved;
+    saved.reserve(region_count);
+    for (uint32_t i = 0; i < region_count; i++) {
+        Address addr = 0;
+        uint32_t size = 0;
+        if (!mr.get(addr) || !mr.get(size) || !mr.need(size))
+            return Result::fail("corrupt memory chunk");
+        saved.push_back({ addr, size, mr.pos });
+        mr.pos += size;
+    }
+
+    // --- how the session's threads become the state's ----------------------------------------
+    // Decided before anything is touched, so a refusal leaves the session as it was. A thread the
+    // state had blocked in a call is checked against the state's memory, not this session's: a
+    // session that has not got as far as the state can have nothing mapped at its PC.
+    const auto state_word = [&](Address address) -> std::optional<uint32_t> {
+        for (const SavedRegion &region : saved) {
+            if (address >= region.addr && address - region.addr <= region.size - 4) {
+                uint32_t word;
+                std::memcpy(&word, mem_raw.data() + region.offset + (address - region.addr), 4);
+                return word;
+            }
+        }
+        return std::nullopt;
+    };
+    kernel::LoadPlan kernel_plan;
+    if (const Result refused = kernel::plan(emuenv, kernel_state, state_word, kernel_plan); !refused)
+        return refused;
+
     // --- put the GPU memory mappings back to what the state had -------------------------------
     // In two halves, because unmapping and mapping have to sit on either side of the memory
     // restore. With the page table in use, remove_external_mapping copies the host buffer back
@@ -1856,56 +1169,6 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
             ite = emuenv.gxm.memory_mapped_regions.erase(ite);
             mappings_dropped++;
         }
-    }
-
-    // --- reconcile the address space --------------------------------------------------------
-    // Restoring page contents is only meaningful if the same pages are allocated. Allocations
-    // made since the save must go, and allocations freed since must come back, or the guest
-    // resumes against an address space that does not match its own pointers. Doing this
-    // through the allocator rather than by restoring the allocation table directly keeps the
-    // host commit state correct: alloc/free commit and decommit pages as they go.
-    Reader mr{ mem_raw.data(), mem_raw.size(), 0 };
-    uint32_t region_count = 0;
-    if (!mr.get(region_count))
-        return Result::fail("corrupt memory chunk");
-
-    struct SavedRegion {
-        Address addr;
-        uint32_t size;
-        size_t offset; // into mem_raw, where this region's bytes start
-    };
-    std::vector<SavedRegion> saved;
-    saved.reserve(region_count);
-    for (uint32_t i = 0; i < region_count; i++) {
-        Address addr = 0;
-        uint32_t size = 0;
-        if (!mr.get(addr) || !mr.get(size) || !mr.need(size))
-            return Result::fail("corrupt memory chunk");
-        saved.push_back({ addr, size, mr.pos });
-        mr.pos += size;
-    }
-
-    // --- rewind: each thread the state has parked in a call goes back to the start of it -----
-    // Checked against the state's memory, not this session's. A session that has not got as far
-    // as the state can have nothing mapped at such a PC - Oddworld's Mono-compiled code, refused
-    // as "not in mapped memory" when loaded into a fresh boot - and whatever it does have there
-    // is not the code the restored thread will run.
-    const auto state_word = [&](Address address) -> std::optional<uint32_t> {
-        for (const SavedRegion &region : saved) {
-            if (address >= region.addr && address - region.addr <= region.size - 4) {
-                uint32_t word;
-                std::memcpy(&word, mem_raw.data() + region.offset + (address - region.addr), 4);
-                return word;
-            }
-        }
-        return std::nullopt;
-    };
-    for (const SceUID id : to_rewind) {
-        CPUContext &ctx = contexts.at(id);
-        const std::string why = why_not_at_a_call(state_word, ctx);
-        if (!why.empty())
-            return Result::fail(fmt::format("thread {} cannot be restarted: {}", id, why));
-        ctx.cpu_registers[15] = ctx.get_pc() - 4;
     }
 
     // Reconcile the address space, then restore, all under one hold of generation_mutex.
@@ -1968,48 +1231,10 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
         ngs::collect_host_owned_ranges(emuenv.ngs, emuenv.mem, host_owned_ranges);
     }
 
-    // --- restart: take every waiting thread out of its call ------------------------------------
-    // Nothing from here on refuses, so this is the point of no return. Each thread waiting now is
-    // armed to continue from the state's registers once its call returns
-    // (ThreadState::continue_from_on_return), and its call is then ended through the release its
-    // wait registered (ThreadState::WaitRelease); the thread parks on savestate_lock until this load
-    // lets go of it. A wait with no release -- sceAudioOutOutput, blocked on that same lock --
-    // cannot be woken and does not need to be: it reaches its armed registers once the load ends.
-    std::set<SceUID> armed;
-    std::vector<ThreadStatePtr> left_on_their_own;
-    for (const Release &r : releases) {
-        if (!r.thread->continue_from_on_return(r.nid, contexts.at(r.thread->id))) {
-            // Its call ended between the check above and here -- a delay ran out -- and the pause
-            // parks it on the way out (KernelState::pause_threads). It is restored below like any
-            // other stopped thread, once it has actually stopped.
-            left_on_their_own.push_back(r.thread);
-            continue;
-        }
-        armed.insert(r.thread->id);
-        // Does nothing if something ended the wait in the meantime, which ends the call anyway.
-        if (r.release)
-            r.release();
-    }
-
-    // Let the woken ones get out of their calls before memory is touched: on the way out they still
-    // write to it (sceKernelWaitSema writes back the time left).
-    const auto wait_until = [](const ThreadStatePtr &thread, const auto &done) {
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
-        while (!done() && std::chrono::steady_clock::now() < deadline)
-            std::this_thread::sleep_for(std::chrono::microseconds(200));
-        if (!done())
-            LOG_ERROR("Savestate: thread {} \"{}\" did not get out of its call; restoring anyway", thread->id, thread->name);
-    };
-    for (const Release &r : releases) {
-        if (armed.contains(r.thread->id) && r.release)
-            wait_until(r.thread, [&] { return r.thread->held_for_savestate(); });
-    }
-    for (const ThreadStatePtr &thread : left_on_their_own) {
-        wait_until(thread, [&] {
-            const std::lock_guard<std::mutex> thread_lock(thread->mutex);
-            return thread->held_at_gate();
-        });
-    }
+    // --- stop the session: every thread at its gate, and no kernel object left ------------------
+    // Nothing from here on refuses, so this is the point of no return. Before memory is touched:
+    // the threads coming out of their calls still write to it (a wait writes back the time left).
+    kernel::stop_session(emuenv, kernel_plan);
 
     // Before anything touches guest memory. The renderer holds read-only protections over the
     // textures and surfaces it has cached; hand them all back, and let their callbacks invalidate
@@ -2157,10 +1382,6 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
     // back; clear the flags and put the traps back.
     renderer::reset_surface_sync_after_savestate(*emuenv.renderer, emuenv.mem);
 
-    // --- point each thread at its stack -------------------------------------------------------
-    // Must happen after the address space has been reconciled and before any thread runs again.
-    // Optional: states written before this chunk existed simply do not carry it, and are loaded
-    // as they were.
     // --- recreate the render targets the guest destroyed since the save --------------------------
     // Memory is back, so each wrapper holds the state's bytes -- among them a renderer pointer the
     // saved session owned, which is not trusted: a fresh wrapper is built over them and the backend
@@ -2197,186 +1418,14 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
             LOG_ERROR("Savestate: {}", why);
     }
 
-    // --- recreate the threads the guest deleted since the save --------------------------------
-    // Memory is back, so their stacks and TLS blocks exist again with the state's bytes; the
-    // reconciliation above allocated them like every other region. Each comes up under its saved
-    // ID, gets its registers with everyone else below, and is held like a thread stopped while
-    // running, so resume_threads lets it go. One that had already finished stays dormant with its
-    // initial registers, for the start the guest may still give it.
-    uint32_t recreated = 0;
-    for (const auto &[id, status] : to_recreate) {
-        const SavedIdentity &identity = identities.at(id);
-        const bool was_running = status != ThreadStatus::dormant;
-        const ThreadStatePtr thread = emuenv.kernel.create_thread_for_savestate(emuenv.mem, id, identity.name, identity.entry_point, identity.priority, identity.affinity_mask,
-            identity.stack, identity.stack_size, identity.tls, identity.init_ctx, was_running);
-        if (!thread) {
-            LOG_ERROR("Savestate: thread {} \"{}\" could not be recreated", id, identity.name);
-            continue;
-        }
-        recreated++;
-    }
-    if (recreated > 0)
-        LOG_INFO("Savestate: recreated {} thread(s) the guest had deleted since the save", recreated);
+    // --- the state's threads and kernel objects ---------------------------------------------------
+    // Memory is back, so their stacks, TLS blocks and work areas hold the state's bytes again
+    kernel::rebuild(emuenv, kernel_state, kernel_plan);
 
-    // --- put back the kernel objects and audio ports the guest deleted since the save ------------
-    // The same defect as the threads, one level down: a worker's mutex and audio port are made and
-    // deleted with it (Borderlands 2: one "RADSS Mutex" and one 704-sample stereo port per RADSS
-    // Thread, both by RenderingThread), so a state's worker comes back holding IDs the session has
-    // reused or dropped -- measured as UNKNOWN_MUTEX_ID and INVALID_PORT on its first calls after
-    // the load. Objects the state has and the session lacks are recreated under their IDs (counts
-    // and owners are set by the sync-primitive pass below); objects the session has and the state
-    // lacks are deleted. Both from SYNI/AUDP; a state without them loads as before.
-    uint32_t objects_recreated = 0, objects_deleted = 0, ports_recreated = 0, ports_closed = 0;
-    if (syni_data) {
-        Reader nr{ syni_data, syni_size, 0 };
-        bool ok = true;
-        const auto read_count = [&](uint32_t &count) { return ok && (ok = nr.get(count)); };
-        // Every table is read before anything changes. The session keeps one UID table for all
-        // of them, so an object it holds under a UID the state gives another class has to go
-        // before the state's object can be put back under that UID.
-        struct SemaRecord {
-            SceUID uid = 0;
-            std::string name;
-            uint32_t attr = 0;
-            int32_t init_val = 0, max_val = 0;
-        };
-        struct FlagRecord {
-            SceUID uid = 0;
-            std::string name;
-            uint32_t attr = 0, flags = 0;
-        };
-        struct MutexRecord {
-            SceUID uid = 0;
-            std::string name;
-            uint32_t attr = 0, workarea = 0;
-            int32_t init_count = 0;
-        };
-        struct CondRecord {
-            SceUID uid = 0, assoc = 0;
-            std::string name;
-            uint32_t attr = 0;
-        };
-        std::vector<SemaRecord> semas;
-        std::vector<FlagRecord> flags;
-        std::array<std::vector<MutexRecord>, 2> mutexes; // heavy, light
-        std::array<std::vector<CondRecord>, 2> condvars; // heavy, light
-        uint32_t count = 0;
-        if (read_count(count)) {
-            for (uint32_t i = 0; i < count && ok; i++) {
-                SemaRecord r;
-                ok = nr.get(r.uid) && nr.get_string(r.name) && nr.get(r.attr) && nr.get(r.init_val) && nr.get(r.max_val);
-                if (ok)
-                    semas.push_back(std::move(r));
-            }
-        }
-        if (read_count(count)) {
-            for (uint32_t i = 0; i < count && ok; i++) {
-                FlagRecord r;
-                ok = nr.get(r.uid) && nr.get_string(r.name) && nr.get(r.attr) && nr.get(r.flags);
-                if (ok)
-                    flags.push_back(std::move(r));
-            }
-        }
-        for (auto &table : mutexes) {
-            if (!read_count(count))
-                break;
-            for (uint32_t i = 0; i < count && ok; i++) {
-                MutexRecord r;
-                ok = nr.get(r.uid) && nr.get_string(r.name) && nr.get(r.attr) && nr.get(r.init_count) && nr.get(r.workarea);
-                if (ok)
-                    table.push_back(std::move(r));
-            }
-        }
-        for (auto &table : condvars) {
-            if (!read_count(count))
-                break;
-            for (uint32_t i = 0; i < count && ok; i++) {
-                CondRecord r;
-                ok = nr.get(r.uid) && nr.get_string(r.name) && nr.get(r.attr) && nr.get(r.assoc);
-                if (ok)
-                    table.push_back(std::move(r));
-            }
-        }
-
-        // Delete what the state does not have, condvars before the mutexes they name. Only for
-        // a chunk that read to the end: a partial one would delete objects it never got to.
-        if (ok) {
-            const auto uids_of = [](const auto &records) {
-                std::set<SceUID> uids;
-                for (const auto &r : records)
-                    uids.insert(r.uid);
-                return uids;
-            };
-            const auto count_deleted = [&](bool deleted) {
-                if (deleted)
-                    objects_deleted++;
-            };
-            KernelState &kernel = emuenv.kernel;
-            for (const SceUID uid : kernel_uids_not_in<HeavyCond>(kernel, uids_of(condvars[0])))
-                count_deleted(delete_kernel_object<HeavyCond>(kernel, uid));
-            for (const SceUID uid : kernel_uids_not_in<LwCond>(kernel, uids_of(condvars[1])))
-                count_deleted(delete_kernel_object<LwCond>(kernel, uid));
-            for (const SceUID uid : kernel_uids_not_in<HeavyMutex>(kernel, uids_of(mutexes[0])))
-                count_deleted(delete_kernel_object<HeavyMutex>(kernel, uid));
-            for (const SceUID uid : kernel_uids_not_in<LwMutex>(kernel, uids_of(mutexes[1])))
-                count_deleted(delete_kernel_object<LwMutex>(kernel, uid));
-            for (const SceUID uid : kernel_uids_not_in<EventFlag>(kernel, uids_of(flags)))
-                count_deleted(delete_kernel_object<EventFlag>(kernel, uid));
-            for (const SceUID uid : kernel_uids_not_in<Semaphore>(kernel, uids_of(semas)))
-                count_deleted(delete_kernel_object<Semaphore>(kernel, uid));
-        }
-
-        // Put back what the session lacks, mutexes before the condvars that name them. A UID
-        // still held by an object of another class (one the guest made after the state and the
-        // delete above could not remove) is reported and left alone.
-        const auto needs_recreating = [&]<KernelObjectClass T>(std::type_identity<T>, SceUID uid, const std::string &name) {
-            if (emuenv.kernel.objects.find<T>(uid))
-                return false;
-            if (emuenv.kernel.objects.find(uid)) {
-                LOG_ERROR("Savestate: \"{}\" ({}) could not be put back: another kind of object holds its UID", name, uid);
-                return false;
-            }
-            return true;
-        };
-        // Built as the guest's create call builds it, under the state's UID, without touching guest
-        // memory (a lightweight mutex's work area is restored with the rest of memory) and with no
-        // owner; the sync-primitive pass below sets the counts and the owner.
-        const auto put_back = [&](std::shared_ptr<KernelObject> obj, SceUID uid) {
-            emuenv.kernel.ensure_next_uid_above(uid);
-            emuenv.kernel.objects.add(std::move(obj), uid);
-            objects_recreated++;
-        };
-        for (const SemaRecord &r : semas) {
-            if (needs_recreating(std::type_identity<Semaphore>{}, r.uid, r.name))
-                put_back(std::make_shared<Semaphore>(r.attr, r.name.c_str(), r.init_val, r.max_val), r.uid);
-        }
-        for (const FlagRecord &r : flags) {
-            if (needs_recreating(std::type_identity<EventFlag>{}, r.uid, r.name))
-                put_back(std::make_shared<EventFlag>(r.attr, r.name.c_str(), r.flags), r.uid);
-        }
-        const auto recreate_mutexes = [&]<KernelObjectClass T>(std::type_identity<T> type, const std::vector<MutexRecord> &records) {
-            for (const MutexRecord &r : records) {
-                if (needs_recreating(type, r.uid, r.name))
-                    put_back(std::make_shared<T>(r.attr, r.name.c_str(), r.init_count, nullptr, Ptr<SceKernelLwMutexWork>(r.workarea)), r.uid);
-            }
-        };
-        recreate_mutexes(std::type_identity<HeavyMutex>{}, mutexes[0]);
-        recreate_mutexes(std::type_identity<LwMutex>{}, mutexes[1]);
-        const auto recreate_condvars = [&]<KernelObjectClass T, KernelObjectClass M>(std::type_identity<T> type, std::type_identity<M>, const std::vector<CondRecord> &records) {
-            for (const CondRecord &r : records) {
-                if (!needs_recreating(type, r.uid, r.name))
-                    continue;
-                if (MutexPtr mutex = emuenv.kernel.objects.find<M>(r.assoc))
-                    put_back(std::make_shared<T>(r.attr, r.name.c_str(), std::move(mutex)), r.uid);
-                else
-                    LOG_ERROR("Savestate: condvar {} \"{}\" could not be recreated: its mutex {} is missing", r.uid, r.name, r.assoc);
-            }
-        };
-        recreate_condvars(std::type_identity<HeavyCond>{}, std::type_identity<HeavyMutex>{}, condvars[0]);
-        recreate_condvars(std::type_identity<LwCond>{}, std::type_identity<LwMutex>{}, condvars[1]);
-        if (!ok)
-            LOG_ERROR("Savestate: the sync object chunk is corrupt; objects the guest deleted since the save were not all put back");
-    }
+    // --- put back the audio ports the guest closed since the save ---------------------------------
+    // A worker's audio port is made and closed with it (Borderlands 2: a 704-sample stereo port per
+    // RADSS Thread), so a state's worker comes back holding a port the session has dropped.
+    uint32_t ports_recreated = 0, ports_closed = 0;
     if (audp_data) {
         Reader ar{ audp_data, audp_size, 0 };
         uint32_t count = 0;
@@ -2430,164 +1479,8 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
             LOG_ERROR("Savestate: the audio port chunk is corrupt; ports the guest closed since the save were not all reopened");
         }
     }
-    if (objects_recreated + objects_deleted + ports_recreated + ports_closed > 0)
-        LOG_INFO("Savestate: {} sync object(s) put back and {} deleted, {} audio port(s) reopened and {} closed, to match the state",
-            objects_recreated, objects_deleted, ports_recreated, ports_closed);
-
-    if (stack_data) {
-        Reader sk{ stack_data, stack_size, 0 };
-        uint32_t count = 0;
-        if (!sk.get(count))
-            return Result::fail("corrupt stack chunk");
-
-        const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
-        uint32_t moved = 0;
-        for (uint32_t i = 0; i < count; i++) {
-            SceUID id = 0;
-            uint32_t addr = 0;
-            int32_t size = 0;
-            if (!sk.get(id) || !sk.get(addr) || !sk.get(size))
-                return Result::fail("corrupt stack chunk");
-
-            const auto it = emuenv.kernel.threads.find(id);
-            if (it == emuenv.kernel.threads.end() || !it->second || addr == 0)
-                continue;
-            const auto &thread = it->second;
-            if (thread->stack.get() == addr)
-                continue;
-
-            // The old allocation was released by the reconciliation above, so the Block must not
-            // free it again.
-            thread->stack.rebase_for_savestate(addr);
-            thread->stack_size = size;
-            moved++;
-        }
-
-        LOG_INFO_IF(moved > 0, "Savestate: {} thread stack(s) moved to where the state has them", moved);
-    }
-
-    // --- restore CPU contexts -----------------------------------------------------------------
-    // Threads armed above pick theirs up when their call returns. Every other thread is stopped,
-    // and gets it now.
-    uint32_t restored = 0;
-    {
-        const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
-        for (const auto &[id, ctx] : contexts) {
-            const auto it = emuenv.kernel.threads.find(id);
-            if (it == emuenv.kernel.threads.end() || !it->second || !it->second->cpu)
-                continue;
-            if (!armed.contains(id))
-                load_context(*it->second->cpu, ctx);
-            restored++;
-        }
-
-        // The rewound ones make their call again from inside its wait
-        for (const SceUID id : to_rewind) {
-            const auto it = emuenv.kernel.threads.find(id);
-            if (it != emuenv.kernel.threads.end() && it->second)
-                it->second->restart_pending.store(true, std::memory_order_release);
-        }
-
-        // Restoring memory can change code the JIT has already translated, so every cached
-        // block has to go. Without this the CPU happily keeps executing translations of
-        // instructions that no longer exist.
-        for (const auto &pair : emuenv.kernel.threads) {
-            if (pair.second && pair.second->cpu)
-                invalidate_jit_cache(*pair.second->cpu, 0, std::numeric_limits<uint32_t>::max());
-        }
-    }
-    const uint32_t thread_count = static_cast<uint32_t>(contexts.size());
-    LOG_INFO("Savestate: {} thread(s) taken out of their calls, {} put back at the start of theirs ({} of them parked differently than the state had them)",
-        armed.size(), restarts, differed);
-
-    // --- restore sync primitive scalars --------------------------------------------------------
-    // The guest's own bookkeeping is in the snapshot; these host-side counters are what it expects
-    // to agree with. Objects the session had deleted were put back above (from SYNI) and get their
-    // counts here like the rest; one a state written without SYNI refers to is skipped, and is
-    // counted as "gone" in the summary line.
-    uint32_t sync_restored = 0, sync_skipped = 0;
-    {
-        Reader sr{ sync_data, sync_size, 0 };
-
-        const auto read_table = [&](auto &&find, auto &&apply) -> bool {
-            uint32_t count = 0;
-            if (!sr.get(count))
-                return false;
-            for (uint32_t i = 0; i < count; i++) {
-                SceUID uid = 0;
-                if (!sr.get(uid))
-                    return false;
-                if (!apply(find(uid)))
-                    return false;
-            }
-            return true;
-        };
-        const auto find_in = [&]<KernelObjectClass T>(std::type_identity<T>) {
-            return [&](SceUID uid) { return emuenv.kernel.objects.find<T>(uid); };
-        };
-
-        const auto count_it = [&](bool present) { present ? sync_restored++ : sync_skipped++; };
-        // The object's lock, which is empty when there is no object or it has been deleted
-        const auto lock_of = [](const auto &obj) { return obj ? obj->lock() : std::unique_lock<std::mutex>(); };
-
-        bool ok = read_table(find_in(std::type_identity<Semaphore>{}), [&](const SemaphorePtr &sema) {
-            int32_t val = 0;
-            if (!sr.get(val))
-                return false;
-            const auto guard = lock_of(sema);
-            if (guard)
-                sema->val = val;
-            count_it(guard.owns_lock());
-            return true;
-        });
-
-        ok = ok && read_table(find_in(std::type_identity<EventFlag>{}), [&](const EventFlagPtr &ef) {
-            int32_t flags = 0;
-            if (!sr.get(flags))
-                return false;
-            const auto guard = lock_of(ef);
-            if (guard)
-                ef->flags = flags;
-            count_it(guard.owns_lock());
-            return true;
-        });
-
-        ok = ok && read_table(find_in(std::type_identity<SimpleEvent>{}), [&](const SimpleEventPtr &ev) {
-            uint32_t pattern = 0;
-            uint64_t user_data = 0;
-            if (!sr.get(pattern) || !sr.get(user_data))
-                return false;
-            const auto guard = lock_of(ev);
-            if (guard) {
-                ev->pattern = pattern;
-                ev->last_user_data = user_data;
-            }
-            count_it(guard.owns_lock());
-            return true;
-        });
-
-        const auto restore_mutexes = [&](auto &&find) {
-            return read_table(find, [&](const MutexPtr &mutex) {
-                int32_t lock_count = 0;
-                SceUID owner_id = 0;
-                if (!sr.get(lock_count) || !sr.get(owner_id))
-                    return false;
-                ThreadStatePtr owner = emuenv.kernel.get_thread(owner_id);
-                const auto guard = lock_of(mutex);
-                if (guard) {
-                    mutex->lock_count = lock_count;
-                    mutex->owner = std::move(owner);
-                }
-                count_it(guard.owns_lock());
-                return true;
-            });
-        };
-        ok = ok && restore_mutexes(find_in(std::type_identity<HeavyMutex>{}));
-        ok = ok && restore_mutexes(find_in(std::type_identity<LwMutex>{}));
-
-        if (!ok)
-            return Result::fail("corrupt sync chunk");
-    }
+    if (ports_recreated + ports_closed > 0)
+        LOG_INFO("Savestate: {} audio port(s) reopened and {} closed, to match the state", ports_recreated, ports_closed);
 
     // --- put the guest's clock back where the state left it ---------------------------------------
     // Without this the guest resumes with its own timestamps in memory and a clock that has run on
@@ -2611,79 +1504,6 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
             else
                 LOG_INFO("Savestate: guest clock moved forward {} us, to {} us", guest_elapsed - was, guest_elapsed);
         }
-    }
-
-    // --- restore the rest of the sync primitives (SYN2) ------------------------------------------
-    // Past the point of no return, so a chunk that does not parse is reported, not refused.
-    if (syn2_data) {
-        Reader xr{ syn2_data, syn2_size, 0 };
-        uint32_t count = 0;
-        bool ok = xr.get(count);
-        for (uint32_t i = 0; ok && i < count; i++) {
-            SceUID uid = 0;
-            uint32_t state = 0, owner_count = 0;
-            ok = xr.get(uid) && xr.get(state) && xr.get(owner_count);
-            std::map<ThreadStatePtr, int> owners;
-            for (uint32_t j = 0; ok && j < owner_count; j++) {
-                SceUID owner = 0;
-                int32_t held = 0;
-                ok = xr.get(owner) && xr.get(held);
-                if (ThreadStatePtr thread = ok ? emuenv.kernel.get_thread(owner) : nullptr)
-                    owners.emplace(std::move(thread), held);
-            }
-            const RWLockPtr rwlock = ok ? emuenv.kernel.objects.find<RWLock>(uid) : nullptr;
-            if (const auto guard = rwlock ? rwlock->lock() : std::unique_lock<std::mutex>()) {
-                rwlock->state = static_cast<RWLockState>(state);
-                rwlock->owners = std::move(owners);
-            }
-        }
-
-        ok = ok && xr.get(count);
-        for (uint32_t i = 0; ok && i < count; i++) {
-            SceUID uid = 0;
-            uint32_t used = 0;
-            ok = xr.get(uid) && xr.get(used) && xr.need(used);
-            if (!ok)
-                break;
-            const uint8_t *const bytes = xr.data + xr.pos;
-            xr.pos += used;
-            if (const MsgPipePtr pipe = emuenv.kernel.objects.find<MsgPipe>(uid))
-                pipe->set_contents(bytes, used);
-        }
-
-        const uint64_t now = sync_timer_clock();
-        ok = ok && xr.get(count);
-        for (uint32_t i = 0; ok && i < count; i++) {
-            SceUID uid = 0;
-            uint8_t flags = 0;
-            uint64_t interval = 0;
-            int64_t next = 0, time = 0;
-            ok = xr.get(uid) && xr.get(flags) && xr.get(interval) && xr.get(next) && xr.get(time);
-            const TimerPtr timer_ptr = ok ? emuenv.kernel.objects.find<Timer>(uid) : nullptr;
-            if (const auto guard = timer_ptr ? timer_ptr->lock() : std::unique_lock<std::mutex>()) {
-                Timer &timer = *timer_ptr;
-                timer.is_started = flags & 1;
-                timer.is_repeat = flags & 2;
-                timer.is_pulse = flags & 4;
-                timer.event_set = flags & 8;
-                timer.event_interval = interval;
-                timer.next_event = next == std::numeric_limits<int64_t>::max() ? std::numeric_limits<uint64_t>::max() : now + next;
-                timer.base = time == std::numeric_limits<int64_t>::min() ? 0 : now + time;
-            }
-        }
-        if (ok && xr.get(count)) {
-            for (uint32_t i = 0; ok && i < count; i++) {
-                SceUID uid = 0;
-                uint64_t stopped_count = 0;
-                ok = xr.get(uid) && xr.get(stopped_count);
-                const TimerPtr timer_ptr = ok ? emuenv.kernel.objects.find<Timer>(uid) : nullptr;
-                if (const auto guard = timer_ptr ? timer_ptr->lock() : std::unique_lock<std::mutex>())
-                    timer_ptr->stopped_count = stopped_count;
-            }
-        }
-
-        if (!ok)
-            LOG_ERROR("Savestate: the SYN2 chunk is corrupt; rwlocks, message pipes and timers may not all be restored");
     }
 
     // --- restore the guest's file table ----------------------------------------------------
@@ -2766,33 +1586,6 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
         }
     }
 
-    // Restoring the counts above wrote numbers the waiting-thread queues know nothing about. A
-    // waiter can now be satisfiable with nobody left to wake it, because Semaphore::signal is the
-    // only thing that ever wakes one -- which presents as the guest hanging with a correct-looking
-    // frame on screen. Put the invariant back.
-    reconcile_waiters_after_load(emuenv.kernel);
-
-    // --- end the threads the state does not have --------------------------------------------
-    // The guest made them after the save; the restored guest never did. Their stacks and TLS are
-    // either regions the reconciliation released or regions a recreated thread now owns, so they
-    // give those up first; then each is told to delete itself, which it does as soon as it is
-    // resumed (a waiting one is woken out of its wait for it). No end callback: as far as the
-    // restored guest is concerned these threads never ran.
-    for (const ThreadStatePtr &thread : session_only) {
-        thread->stack.release_for_savestate();
-        thread->tls.release_for_savestate();
-        thread->exit_delete(false);
-    }
-    if (!session_only.empty())
-        LOG_INFO("Savestate: {} thread(s) the guest created after the save are being ended", session_only.size());
-
-    // And the ones the state has, finished, that this session is still running: the same ending,
-    // except they keep their stack and TLS (the state's own) and park dormant rather than go.
-    for (const ThreadStatePtr &thread : to_end)
-        thread->end_for_savestate();
-    if (!to_end.empty())
-        LOG_INFO("Savestate: {} thread(s) still running here had finished in the state; each is being ended", to_end.size());
-
     // Host-side audio decoders hold a position inside the stream they were decoding. Guest memory
     // has just been rewound underneath them, so that position is now wrong and the next frame
     // unpacks nonsense -- observed as a storm of Atrac9 decode failures ending in a fault. Tell
@@ -2820,28 +1613,8 @@ Result load(EmuEnvState &emuenv, const fs::path &path) {
     const size_t audio_positions = audiodec_restore_positions(emuenv, adec_data, adec_size);
     LOG_INFO_IF(audio_positions > 0, "Savestate: put {} ATRAC9 decoder(s) back where the state had them", audio_positions);
 
-    // The ForVM suspends the state had, in place of the session's: a load in the middle of a
-    // garbage collection here would otherwise leave the threads it had stopped stopped for good,
-    // since the restored collector never resumes them. A state without the counts has none.
-    {
-        size_t vm_changed = 0;
-        const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
-        for (const auto &[uid, thread] : emuenv.kernel.threads) {
-            if (!thread)
-                continue;
-            const auto saved = saved_vm_suspends.find(uid);
-            const int32_t count = saved == saved_vm_suspends.end() ? 0 : saved->second;
-            if (thread->vm_suspend_count() != count) {
-                thread->set_vm_suspend_count(count);
-                vm_changed++;
-            }
-        }
-        LOG_INFO_IF(vm_changed > 0, "Savestate: put back the ForVM suspend count of {} thread(s)", vm_changed);
-    }
-
-    LOG_INFO("Savestate loaded: {} ({} regions, {}/{} threads, {} sync object(s), {} file position(s), {} reopened; {} sync and {} file gone)",
-        path.string(), region_count, restored, thread_count, sync_restored, files_restored, files_reopened,
-        sync_skipped, files_gone);
+    LOG_INFO("Savestate loaded: {} ({} regions, {} threads, {} kernel object(s), {} file position(s), {} reopened; {} file gone)",
+        path.string(), region_count, kernel_state.threads.size(), kernel_state.objects.size(), files_restored, files_reopened, files_gone);
     return Result::ok();
 }
 
