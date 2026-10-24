@@ -231,16 +231,18 @@ EXPORT(int, sceAudioOutOutput, int port, const void *buf) {
     }
 
     // is it really useful to update the thread status?
-    thread->begin_host_wait();
     {
         // audio_output reads the guest buffer directly -- cubeb memcpy's it into its own ring,
         // SDL hands it to SDL_PutAudioStreamData. A savestate can be rewriting guest memory while
         // this read is in flight, which faulted here reliably, in memmove, on this thread. Take the
-        // barrier so a load waits for this to finish, and so this waits for a load in progress.
+        // barrier so a savestate waits for this to finish, and so this waits for one in progress.
+        // Taken before the thread shows waiting, so a thread a savestate holds up here shows
+        // running and is waited for, instead of seeming stopped in a call it never gets through.
         const std::shared_lock<std::shared_timed_mutex> guest_memory(emuenv.mem.savestate_lock);
+        thread->begin_host_wait();
         emuenv.audio.audio_output(*prt, buf);
+        thread->end_host_wait();
     }
-    thread->end_host_wait();
 
     return prt->len;
 }

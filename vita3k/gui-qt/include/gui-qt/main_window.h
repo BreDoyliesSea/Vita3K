@@ -130,7 +130,6 @@ private slots:
 private:
     void quicksave();
     void quickload();
-    void snapshot_roundtrip();
     void start_savestate_task(const char *what, void (MainWindow::*task)());
     void stop_savestate_task();
     void show_status_message(const QString &message, int timeout);
@@ -198,6 +197,7 @@ private:
     QWindow *m_game_container = nullptr;
     QTimer *m_sdl_pump_timer = nullptr;
     std::thread m_savestate_thread;
+    std::optional<std::thread> m_roundtrip_thread;
     std::atomic<bool> m_savestate_busy{ false };
     std::atomic<bool> m_savestate_cancel{ false };
 

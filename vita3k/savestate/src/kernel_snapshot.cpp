@@ -229,6 +229,9 @@ void put_back_pipe_contents(EmuEnvState &emuenv, MsgPipe &pipe, const std::vecto
     free(emuenv.mem, scratch);
 }
 
+// The threads the last load had making their call again, in the order to let them go
+std::vector<SceUID> release_order;
+
 } // namespace
 
 std::string why_not_at_a_call(const WordReader &read, const CPUContext &ctx) {
@@ -259,7 +262,22 @@ std::string quiesce(EmuEnvState &emuenv, int timeout_ms) {
 }
 
 void release_threads(EmuEnvState &emuenv) {
-    emuenv.kernel.resume_suspended_threads();
+    KernelState &kernel = emuenv.kernel;
+    for (const SceUID id : std::exchange(release_order, {})) {
+        const ThreadStatePtr thread = kernel.get_thread(id);
+        if (!thread)
+            continue;
+        thread->resume();
+        // Until it blocks in its call again, or gets what it waits for at once
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(20);
+        while (std::chrono::steady_clock::now() < deadline) {
+            const SceUInt32 status = thread->info().status;
+            if (status != SCE_KERNEL_THREAD_STATUS_RUNNING && status != SCE_KERNEL_THREAD_STATUS_READY && status != SCE_KERNEL_THREAD_STATUS_SUSPENDED)
+                break;
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
+    }
+    kernel.resume_suspended_threads();
 }
 
 Result capture(EmuEnvState &emuenv, Snapshot &snapshot) {
@@ -311,6 +329,9 @@ Result capture(EmuEnvState &emuenv, Snapshot &snapshot) {
             if (r.wait_type == 0 && std::ranges::none_of(RESTARTABLE_HOST_WAITS, [&](const char *name) { return call && std::strcmp(call, name) == 0; }))
                 return Result::retry(fmt::format("thread {} \"{}\" is in {}, which a load could not make again", r.id, r.name, call ? call : "an unknown call"));
             r.resume = Resume::restart_call;
+            if (const auto left = thread->wait_time_left())
+                r.time_left_us = left->count();
+            r.wait_sequence = thread->wait_sequence();
             break;
         }
         default:
@@ -382,6 +403,7 @@ Result capture(EmuEnvState &emuenv, Snapshot &snapshot) {
             w.put(obj->init_count);
             w.put(info.currentCount);
             w.put(info.currentOwnerId);
+            w.put<uint8_t>(0);
         }));
     }
     for (const auto &obj : objects_of<LwMutex>(kernel)) {
@@ -395,7 +417,32 @@ Result capture(EmuEnvState &emuenv, Snapshot &snapshot) {
             w.put<uint32_t>(obj->workarea.address());
             w.put(info.currentCount);
             w.put(info.currentOwnerId);
+            w.put<uint8_t>(0);
         }));
+    }
+    // A condition variable keeps the mutex it was made with after the guest deleted the mutex, so
+    // the mutex is made again too, then deleted once the condition variable has it
+    const auto put_deleted_mutex = [&](const Mutex &mutex, bool lightweight) {
+        ObjectRecord record{ static_cast<uint32_t>(lightweight ? UidClass::lw_mutex : UidClass::mutex), mutex.uid, {} };
+        Writer w{ record.data };
+        w.put(mutex.attr);
+        w.put_string(mutex.name);
+        w.put(mutex.init_count);
+        if (lightweight)
+            w.put<uint32_t>(mutex.workarea.address());
+        w.put<SceInt32>(0);
+        w.put<SceUID>(0);
+        w.put<uint8_t>(1);
+        objects.push_back(std::move(record));
+    };
+    std::set<SceUID> deleted_mutexes;
+    for (const auto &obj : objects_of<HeavyCond>(kernel)) {
+        if (kernel.objects.find<HeavyMutex>(obj->associated_mutex->uid) != obj->associated_mutex && deleted_mutexes.insert(obj->associated_mutex->uid).second)
+            put_deleted_mutex(*obj->associated_mutex, false);
+    }
+    for (const auto &obj : objects_of<LwCond>(kernel)) {
+        if (kernel.objects.find<LwMutex>(obj->associated_mutex->uid) != obj->associated_mutex && deleted_mutexes.insert(obj->associated_mutex->uid).second)
+            put_deleted_mutex(*obj->associated_mutex, true);
     }
     for (const auto &obj : objects_of<HeavyCond>(kernel)) {
         objects.push_back(record_of(*obj, [&](Writer &w) {
@@ -471,6 +518,8 @@ void write(const Snapshot &snapshot, std::vector<uint8_t> &threads, std::vector<
         t.put(r.vm_suspends);
         t.put(r.ctx);
         t.put(r.tpidrurw);
+        t.put(r.time_left_us);
+        t.put(r.wait_sequence);
     }
     Writer o{ objects };
     o.put<uint32_t>(static_cast<uint32_t>(snapshot.objects.size()));
@@ -490,7 +539,8 @@ bool read(const uint8_t *threads, size_t threads_size, const uint8_t *objects, s
         ThreadRecord r;
         if (!t.get(r.id) || !t.get_string(r.name) || !t.get(r.entry_point) || !t.get(r.attr) || !t.get(r.stack_size) || !t.get(r.stack)
             || !t.get(r.tls) || !t.get(r.init_priority) || !t.get(r.init_affinity_mask) || !t.get(r.init_cpu_ctx) || !t.get(r.resume)
-            || !t.get(r.wait_type) || !t.get(r.priority) || !t.get(r.affinity_mask) || !t.get(r.vm_suspends) || !t.get(r.ctx) || !t.get(r.tpidrurw))
+            || !t.get(r.wait_type) || !t.get(r.priority) || !t.get(r.affinity_mask) || !t.get(r.vm_suspends) || !t.get(r.ctx) || !t.get(r.tpidrurw)
+            || !t.get(r.time_left_us) || !t.get(r.wait_sequence))
             return false;
         snapshot.threads.push_back(std::move(r));
     }
@@ -638,6 +688,7 @@ void rebuild(EmuEnvState &emuenv, const Snapshot &snapshot, const LoadPlan &plan
     const auto add = [&](std::shared_ptr<KernelObject> obj, SceUID uid) { kernel.objects.add(std::move(obj), uid); };
     const auto thread_of = [&](SceUID id) { return id ? kernel.get_thread(id) : nullptr; };
     uint32_t made = 0, missed = 0;
+    std::vector<std::pair<UidClass, SceUID>> deleted_mutexes;
     const auto missing_owner = [&](const ObjectRecord &r, const std::string &name, SceUID owner) {
         LOG_WARN("Savestate: \"{}\" ({}) is held by thread {}, which the state does not have; left free", name, r.uid, owner);
     };
@@ -656,7 +707,9 @@ void rebuild(EmuEnvState &emuenv, const Snapshot &snapshot, const LoadPlan &plan
                 SceInt32 init_count = 0, count = 0;
                 SceUID owner = 0;
                 uint32_t workarea = 0;
-                ok = in.get(attr) && in.get_string(name) && in.get(init_count) && (pass == UidClass::mutex || in.get(workarea)) && in.get(count) && in.get(owner);
+                uint8_t deleted = 0;
+                ok = in.get(attr) && in.get_string(name) && in.get(init_count) && (pass == UidClass::mutex || in.get(workarea)) && in.get(count) && in.get(owner)
+                    && in.get(deleted);
                 if (!ok)
                     break;
                 std::shared_ptr<Mutex> mutex;
@@ -665,6 +718,8 @@ void rebuild(EmuEnvState &emuenv, const Snapshot &snapshot, const LoadPlan &plan
                 else
                     mutex = std::make_shared<LwMutex>(attr, name.c_str(), init_count, nullptr, Ptr<SceKernelLwMutexWork>(workarea));
                 add(mutex, r.uid);
+                if (deleted)
+                    deleted_mutexes.emplace_back(pass, r.uid);
                 const ThreadStatePtr holder = thread_of(owner);
                 if (owner && !holder)
                     missing_owner(r, name, owner);
@@ -701,7 +756,7 @@ void rebuild(EmuEnvState &emuenv, const Snapshot &snapshot, const LoadPlan &plan
                     break;
                 const auto event = std::make_shared<SimpleEvent>(attr, name.c_str(), 0, 0);
                 add(event, r.uid);
-                static_cast<Event &>(*event).cancel(pattern, user_data, nullptr);
+                event->restore(pattern, user_data);
                 break;
             }
             case UidClass::timer: {
@@ -715,9 +770,10 @@ void rebuild(EmuEnvState &emuenv, const Snapshot &snapshot, const LoadPlan &plan
                     break;
                 const auto timer = std::make_shared<Timer>(attr, name.c_str(), 0);
                 add(timer, r.uid);
-                static_cast<Event &>(*timer).cancel(pattern, user_data, nullptr);
                 // Stopped, as it was made: an event set an interval before the count it is due at,
-                // then the count, then the start, which queues the event for the time it has left
+                // then the count, then the start, which queues the event for the time it has left. A
+                // one shot event already past fires again here, with nobody waiting, and stays armed,
+                // as it was. The pattern goes back last, over whatever that fire set.
                 if (schedule != 0) {
                     timer->set_time(schedule >= interval ? schedule - interval : 0);
                     timer->set_event(type, interval, repeat);
@@ -725,6 +781,9 @@ void rebuild(EmuEnvState &emuenv, const Snapshot &snapshot, const LoadPlan &plan
                 timer->set_time(time);
                 if (active)
                     timer->start();
+                SceKernelTimerInfo settled{};
+                timer->timer_info(settled);
+                timer->restore(pattern, user_data);
                 break;
             }
             case UidClass::rw_lock: {
@@ -813,6 +872,13 @@ void rebuild(EmuEnvState &emuenv, const Snapshot &snapshot, const LoadPlan &plan
         }
     }
 
+    for (const auto &[uid_class, uid] : deleted_mutexes) {
+        if (uid_class == UidClass::mutex)
+            kernel.objects.remove<HeavyMutex>(uid, 0);
+        else
+            kernel.objects.remove<LwMutex>(uid, 0);
+    }
+
     // Registers, and what else each thread was
     uint32_t restarting = 0;
     for (const ThreadRecord &r : snapshot.threads) {
@@ -825,10 +891,15 @@ void rebuild(EmuEnvState &emuenv, const Snapshot &snapshot, const LoadPlan &plan
         if (r.resume == Resume::restart_call) {
             ctx.cpu_registers[15] = ctx.get_pc() - 4;
             restarting++;
+            ThreadState::ResumedWait how = ThreadState::ResumedWait::none;
             if (r.wait_type == SCE_KERNEL_WAITTYPE_COND_SIGNAL || r.wait_type == SCE_KERNEL_WAITTYPE_LW_COND_SIGNAL)
-                thread->resume_wait(ThreadState::ResumedWait::signal);
+                how = ThreadState::ResumedWait::signal;
             else if (r.wait_type == SCE_KERNEL_WAITTYPE_COND_MUTEX || r.wait_type == SCE_KERNEL_WAITTYPE_LW_COND_LW_MUTEX)
-                thread->resume_wait(ThreadState::ResumedWait::relock);
+                how = ThreadState::ResumedWait::relock;
+            std::optional<std::chrono::microseconds> left;
+            if (r.time_left_us >= 0)
+                left = std::chrono::microseconds(r.time_left_us);
+            thread->resume_wait(how, left);
         }
         load_context(*thread->cpu, ctx);
         write_tpidrurw(*thread->cpu, r.tpidrurw);
@@ -837,6 +908,17 @@ void rebuild(EmuEnvState &emuenv, const Snapshot &snapshot, const LoadPlan &plan
         while (thread->vm_suspend_count() > r.vm_suspends && thread->vm_resume() >= 0) {
         }
     }
+
+    // The order release_threads lets the restarting threads go in
+    std::vector<const ThreadRecord *> restarts;
+    for (const ThreadRecord &r : snapshot.threads) {
+        if (r.resume == Resume::restart_call)
+            restarts.push_back(&r);
+    }
+    std::ranges::sort(restarts, {}, &ThreadRecord::wait_sequence);
+    release_order.clear();
+    for (const ThreadRecord *r : restarts)
+        release_order.push_back(r->id);
 
     // Calls block again
     for (const ThreadStatePtr &thread : live_threads(kernel))

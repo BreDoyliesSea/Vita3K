@@ -84,7 +84,8 @@ Result quickload(EmuEnvState &emuenv, app::AppSessionController &session, int sl
 
 // For tests: with VITA3K_SNAPSHOT_ROUNDTRIP=<seconds> set, a thread that quicksaves and then
 // quickloads that state that long after now, so a run shows whether the guest goes on as if nothing
-// had happened. Nothing without it. The caller sets cancel and joins the thread before the session ends.
+// had happened. VITA3K_SNAPSHOT_SAVE only saves, and VITA3K_SNAPSHOT_LOAD only loads the state an
+// earlier run saved. Nothing without them. The caller sets cancel and joins the thread before the session ends.
 std::optional<std::thread> start_roundtrip_from_env(EmuEnvState &emuenv, app::AppSessionController &session, const std::atomic<bool> &cancel);
 
 } // namespace savestate

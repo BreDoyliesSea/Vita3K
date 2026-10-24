@@ -33,6 +33,7 @@
 
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <shared_mutex>
 #include <thread>
 
@@ -47,10 +48,14 @@ namespace {
 // buffer syncs into guest memory as work completes. A write landing after the restore overwrote the
 // restored guest's GPU notification counter, measured as Gravity Rush falling to 2 fps for good after
 // a load. False if the GPU did not finish in time.
-bool drain_renderer(renderer::State &renderer) {
+bool drain_renderer(EmuEnvState &emuenv) {
+    renderer::State &renderer = *emuenv.renderer;
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
     while (renderer.command_buffer_queue.size() > 0 && std::chrono::steady_clock::now() < deadline)
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    // Without a GXM context nothing was submitted, and nothing would answer the wait
+    if (gxm::capture_layout(emuenv.gxm, emuenv.mem).contexts.empty())
+        return true;
     return renderer::wait_gpu_idle(renderer, 500);
 }
 
@@ -65,7 +70,7 @@ Result run_quiesced(EmuEnvState &emuenv, app::AppSessionController &session, con
     std::unique_lock<std::shared_timed_mutex> guest_memory;
     if (const std::string blocker = quiesce(emuenv, 2000); !blocker.empty()) {
         result = Result::retry(blocker);
-    } else if (!drain_renderer(*emuenv.renderer)) {
+    } else if (!drain_renderer(emuenv)) {
         result = Result::retry("the GPU still has work in flight");
     } else if (!(render_parked = emuenv.renderer->park_render_thread(std::chrono::milliseconds(2000)))) {
         // The render thread is ours, not the guest's, and it reads guest memory continuously
@@ -90,8 +95,9 @@ Result run_quiesced(EmuEnvState &emuenv, app::AppSessionController &session, con
     if (render_parked)
         emuenv.renderer->unpark_render_thread();
     guest_memory = {};
-    release_threads(emuenv);
+    // The pause first, so the threads a load restarts can go one at a time
     session.set_pause_reason(app::AppSessionPauseReason::Savestate, false);
+    release_threads(emuenv);
     return result;
 }
 
@@ -179,28 +185,49 @@ Result quickload(EmuEnvState &emuenv, app::AppSessionController &session, int sl
 }
 
 std::optional<std::thread> start_roundtrip_from_env(EmuEnvState &emuenv, app::AppSessionController &session, const std::atomic<bool> &cancel) {
-    const char *const after = std::getenv("VITA3K_SNAPSHOT_ROUNDTRIP");
-    if (!after)
+    // ROUNDTRIP saves and loads back; SAVE only saves, and LOAD only loads, a state an earlier run
+    // saved, which checks a load into a session that never had the state's threads and objects
+    const char *after = nullptr;
+    bool do_save = true, do_load = true;
+    if ((after = std::getenv("VITA3K_SNAPSHOT_ROUNDTRIP"))) {
+    } else if ((after = std::getenv("VITA3K_SNAPSHOT_SAVE"))) {
+        do_load = false;
+    } else if ((after = std::getenv("VITA3K_SNAPSHOT_LOAD"))) {
+        do_save = false;
+    } else {
         return std::nullopt;
-    const auto delay = std::chrono::milliseconds(static_cast<int64_t>(std::atof(after) * 1000));
-    return std::thread([&emuenv, &session, &cancel, delay] {
+    }
+    // A list of times, seconds after now, like 60,90,120: one round trip at each
+    std::vector<std::chrono::milliseconds> times;
+    for (const char *at = after; *at;) {
+        times.emplace_back(static_cast<int64_t>(std::atof(at) * 1000));
+        const char *const comma = std::strchr(at, ',');
+        if (!comma)
+            break;
+        at = comma + 1;
+    }
+    return std::thread([&emuenv, &session, &cancel, times, do_save, do_load] {
         const auto start = std::chrono::steady_clock::now();
-        while (!cancel && std::chrono::steady_clock::now() - start < delay)
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
-        if (cancel)
-            return;
-        LOG_INFO("Savestate: round trip starts");
-        const Result saved = quicksave(emuenv, session, 0, cancel);
-        if (!saved) {
-            LOG_ERROR("Savestate: round trip could not save: {}", saved.reason);
-            return;
+        for (size_t i = 0; i < times.size(); i++) {
+            while (!cancel && std::chrono::steady_clock::now() - start < times[i])
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            if (cancel)
+                return;
+            LOG_INFO("Savestate: round trip {}/{} starts", i + 1, times.size());
+            if (do_save) {
+                if (const Result saved = quicksave(emuenv, session, 0, cancel); !saved) {
+                    LOG_ERROR("Savestate: round trip {} could not save: {}", i + 1, saved.reason);
+                    continue;
+                }
+            }
+            if (do_load) {
+                if (const Result loaded = quickload(emuenv, session, 0, cancel); !loaded) {
+                    LOG_ERROR("Savestate: round trip {} could not load: {}", i + 1, loaded.reason);
+                    continue;
+                }
+            }
+            LOG_INFO("Savestate: round trip {} done", i + 1);
         }
-        const Result loaded = quickload(emuenv, session, 0, cancel);
-        if (!loaded) {
-            LOG_ERROR("Savestate: round trip could not load: {}", loaded.reason);
-            return;
-        }
-        LOG_INFO("Savestate: round trip done");
     });
 }
 

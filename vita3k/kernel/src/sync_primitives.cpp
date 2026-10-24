@@ -219,6 +219,15 @@ SceInt32 Event::cancel(SceUInt32 set_pattern, SceUInt64 user_data, SceUInt32 *nu
     return SCE_KERNEL_OK;
 }
 
+SceInt32 Event::restore(SceUInt32 pattern, SceUInt64 user_data) {
+    const auto guard = lock();
+    if (!guard)
+        return SCE_KERNEL_ERROR_UNKNOWN_EVENT_ID;
+    this->pattern = pattern;
+    last_user_data = user_data;
+    return SCE_KERNEL_OK;
+}
+
 SceInt32 Event::get_pattern(SceUInt32 &result) {
     const auto guard = lock();
     if (!guard)

@@ -590,9 +590,19 @@ WaitResult ThreadState::wait_for_thread_end(const ThreadStatePtr &waiter, SceInt
     return end_waiters.wait(end_lock, waiter, { SCE_KERNEL_WAITTYPE_WAITTHEND, id, callbacks }, { exit_status }, deadline);
 }
 
+// Orders the waits of every thread, for wait_sequence()
+static std::atomic<uint64_t> wait_count{ 0 };
+
 WaitResult ThreadState::wait(WaitTarget target, Deadline deadline) {
     std::unique_lock<std::mutex> lock(mutex);
     const auto woken = [&] { return wait_over(); };
+    // The first wait of a call a snapshot restarted has only the time the stopped one had left
+    if (resumed_deadline) {
+        deadline = std::min(deadline, *resumed_deadline);
+        resumed_deadline.reset();
+    }
+    wait_deadline = deadline;
+    wait_started = ++wait_count;
     wait_target = target;
     update_status(ThreadStatus::waiting);
     bool satisfied = true;
@@ -871,9 +881,25 @@ void ThreadState::abandon_wait(bool abandon) {
     wait_cv.notify_all();
 }
 
-void ThreadState::resume_wait(ResumedWait how) {
+void ThreadState::resume_wait(ResumedWait how, std::optional<std::chrono::microseconds> time_left) {
     const std::lock_guard<std::mutex> lock(mutex);
     resumed_wait = how;
+    if (time_left)
+        resumed_deadline = std::chrono::steady_clock::now() + *time_left;
+    else
+        resumed_deadline.reset();
+}
+
+std::optional<std::chrono::microseconds> ThreadState::wait_time_left() const {
+    const std::lock_guard<std::mutex> lock(mutex);
+    if (status != ThreadStatus::waiting || wait_deadline == Deadline::max())
+        return std::nullopt;
+    return std::max(std::chrono::duration_cast<std::chrono::microseconds>(wait_deadline - std::chrono::steady_clock::now()), std::chrono::microseconds(0));
+}
+
+uint64_t ThreadState::wait_sequence() const {
+    const std::lock_guard<std::mutex> lock(mutex);
+    return wait_started;
 }
 
 ThreadState::ResumedWait ThreadState::take_resumed_wait() {

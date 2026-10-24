@@ -26,6 +26,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <expected>
 #include <list>
@@ -211,9 +212,15 @@ struct ThreadState {
         // Stopped taking the mutex back: signalled already
         relock,
     };
-    void resume_wait(ResumedWait how);
+    // A restarted call's first wait ends no later than time_left after it starts, the time the wait
+    // a snapshot stopped had left
+    void resume_wait(ResumedWait how, std::optional<std::chrono::microseconds> time_left = std::nullopt);
     // Returns how the next condition variable wait goes on, once
     ResumedWait take_resumed_wait();
+    // How long the wait the thread is in has left, nothing for one with no timeout or no wait
+    std::optional<std::chrono::microseconds> wait_time_left() const;
+    // When the thread started the wait it is in, in an order shared by every thread
+    uint64_t wait_sequence() const;
     // How many run_loop levels run on the thread: 1 at the top, 2 inside a callback
     int call_depth() const;
 
@@ -346,6 +353,9 @@ private:
     // Snapshots
     bool wait_abandoned = false;
     ResumedWait resumed_wait = ResumedWait::none;
+    std::optional<Deadline> resumed_deadline;
+    Deadline wait_deadline = Deadline::max();
+    uint64_t wait_started = 0;
     // Not guarded, run_loop counts its levels
     std::atomic<int> run_depth{ 0 };
 

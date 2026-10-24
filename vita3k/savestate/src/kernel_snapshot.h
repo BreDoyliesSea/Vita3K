@@ -77,6 +77,10 @@ struct ThreadRecord {
     int32_t vm_suspends = 0;
     CPUContext ctx;
     uint32_t tpidrurw = 0;
+    // For a blocked thread: the time its wait had left in microseconds, -1 for none, and when it
+    // started waiting, in an order shared by every thread
+    int64_t time_left_us = -1;
+    uint64_t wait_sequence = 0;
 };
 
 // One kernel object: its class (UidClass), its UID and its record, whose layout the class decides
@@ -122,7 +126,9 @@ Result plan(EmuEnvState &emuenv, const Snapshot &snapshot, const WordReader &sta
 void stop_session(EmuEnvState &emuenv, const LoadPlan &plan);
 
 // After guest memory is restored: makes the threads and objects of the state, and gives every thread
-// its registers. The threads stay held until the caller releases them.
+// its registers. The threads stay held until release_threads, which lets the ones making their call
+// again go one at a time, in the order they had started waiting, so the wait queues come back in
+// their order.
 void rebuild(EmuEnvState &emuenv, const Snapshot &snapshot, const LoadPlan &plan);
 
 } // namespace savestate::kernel

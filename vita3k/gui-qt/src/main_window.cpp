@@ -1085,12 +1085,9 @@ std::optional<AppLaunchRequest> MainWindow::boot_game_once(const AppLaunchReques
 
     LOG_INFO("Game started: {} ({})", emuenv.current_app_title, launch_request.app_path);
 
-    // For tests: VITA3K_SNAPSHOT_ROUNDTRIP=<seconds> quicksaves, then quickloads that state, that long
-    // after the game starts, so a test run checks that the guest goes on as if nothing had happened
-    if (const char *const roundtrip = std::getenv("VITA3K_SNAPSHOT_ROUNDTRIP")) {
-        const int delay_ms = static_cast<int>(std::atof(roundtrip) * 1000);
-        QTimer::singleShot(delay_ms, this, [this]() { start_savestate_task("Snapshot round trip", &MainWindow::snapshot_roundtrip); });
-    }
+    // For tests, see savestate::start_roundtrip_from_env
+    m_savestate_cancel = false;
+    m_roundtrip_thread = savestate::start_roundtrip_from_env(emuenv, m_app_session, m_savestate_cancel);
 
     if (m_settings_dialog)
         m_settings_dialog->set_storage_path_locked(true);
@@ -1429,6 +1426,10 @@ void MainWindow::stop_savestate_task() {
     m_savestate_cancel = true;
     if (m_savestate_thread.joinable())
         m_savestate_thread.join();
+    if (m_roundtrip_thread) {
+        m_roundtrip_thread->join();
+        m_roundtrip_thread.reset();
+    }
 }
 
 void MainWindow::show_status_message(const QString &message, const int timeout) {
@@ -1545,13 +1546,6 @@ void MainWindow::quicksave() {
         show_status_message(tr("Quicksave complete"), 4000);
     else if (!m_savestate_cancel)
         show_status_message(tr("Quicksave failed, the previous quicksave is kept: %1").arg(QString::fromStdString(result.reason)), 8000);
-}
-
-void MainWindow::snapshot_roundtrip() {
-    LOG_INFO("Savestate: round trip starts");
-    quicksave();
-    quickload();
-    LOG_INFO("Savestate: round trip done");
 }
 
 void MainWindow::on_quickload_triggered() {
