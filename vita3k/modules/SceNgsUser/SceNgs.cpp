@@ -24,6 +24,8 @@
 #include <util/log.h>
 #include <util/tracy.h>
 
+#include <algorithm>
+
 TRACY_MODULE_NAME(SceNgs);
 
 struct SceNgsVolumeMatrix {
@@ -460,6 +462,17 @@ EXPORT(SceUInt32, sceNgsSystemUpdate, ngs::System *system) {
     TRACY_FUNC(sceNgsSystemUpdate, system);
     if (!emuenv.cfg.current_config.ngs_enable) {
         return 0;
+    }
+
+    // The guest hands back a pointer it was given by sceNgsSystemInit, and after a savestate load
+    // that pointer comes from the state while our System objects are wherever this session put
+    // them. If the two sessions laid the pool out differently, this is a pointer to something
+    // that is not a System, and the first thing update() does is walk it. Measured as a fault in
+    // memmove inside VoiceScheduler::update, tens of milliseconds after every load.
+    if (std::find(emuenv.ngs.systems.begin(), emuenv.ngs.systems.end(), system) == emuenv.ngs.systems.end()) {
+        LOG_WARN_ONCE("sceNgsSystemUpdate: {} is not a system this session knows about, ignoring it",
+            fmt::ptr(system));
+        return SCE_NGS_OK;
     }
 
     system->voice_scheduler.update(emuenv.kernel, emuenv.mem, thread_id);

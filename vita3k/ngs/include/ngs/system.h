@@ -64,10 +64,20 @@ struct Patch {
 
 struct ModuleLogicalState {
     virtual ~ModuleLogicalState() = default;
+
+    // For savestates: the loop count travels with the voice's position, and whatever was decoded
+    // ahead of that position is dropped, as on a key-on.
+    virtual int32_t loop_count() const { return 0; }
+    virtual void restart_at_position(int32_t loop_count) {}
 };
 
 struct ModuleRuntimeState {
     virtual ~ModuleRuntimeState() = default;
+
+    // Called after a savestate has been loaded. Guest memory has just been rewound underneath
+    // this object, so any host decoder position it holds now refers to a different point in a
+    // different buffer. Resynchronise rather than carry the stale position forward.
+    virtual void on_savestate_loaded() {}
 };
 
 struct PCMFrameQueue {
