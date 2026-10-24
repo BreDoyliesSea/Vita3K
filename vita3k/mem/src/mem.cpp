@@ -325,6 +325,31 @@ bool handle_access_violation(MemState &state, uint8_t *addr, bool write) noexcep
     return true;
 }
 
+// Give every protected range back, telling its owner first.
+//
+// The renderer marks guest memory read-only to notice when the guest overwrites a texture or a
+// render surface, and the callback on each range is what invalidates the cached copy. A savestate
+// load rewrites guest memory wholesale and directly, so those callbacks would otherwise fire one
+// page fault at a time *during* the restore -- on the loading thread, with the render thread
+// parked -- and any range that survived would then describe a texture whose bytes had changed
+// with nobody told.
+//
+// Callbacks run under protect_mutex, which is what handle_access_violation does too.
+void drop_all_protections(MemState &state) {
+    const std::lock_guard<std::mutex> lock(state.protect_mutex);
+    while (!state.protect_tree.empty()) {
+        const auto it = state.protect_tree.begin();
+        const Address addr = it->first;
+        ProtectSegmentInfo info = std::move(it->second);
+        state.protect_tree.erase(it);
+
+        for (auto &[block_addr, block] : info.blocks)
+            block.callback(addr, true);
+
+        unprotect_inner(state, addr, info.size);
+    }
+}
+
 bool add_protect(MemState &state, Address addr, const uint32_t size, const MemPerm perm, const ProtectCallback &callback) {
     const std::lock_guard<std::mutex> lock(state.protect_mutex);
     ProtectSegmentInfo protect(size, perm);
@@ -468,6 +493,15 @@ Address alloc_at(MemState &state, Address address, uint32_t size, const char *na
 
 Address try_alloc_at(MemState &state, Address address, uint32_t size, const char *name) {
     const std::lock_guard<std::mutex> lock(state.generation_mutex);
+    return try_alloc_at_locked(state, address, size, name);
+}
+
+// Caller must already hold generation_mutex. Exists for savestate loading, which frees a set of
+// regions and reallocates them: taking the lock per call leaves the guest's address space visibly
+// half-torn between calls, and Vita3K's own host threads -- the GXM display queue and the renderer
+// among them -- keep dereferencing guest pointers throughout. That window is not theoretical; it
+// crashed the emulator in memmove on the first attempt of every soak run.
+Address try_alloc_at_locked(MemState &state, Address address, uint32_t size, const char *name) {
     const uint32_t wanted_page = address / STANDARD_PAGE_SIZE;
     size += address % STANDARD_PAGE_SIZE;
     const uint32_t page_count = align(size, STANDARD_PAGE_SIZE) / STANDARD_PAGE_SIZE;
@@ -482,8 +516,50 @@ Block alloc_block(MemState &mem, uint32_t size, const char *name, Address start_
     });
 }
 
+void for_each_allocation(const MemState &state, const std::function<void(Address, uint32_t)> &visit) {
+    const size_t table_length = TOTAL_MEM_SIZE / STANDARD_PAGE_SIZE;
+    for (size_t page_num = 0; page_num < table_length;) {
+        const AllocMemPage &page = state.alloc_table[page_num];
+        if (!page.allocated || page.size == 0) {
+            page_num++;
+            continue;
+        }
+        // Skip the guard allocation at address 0. init() deliberately marks it PAGE_NOACCESS
+        // so that null dereferences fault, which means simply reading it crashes the host.
+        // It holds no guest state worth reporting.
+        if (page_num != 0)
+            visit(static_cast<Address>(page_num * STANDARD_PAGE_SIZE), page.size * STANDARD_PAGE_SIZE);
+        page_num += page.size;
+    }
+}
+
 void free(MemState &state, Address address) {
     const std::lock_guard<std::mutex> lock(state.generation_mutex);
+    free_locked(state, address);
+}
+
+// Caller must already hold generation_mutex. See try_alloc_at_locked.
+void free_locked(MemState &state, Address address) {
+    free_inner_locked(state, address, true);
+}
+
+// Release the allocator's bookkeeping for a region but leave its pages committed.
+//
+// For savestate loading. The ordinary free() decommits, and that is what makes a load dangerous:
+// host-side structures outside the guest -- the renderer, the texture cache, the GXM display queue
+// -- hold raw pointers into guest memory and are not told when a region goes away. The next one to
+// touch an unmapped page faults, which is exactly how loads were dying, in memmove with an
+// unmapped host address and null dereferences on other threads behind it.
+//
+// Leaving the pages mapped means such a pointer reads stale bytes instead of faulting, and the
+// restore overwrites those bytes for every region the state actually has. The cost is that pages
+// the state does not want stay committed until the guest frees them again through the normal path;
+// the allocator bookkeeping is correct, so it can hand them straight back out.
+void free_for_savestate(MemState &state, Address address) {
+    free_inner_locked(state, address, false);
+}
+
+void free_inner_locked(MemState &state, Address address, bool decommit) {
     const uint32_t page_num = address / STANDARD_PAGE_SIZE;
     assert(page_num >= 0);
 
@@ -499,6 +575,10 @@ void free(MemState &state, Address address) {
     }
 
     assert(!state.use_page_table || state.page_table[address / KiB(4)] == state.memory.get());
+
+    if (!decommit)
+        return;
+
     const Address region_start = page_num * STANDARD_PAGE_SIZE;
     const Address region_end = region_start + page.size * STANDARD_PAGE_SIZE;
 
